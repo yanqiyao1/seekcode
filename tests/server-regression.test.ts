@@ -1,0 +1,364 @@
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const clientSendMocks = vi.hoisted((): Array<() => AsyncIterable<any>> => []);
+
+vi.mock("../src/client/deepseek.js", () => ({
+  DeepSeekClient: vi.fn().mockImplementation(() => ({
+    send: vi.fn(() => {
+      const mock = clientSendMocks.shift();
+      if (mock) return mock();
+      return defaultClientSend();
+    }),
+  })),
+}));
+
+async function* defaultClientSend() {
+  yield { type: "content", text: "ok" };
+  yield { type: "done", finish_reason: "stop", usage: { total_tokens: 1 }, content: "ok", reasoning_content: null, tool_calls: [] };
+}
+
+const { createApp } = await import("../src/server/app.js");
+const {
+  appendEvent,
+  appendRuntimeItem,
+  clearRuntimeStoreForTests,
+  createTurn,
+  getRuntimeRecord,
+  reloadRuntimeStoreForTests,
+  subscribeRuntimeEvents,
+  updateTurn,
+} = await import("../src/server/runtime-store.js");
+const { clearArtifactsForTests, listArtifactLinks } = await import("../src/artifacts/store.js");
+const { parseSSEFrames } = await import("../src/server/transport.js");
+
+describe("HTTP/SSE server", () => {
+  const oldApiKey = process.env.DEEPSEEK_API_KEY;
+  let tmp: string;
+  let oldRuntimeDir: string | undefined;
+  let oldArtifactsDir: string | undefined;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "seek-code-server-runtime-"));
+    oldRuntimeDir = process.env.DEEPCODE_RUNTIME_DIR;
+    oldArtifactsDir = process.env.DEEPCODE_ARTIFACTS_DIR;
+    process.env.DEEPCODE_RUNTIME_DIR = tmp;
+    process.env.DEEPCODE_ARTIFACTS_DIR = join(tmp, "artifacts");
+    clientSendMocks.length = 0;
+    clearRuntimeStoreForTests();
+    clearArtifactsForTests();
+  });
+
+  afterEach(() => {
+    if (oldApiKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = oldApiKey;
+    clearRuntimeStoreForTests();
+    clearArtifactsForTests();
+    if (oldRuntimeDir === undefined) delete process.env.DEEPCODE_RUNTIME_DIR;
+    else process.env.DEEPCODE_RUNTIME_DIR = oldRuntimeDir;
+    if (oldArtifactsDir === undefined) delete process.env.DEEPCODE_ARTIFACTS_DIR;
+    else process.env.DEEPCODE_ARTIFACTS_DIR = oldArtifactsDir;
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("executes tool calls and emits tool_result events", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    clientSendMocks.push(
+      async function* () {
+        yield { type: "tool_call_begin", index: 0, tool_call_id: "call_1", name: "read" };
+        yield { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "read", arguments: { path: "package.json" } }] };
+      },
+      async function* () {
+        yield { type: "content", text: "read complete" };
+        yield { type: "done", finish_reason: "stop", usage: { total_tokens: 1 }, content: "read complete", reasoning_content: null, tool_calls: [] };
+      },
+    );
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const { session_id } = await createResp.json();
+
+    const chatResp = await app.request(`/v1/session/${session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "read package" }),
+    });
+    const body = await chatResp.text();
+
+    expect(body).toContain("event: tool_call");
+    expect(body).toContain("event: tool_result");
+    expect(body).toContain("event: content");
+    expect(body).toContain("event: done");
+  });
+
+  it("exposes session/thread runtime APIs including replay, fork, resume, and delete", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const created = await createResp.json() as { session_id: string; thread_id: string };
+
+    const sessions = await (await app.request("/v1/sessions")).json() as { sessions: Array<{ id: string }> };
+    const resumed = await (await app.request(`/v1/sessions/${created.session_id}/resume-thread`, { method: "POST" })).json() as { thread_id: string };
+    const thread = await (await app.request(`/v1/threads/${created.thread_id}`)).json() as { thread: { id: string } };
+    const patched = await (await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ archived: true }),
+    })).json() as { thread: { archived: boolean } };
+    const events = await (await app.request(`/v1/threads/${created.thread_id}/events?since_seq=0`)).json() as { events: unknown[] };
+    mkdirSync(join(tmp, "skills", "api-skill"), { recursive: true });
+    writeFileSync(join(tmp, "skills", "api-skill", "SKILL.md"), "---\nname: api-skill\ndescription: runtime skill\n---\n\nUse runtime skill.\n");
+    const skills = await (await app.request(`/v1/skills?workspace=${encodeURIComponent(tmp)}`)).json() as { skills: Array<{ name: string }> };
+    appendRuntimeItem(getRuntimeRecord(created.thread_id)!, "artifact_test", { artifact_id: "log_m123456_deadbeef00" });
+    const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as { items: Array<{ type: string; artifact_ids: string[] }> };
+    const fork = await (await app.request(`/v1/threads/${created.thread_id}/fork`, { method: "POST" })).json() as { thread: { id: string } };
+    const deleted = await (await app.request(`/v1/sessions/${created.session_id}`, { method: "DELETE" })).json() as { deleted: boolean };
+
+    expect(sessions.sessions.some(session => session.id === created.session_id)).toBe(true);
+    expect(resumed.thread_id).toBe(created.thread_id);
+    expect(thread.thread.id).toBe(created.thread_id);
+    expect(patched.thread.archived).toBe(true);
+    expect(events.events.length).toBeGreaterThan(0);
+    expect(skills.skills.some(skill => skill.name === "api-skill")).toBe(true);
+    expect(items.items.some(item => item.type === "artifact_test" && item.artifact_ids.includes("log_m123456_deadbeef00"))).toBe(true);
+    expect(fork.thread.id).not.toBe(created.thread_id);
+    expect(deleted.deleted).toBe(true);
+  });
+
+  it("persists event/item replay and marks active turns interrupted after runtime reload", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const created = await createResp.json() as { session_id: string; thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+    const turn = createTurn(record, "persist me");
+
+    updateTurn(record, turn, "in_progress");
+    appendEvent(record, "custom.event", { ok: true }, turn.id);
+    appendRuntimeItem(record, "artifact_link", { nested: { artifact_id: "log_m123456_deadbeef00" } }, { turnId: turn.id });
+
+    expect(listArtifactLinks({ scope: "session", target_id: created.session_id })[0].artifact_id).toBe("log_m123456_deadbeef00");
+    expect(listArtifactLinks({ scope: "turn", target_id: turn.id })[0].artifact_id).toBe("log_m123456_deadbeef00");
+
+    reloadRuntimeStoreForTests();
+
+    const reloadedThread = await (await app.request(`/v1/threads/${created.thread_id}`)).json() as {
+      turns: Array<{ id: string; status: string; error?: string; artifact_ids: string[] }>;
+    };
+    const events = await (await app.request(`/v1/threads/${created.thread_id}/events?since_seq=0`)).json() as { events: Array<{ event: string }> };
+    const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as { items: Array<{ type: string; artifact_ids: string[] }> };
+    const resumed = await (await app.request(`/v1/sessions/${created.session_id}/resume-thread`, { method: "POST" })).json() as { thread_id: string };
+
+    expect(reloadedThread.turns.find(item => item.id === turn.id)).toMatchObject({
+      status: "interrupted",
+      error: "Interrupted by process restart",
+      artifact_ids: ["log_m123456_deadbeef00"],
+    });
+    expect(events.events.map(event => event.event)).toEqual(expect.arrayContaining(["custom.event", "item.artifact_link", "turn.interrupted"]));
+    expect(items.items.some(item => item.type === "artifact_link" && item.artifact_ids.includes("log_m123456_deadbeef00"))).toBe(true);
+    expect(resumed.thread_id).toBe(created.thread_id);
+  });
+
+  it("forks sessions with independent thinking, turn, and artifact state", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const created = await createResp.json() as { thread_id: string };
+    const source = getRuntimeRecord(created.thread_id)!;
+    source.session.messages.push({ role: "user", content: "fork me" });
+    source.session.messages.push({
+      role: "assistant",
+      content: "done",
+      reasoning_content: "forked reasoning",
+      tool_calls: [{ id: "call_1", name: "read", arguments: { path: "original.txt" } }],
+    });
+    source.session.turns.push({
+      index: 1,
+      user_message: "fork me",
+      assistant_messages: [{
+        role: "assistant",
+        content: "done",
+        reasoning_content: "forked reasoning",
+        tool_calls: [{ id: "call_1", name: "read", arguments: { path: "original.txt" } }],
+      }],
+      tool_calls: [{ id: "call_1", name: "read", arguments: { path: "original.txt" } }],
+      tool_results: [{ tool_call_id: "call_1", name: "read", content: "ok", is_error: false }],
+      tokens_in: 1,
+      tokens_out: 2,
+      cost: 0.003,
+      duration_s: 0.4,
+      artifact_ids: ["log_m123456_deadbeef00"],
+    });
+    source.session.artifact_index = { session: ["log_m123456_deadbeef00"], "turn:1": ["log_m123456_deadbeef00"] };
+
+    const fork = await (await app.request(`/v1/threads/${created.thread_id}/fork`, { method: "POST" })).json() as { thread: { id: string }; session_id: string };
+    const forked = getRuntimeRecord(fork.thread.id)!;
+    (source.session.messages.at(-1)!.tool_calls![0].arguments as Record<string, unknown>).path = "mutated.txt";
+    source.session.turns[0].artifact_ids!.push("log_m999999_badbadbad0");
+
+    expect(fork.thread.id).not.toBe(created.thread_id);
+    expect(forked.session.id).toBe(fork.session_id);
+    expect(forked.session.messages.at(-1)).toMatchObject({
+      reasoning_content: "forked reasoning",
+      tool_calls: [{ arguments: { path: "original.txt" } }],
+    });
+    expect(forked.session.turns[0].artifact_ids).toEqual(["log_m123456_deadbeef00"]);
+    expect(forked.session.artifact_index["turn:1"]).toEqual(["log_m123456_deadbeef00"]);
+  });
+
+  it("interrupts only active turns and records interrupt replay evidence", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const created = await createResp.json() as { thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+    const turn = createTurn(record, "stop me");
+    const abortController = new AbortController();
+    record.abortController = abortController;
+    updateTurn(record, turn, "in_progress");
+
+    const interruptedResp = await app.request(`/v1/threads/${created.thread_id}/turns/${turn.id}/interrupt`, { method: "POST" });
+    const interrupted = await interruptedResp.json() as { interrupted: boolean; turn: { status: string; error?: string } };
+    const duplicateResp = await app.request(`/v1/threads/${created.thread_id}/turns/${turn.id}/interrupt`, { method: "POST" });
+    const events = await (await app.request(`/v1/threads/${created.thread_id}/events?since_seq=0`)).json() as { events: Array<{ event: string }> };
+    const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as { items: Array<{ type: string }> };
+
+    expect(interruptedResp.status).toBe(200);
+    expect(interrupted).toMatchObject({ interrupted: true, turn: { status: "interrupted", error: "Interrupted by API request" } });
+    expect(abortController.signal.aborted).toBe(true);
+    expect(duplicateResp.status).toBe(409);
+    expect(events.events.map(event => event.event)).toEqual(expect.arrayContaining(["turn.interrupt_requested", "item.interrupt", "turn.interrupted"]));
+    expect(items.items.some(item => item.type === "interrupt")).toBe(true);
+  });
+
+  it("keeps chat aborts as interrupted instead of failed", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    let continueStream: (() => void) | undefined;
+    clientSendMocks.push(async function* () {
+      yield { type: "content", text: "partial" };
+      await new Promise<void>(resolve => { continueStream = resolve; });
+      yield { type: "content", text: "late" };
+      yield { type: "done", finish_reason: "stop", usage: null, content: "partiallate", reasoning_content: null, tool_calls: [] };
+    });
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const created = await createResp.json() as { session_id: string; thread_id: string };
+    const chatRespPromise = app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "abort stream" }),
+    });
+
+    await waitFor(() => {
+      const turn = getRuntimeRecord(created.thread_id)?.turns.at(-1);
+      return turn?.status === "in_progress" ? turn : null;
+    });
+    const turnId = getRuntimeRecord(created.thread_id)!.turns.at(-1)!.id;
+    const interruptResp = await app.request(`/v1/threads/${created.thread_id}/turns/${turnId}/interrupt`, { method: "POST" });
+    continueStream?.();
+    const chatBody = await (await chatRespPromise).text();
+    const thread = await (await app.request(`/v1/threads/${created.thread_id}`)).json() as { turns: Array<{ id: string; status: string }> };
+
+    expect(interruptResp.status).toBe(200);
+    expect(chatBody).toContain("event: interrupted");
+    expect(thread.turns.find(turn => turn.id === turnId)?.status).toBe("interrupted");
+    expect(thread.turns.find(turn => turn.id === turnId)?.status).not.toBe("failed");
+  });
+
+  it("deletes runtime threads, replay files, and session resume targets", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const created = await createResp.json() as { session_id: string; thread_id: string };
+    appendEvent(getRuntimeRecord(created.thread_id)!, "delete.marker", { ok: true });
+    appendRuntimeItem(getRuntimeRecord(created.thread_id)!, "delete_item", { ok: true });
+
+    const deleted = await (await app.request(`/v1/sessions/${created.session_id}`, { method: "DELETE" })).json() as { deleted: boolean };
+    const threadResp = await app.request(`/v1/threads/${created.thread_id}`);
+    const resumeResp = await app.request(`/v1/sessions/${created.session_id}/resume-thread`, { method: "POST" });
+    const eventsResp = await app.request(`/v1/threads/${created.thread_id}/events?since_seq=0`);
+    const secondDeleteResp = await app.request(`/v1/sessions/${created.session_id}`, { method: "DELETE" });
+
+    expect(deleted.deleted).toBe(true);
+    expect(threadResp.status).toBe(404);
+    expect(resumeResp.status).toBe(404);
+    expect(eventsResp.status).toBe(404);
+    expect(secondDeleteResp.status).toBe(404);
+    expect(existsSync(join(tmp, "threads", `${created.thread_id}.json`))).toBe(false);
+    expect(existsSync(join(tmp, "events", `${created.thread_id}.jsonl`))).toBe(false);
+    expect(existsSync(join(tmp, "items", `${created.thread_id}.jsonl`))).toBe(false);
+  });
+
+  it("subscribes to live runtime events after backlog replay", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const created = await createResp.json() as { thread_id: string };
+    const live = new Promise(resolve => {
+      const unsubscribe = subscribeRuntimeEvents(created.thread_id, event => {
+        if (event.event === "test.live") {
+          unsubscribe();
+          resolve(event);
+        }
+      });
+    });
+    appendEvent(getRuntimeRecord(created.thread_id)!, "test.live", { ok: true });
+
+    await expect(live).resolves.toMatchObject({ event: "test.live", data: { ok: true } });
+  });
+
+  it("streams SSE backlog followed by live events from the HTTP handler", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const created = await createResp.json() as { thread_id: string };
+    appendEvent(getRuntimeRecord(created.thread_id)!, "backlog.event", { ok: "backlog" });
+
+    const response = await app.request(`/v1/threads/${created.thread_id}/events?since_seq=0`, {
+      headers: { Accept: "text/event-stream" },
+    });
+    const reader = response.body!.getReader();
+    try {
+      let streamText = await readStreamUntil(reader, "backlog.event");
+      appendEvent(getRuntimeRecord(created.thread_id)!, "live.event", { ok: "live" });
+      streamText = await readStreamUntil(reader, "live.event", streamText);
+      const parsed = parseSSEFrames(streamText);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/event-stream");
+      expect(parsed.frames.map(frame => frame.event)).toEqual(expect.arrayContaining(["thread.started", "backlog.event", "live.event"]));
+    } finally {
+      await reader.cancel().catch(() => undefined);
+    }
+  });
+});
+
+async function readStreamUntil(reader: any, needle: string, existing = "", timeoutMs = 1500): Promise<string> {
+  const decoder = new TextDecoder();
+  let output = existing;
+  const deadline = Date.now() + timeoutMs;
+  while (!output.includes(needle)) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`Timed out waiting for ${needle}`);
+    const chunk = await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`Timed out waiting for ${needle}`)), remaining)),
+    ]) as { done: boolean; value?: Uint8Array };
+    if (chunk.done) break;
+    if (chunk.value) output += decoder.decode(chunk.value, { stream: true });
+  }
+  if (!output.includes(needle)) throw new Error(`Stream ended before ${needle}`);
+  return output;
+}
+
+async function waitFor<T>(fn: () => T | Promise<T>, timeoutMs = 1500): Promise<NonNullable<T>> {
+  const deadline = Date.now() + timeoutMs;
+  let last: T;
+  do {
+    last = await fn();
+    if (last) return last as NonNullable<T>;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  } while (Date.now() < deadline);
+  throw new Error("Timed out waiting for condition");
+}

@@ -1,0 +1,55 @@
+{
+  "name": "seek-code",
+  "version": "0.1.0",
+  "description": "Seek Code — a terminal-native coding agent powered by DeepSeek models",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "seek": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "docs",
+    "README.md",
+    "README.zh-CN.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "pretest": "npm run build",
+    "start": "node dist/index.js",
+    "prepack": "npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "seek-code",
+    "seek",
+    "cli",
+    "coding-agent",
+    "ai"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@hono/node-server": "^2.0.1",
+    "chalk": "^5.4.0",
+    "cheerio": "^1.0.0",
+    "commander": "^13.1.0",
+    "hono": "^4.7.0",
+    "openai": "^5.12.0",
+    "smol-toml": "^1.3.0",
+    "tiktoken": "^1.0.22",
+    "undici": "^7.25.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.4.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.1.0"
+  }
+}

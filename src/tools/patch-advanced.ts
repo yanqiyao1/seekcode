@@ -1,0 +1,481 @@
+/** Advanced hunks-based patch system with add/delete/update file types.
+ *
+ * Adopted from OpenCode: parses unified diffs into structured hunks,
+ * supports multi-file patches, add/delete/update operations, move_path
+ * detection, and smarter error handling.
+ */
+
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync, realpathSync } from "node:fs";
+import { resolve, dirname, relative, isAbsolute } from "node:path";
+import { diffLines } from "../ui/renderer.js";
+
+// ── Types ────────────────────────────────────────────────────
+
+export interface AddHunk {
+  type: "add";
+  path: string;
+  contents: string;
+}
+
+export interface DeleteHunk {
+  type: "delete";
+  path: string;
+}
+
+export interface UpdateChunk {
+  old_lines: string[];
+  new_lines: string[];
+  change_context?: string;
+  is_end_of_file?: boolean;
+}
+
+export interface UpdateHunk {
+  type: "update";
+  path: string;
+  move_path?: string;
+  chunks: UpdateChunk[];
+}
+
+export type Hunk = AddHunk | DeleteHunk | UpdateHunk;
+
+export interface PatchResult {
+  path: string;
+  type: "add" | "delete" | "update" | "skip" | "error";
+  message: string;
+  oldContent?: string;
+  newContent?: string;
+}
+
+interface FileBackup {
+  path: string;
+  existed: boolean;
+  content?: string;
+}
+
+export interface ApplyPatchOptions {
+  workdir?: string;
+  /** Dry run: validate but don't write */
+  dryRun?: boolean;
+  /** Create parent directories if missing */
+  createDirs?: boolean;
+  /** Max file size to patch */
+  maxFileSize?: number;
+}
+
+// ── Unified Diff Parser ─────────────────────────────────────
+
+/**
+ * Parse a unified diff into structured Hunk objects.
+ *
+ * Handles:
+ * - Single and multi-file patches
+ * - New file (add), deleted file (delete), modified file (update)
+ * - Renamed/moved files (similarity index + rename from/to)
+ * - Binary file notices
+ */
+export function parseUnifiedDiff(patchText: string, workdir = "."): Hunk[] {
+  const hunks: Hunk[] = [];
+  const lines = patchText.split("\n");
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // File header: diff --git a/path b/path
+    const diffMatch = line?.match(/^diff --git a\/(.+) b\/(.+)$/);
+    if (diffMatch) {
+      const oldPath = diffMatch[1];
+      const newPath = diffMatch[2];
+      const fileLines: string[] = [];
+      let fileMode = "";
+      let similarityIndex = 0;
+      let isBinary = false;
+
+      i++;
+      while (i < lines.length && !lines[i]?.startsWith("diff --git ")) {
+        const headerLine = lines[i];
+
+        if (headerLine?.startsWith("new file mode")) fileMode = "add";
+        else if (headerLine?.startsWith("deleted file mode")) fileMode = "delete";
+        else if (headerLine?.startsWith("similarity index")) {
+          const pct = parseInt(headerLine.match(/\d+/)![0], 10);
+          similarityIndex = pct;
+        } else if (headerLine?.startsWith("rename from")) fileMode = "rename";
+        else if (headerLine?.startsWith("rename to")) {
+          fileMode = "rename";
+        } else if (headerLine?.startsWith("Binary files")) {
+          isBinary = true;
+        } else if (
+          headerLine?.startsWith("--- ") || headerLine?.startsWith("+++ ") ||
+          headerLine?.startsWith("@@") || headerLine?.startsWith(" ") ||
+          headerLine?.startsWith("+") || headerLine?.startsWith("-")
+        ) {
+          fileLines.push(headerLine);
+        }
+        i++;
+      }
+
+      if (isBinary) {
+        hunks.push({
+          type: "skip" as any,
+          path: newPath,
+          chunks: [],
+        });
+        continue; // skip binary files
+      }
+
+      // Determine operation type
+      if (fileMode === "add" || (oldPath === "/dev/null" && newPath !== "/dev/null")) {
+        hunks.push(parseAddHunk(newPath, fileLines, workdir));
+      } else if (fileMode === "delete" || (newPath === "/dev/null" && oldPath !== "/dev/null")) {
+        hunks.push({ type: "delete", path: oldPath });
+      } else if (fileMode === "rename" && similarityIndex >= 50) {
+        // Treat as update with move_path
+        const hunk = parseUpdateHunk(oldPath, newPath, fileLines, workdir);
+        hunk.move_path = newPath;
+        hunks.push(hunk);
+      } else {
+        // Standard update
+        hunks.push(parseUpdateHunk(oldPath, newPath, fileLines, workdir));
+      }
+    } else {
+      i++;
+    }
+  }
+
+  return hunks;
+}
+
+function parseAddHunk(path: string, lines: string[], _workdir: string): AddHunk {
+  const contentLines: string[] = [];
+  let inChunk = false;
+  for (const line of lines) {
+    if (line.startsWith("@@")) {
+      inChunk = true;
+      continue;
+    }
+    if (!inChunk) continue;
+    if (line.startsWith("+")) contentLines.push(line.slice(1));
+    else if (line === "\\ No newline at end of file") continue;
+  }
+  return { type: "add", path, contents: contentLines.join("\n") };
+}
+
+function parseUpdateHunk(
+  oldPath: string, _newPath: string, lines: string[], workdir: string,
+): UpdateHunk {
+  const chunks: UpdateChunk[] = [];
+  let currentChunk: UpdateChunk | null = null;
+  let lineNum = 0;
+
+  for (const line of lines) {
+    const hunkMatch = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@\s*(.*)/);
+    if (hunkMatch) {
+      if (currentChunk && (currentChunk.old_lines.length || currentChunk.new_lines.length)) {
+        chunks.push(currentChunk);
+      }
+      currentChunk = {
+        old_lines: [],
+        new_lines: [],
+        change_context: hunkMatch[5]?.trim() || undefined,
+      };
+      lineNum = parseInt(hunkMatch[3], 10);
+      continue;
+    }
+
+    if (!currentChunk) continue;
+
+    if (line.startsWith(" ")) {
+      // Context line — appears in both old and new
+      currentChunk.old_lines.push(line.slice(1));
+      currentChunk.new_lines.push(line.slice(1));
+      lineNum++;
+    } else if (line.startsWith("-")) {
+      currentChunk.old_lines.push(line.slice(1));
+    } else if (line.startsWith("+")) {
+      currentChunk.new_lines.push(line.slice(1));
+      lineNum++;
+    }
+    // No newline at EOF marker
+    else if (line === "\\ No newline at end of file") {
+      if (currentChunk) {
+        currentChunk.is_end_of_file = true;
+      }
+    }
+  }
+
+  if (currentChunk && (currentChunk.old_lines.length || currentChunk.new_lines.length)) {
+    chunks.push(currentChunk);
+  }
+
+  return { type: "update", path: oldPath, chunks };
+}
+
+// ── Apply ──────────────────────────────────────────────────
+
+/**
+ * Apply a parsed patch to the filesystem.
+ * Returns results for each hunk.
+ */
+export function applyPatch(
+  patchText: string,
+  options: ApplyPatchOptions = {},
+): PatchResult[] {
+  const workdir = resolve(options.workdir || ".");
+  const hunks = parseUnifiedDiff(patchText, workdir);
+  if (!hunks.length) {
+    return [{ path: "unknown", type: "error", message: "No valid patch hunks found." }];
+  }
+  const validation = applyHunks(hunks, workdir, { ...options, dryRun: true });
+  if (validation.some(result => result.type === "error")) {
+    return validation;
+  }
+  if (options.dryRun) return validation;
+  const backups = backupPatchPaths(hunks, workdir);
+  const results = applyHunks(hunks, workdir, options);
+  if (results.some(result => result.type === "error")) {
+    restoreBackups(backups);
+  }
+  return results;
+}
+
+function applyHunks(hunks: Hunk[], workdir: string, options: ApplyPatchOptions): PatchResult[] {
+  const results: PatchResult[] = [];
+  for (const hunk of hunks) {
+    try {
+      results.push(applyHunk(hunk, workdir, options));
+    } catch (e: any) {
+      results.push({ path: (hunk as any).path || "unknown", type: "error", message: e.message });
+    }
+  }
+  return results;
+}
+
+function applyHunk(
+  hunk: Hunk, workdir: string, options: ApplyPatchOptions,
+): PatchResult {
+  const fullPath = resolvePatchPath(workdir, (hunk as any).path);
+
+  switch (hunk.type) {
+    case "add": {
+      const parent = dirname(fullPath);
+      if (options.createDirs === false && !existsSync(parent)) {
+        return {
+          path: relative(workdir, fullPath),
+          type: "error",
+          message: `Parent directory not found: ${relative(workdir, parent)}`,
+        };
+      }
+      if (!options.dryRun) {
+        if (options.createDirs !== false) {
+          mkdirSync(parent, { recursive: true });
+        }
+        writeFileSync(fullPath, (hunk as AddHunk).contents, "utf-8");
+      }
+      return {
+        path: relative(workdir, fullPath),
+        type: "add",
+        message: `Created: ${(hunk as AddHunk).contents.length} bytes`,
+        newContent: (hunk as AddHunk).contents,
+      };
+    }
+
+    case "delete": {
+      if (!existsSync(fullPath)) {
+        return {
+          path: relative(workdir, fullPath),
+          type: "error",
+          message: `File not found: ${relative(workdir, fullPath)}`,
+        };
+      }
+      const oldContent = readFileSync(fullPath, "utf-8");
+      if (!options.dryRun) {
+        unlinkSync(fullPath);
+      }
+      return {
+        path: relative(workdir, fullPath),
+        type: "delete",
+        message: "Deleted",
+        oldContent,
+      };
+    }
+
+    case "update": {
+      const updateHunk = hunk as UpdateHunk;
+      const sourcePath = fullPath;
+      const targetPath = updateHunk.move_path
+        ? resolvePatchPath(workdir, updateHunk.move_path)
+        : sourcePath;
+
+      if (!existsSync(sourcePath)) {
+        return {
+          path: relative(workdir, sourcePath),
+          type: "error",
+          message: `File not found: ${relative(workdir, sourcePath)}`,
+        };
+      }
+
+      const maxSize = options.maxFileSize || 5 * 1024 * 1024; // 5MB
+      const stat = statSync(sourcePath);
+      if (stat.size > maxSize) {
+        return {
+          path: relative(workdir, sourcePath),
+          type: "error",
+          message: `File too large: ${stat.size} bytes (max ${maxSize})`,
+        };
+      }
+
+      const targetParent = dirname(targetPath);
+      if (options.createDirs === false && !existsSync(targetParent)) {
+        return {
+          path: relative(workdir, targetPath),
+          type: "error",
+          message: `Parent directory not found: ${relative(workdir, targetParent)}`,
+        };
+      }
+
+      const oldContent = readFileSync(sourcePath, "utf-8");
+      let newContent = oldContent;
+
+      for (const chunk of updateHunk.chunks) {
+        // Find and replace the old_lines with new_lines
+        const oldBlock = chunk.old_lines.join("\n");
+        const newBlock = chunk.new_lines.join("\n");
+
+        if (oldBlock) {
+          if (!newContent.includes(oldBlock)) {
+            return {
+              path: relative(workdir, targetPath),
+              type: "error",
+              message: `Chunk not found in file. Context: ${chunk.change_context || "none"}`,
+              oldContent,
+            };
+          }
+          newContent = newContent.replace(oldBlock, newBlock);
+        }
+      }
+
+      if (updateHunk.move_path && targetPath !== fullPath) {
+        // Rename: write to new path, delete old
+        if (!options.dryRun) {
+          if (options.createDirs !== false) {
+            mkdirSync(targetParent, { recursive: true });
+          }
+          writeFileSync(targetPath, newContent, "utf-8");
+          if (existsSync(sourcePath)) unlinkSync(sourcePath);
+        }
+      } else {
+        if (!options.dryRun) {
+          writeFileSync(sourcePath, newContent, "utf-8");
+        }
+      }
+
+      return {
+        path: relative(workdir, targetPath),
+        type: "update",
+        message: `Updated: ${(updateHunk as UpdateHunk).chunks.length} chunk(s)${updateHunk.move_path ? ` (moved from ${relative(workdir, fullPath)})` : ""}`,
+        oldContent,
+        newContent,
+      };
+    }
+
+    default:
+      return {
+        path: (hunk as any).path || "unknown",
+        type: "skip",
+        message: "Unknown hunk type",
+      };
+  }
+}
+
+function backupPatchPaths(hunks: Hunk[], workdir: string): FileBackup[] {
+  const paths = new Set<string>();
+  for (const hunk of hunks) {
+    const source = resolvePatchPath(workdir, (hunk as any).path);
+    paths.add(source);
+    if (hunk.type === "update" && (hunk as UpdateHunk).move_path) {
+      paths.add(resolvePatchPath(workdir, (hunk as UpdateHunk).move_path!));
+    }
+  }
+  return [...paths].map(path => ({
+    path,
+    existed: existsSync(path),
+    content: existsSync(path) ? readFileSync(path, "utf-8") : undefined,
+  }));
+}
+
+function restoreBackups(backups: FileBackup[]): void {
+  for (const backup of backups.reverse()) {
+    try {
+      if (backup.existed) {
+        mkdirSync(dirname(backup.path), { recursive: true });
+        writeFileSync(backup.path, backup.content || "", "utf-8");
+      } else if (existsSync(backup.path)) {
+        unlinkSync(backup.path);
+      }
+    } catch {
+      // best-effort rollback; original patch error remains authoritative
+    }
+  }
+}
+
+function resolvePatchPath(workdir: string, patchPath: string): string {
+  const normalized = stripPatchPrefix(patchPath);
+  if (!normalized || isAbsolute(normalized)) {
+    throw new Error(`Unsafe patch path: ${patchPath}`);
+  }
+  const resolved = resolve(workdir, normalized);
+  const rel = relative(workdir, resolved);
+  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
+    assertRealPathInsideWorkdir(resolved, workdir, patchPath);
+    return resolved;
+  }
+  throw new Error(`Patch path escapes workdir: ${patchPath}`);
+}
+
+function stripPatchPrefix(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^(?:a|b)\//, "");
+}
+
+function assertRealPathInsideWorkdir(path: string, workdir: string, patchPath: string): void {
+  const realWorkdir = realpathSync(workdir);
+  const realTarget = existsSync(path) ? realpathSync(path) : realpathSync(nearestExistingParent(path));
+  const rel = relative(realWorkdir, realTarget);
+  if (rel === "" || (!!rel && !rel.startsWith("..") && !isAbsolute(rel) && !/^[a-zA-Z]:/.test(rel))) return;
+  throw new Error(`Patch path escapes workdir through symlink: ${patchPath}`);
+}
+
+function nearestExistingParent(path: string): string {
+  let current = path;
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) return parent;
+    current = parent;
+  }
+  return current;
+}
+
+export function formatPatchResult(results: PatchResult[]): string {
+  if (!results.length) return "No changes to apply.";
+
+  const byType: Record<string, PatchResult[]> = {};
+  for (const r of results) {
+    (byType[r.type] = byType[r.type] || []).push(r);
+  }
+
+  const lines: string[] = [];
+  for (const [type, items] of Object.entries(byType)) {
+    const icon = type === "add" ? "+" : type === "delete" ? "-" : type === "update" ? "~" : type === "error" ? "✗" : "○";
+    for (const item of items) {
+      lines.push(`  ${icon} ${item.path}: ${item.message}`);
+    }
+  }
+  const diffPreviews = results
+    .filter(item => (item.oldContent !== undefined || item.newContent !== undefined) && item.type !== "error")
+    .map(item => diffLines(item.oldContent || "", item.newContent || "", item.path))
+    .filter(Boolean);
+  if (diffPreviews.length) {
+    lines.push("", "[diff]", ...diffPreviews);
+  }
+  return lines.join("\n");
+}

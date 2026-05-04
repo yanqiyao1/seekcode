@@ -1,0 +1,276 @@
+/** Plan and todo tools — checklist_write, update_plan, note.
+ *
+ * Adopted from DeepSeek-TUI's decomposition-first approach.
+ * checklist_write: granular leaf tasks
+ * update_plan: high-level strategic phases
+ * note: persistent cross-session memory
+ */
+
+import { PermissionLevel } from "./base.js";
+import { getRegistry } from "./registry.js";
+
+// ── State types ──────────────────────────────────────────────
+
+interface PlanStep {
+  text: string;
+  status: "pending" | "in_progress" | "completed";
+  started_at?: number;
+  completed_at?: number;
+}
+
+interface TodoItem {
+  id: number;
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+}
+
+// ── In-memory state ──────────────────────────────────────────
+
+let planSteps: PlanStep[] = [];
+let todoItems: TodoItem[] = [];
+let nextTodoId = 1;
+let notes: Array<{ title: string; content: string; created_at: string }> = [];
+
+export function getPlanState() { return [...planSteps]; }
+export function getTodoState() { return [...todoItems]; }
+export function getNoteState() { return [...notes]; }
+export function clearPlanState() { planSteps = []; todoItems = []; nextTodoId = 1; }
+
+// ── checklist_write ──────────────────────────────────────────
+
+const STATUS_SYMBOLS: Record<string, string> = {
+  pending: "○",
+  in_progress: "◎",
+  completed: "●",
+};
+
+async function checklistWrite(args: Record<string, unknown>): Promise<string> {
+  const items = args.items as Array<{ content: string; status?: string }>;
+  if (!items || !Array.isArray(items)) return "Error: items must be an array";
+
+  todoItems = [];
+  nextTodoId = 1;
+  const lines: string[] = [];
+  let inProgressCount = 0;
+
+  for (const item of items) {
+    const status = (item.status || "pending") as TodoItem["status"];
+    if (status === "in_progress") inProgressCount++;
+    const ti: TodoItem = { id: nextTodoId++, content: item.content, status };
+    todoItems.push(ti);
+    lines.push(`  ${STATUS_SYMBOLS[status]} [${ti.id}] ${ti.content}`);
+  }
+
+  const header = `${todoItems.length} tasks, ${inProgressCount} in progress:\n`;
+  return header + lines.join("\n");
+}
+
+// ── update_plan ──────────────────────────────────────────────
+
+async function updatePlan(args: Record<string, unknown>): Promise<string> {
+  const explanation = (args.explanation as string) || "";
+  const plan = args.plan as Array<{ step: string; status?: string }> | undefined;
+
+  // If updating specific steps
+  if (plan && Array.isArray(plan)) {
+    for (const item of plan) {
+      const existing = planSteps.find(s => s.text === item.step);
+      if (existing) {
+        existing.status = (item.status as PlanStep["status"]) || existing.status;
+        if (item.status === "in_progress" && !existing.started_at) {
+          existing.started_at = Date.now();
+        }
+        if (item.status === "completed") {
+          existing.completed_at = Date.now();
+        }
+      }
+    }
+  } else if (explanation) {
+    // Narrative update — just add context, don't change plan
+    return `Plan context updated: ${explanation.slice(0, 500)}`;
+  }
+
+  // Render current plan
+  if (planSteps.length === 0) {
+    return "No active plan. Use update_plan with plan items to create one.";
+  }
+
+  const lines: string[] = [];
+  if (explanation) lines.push(`Context: ${explanation}\n`);
+
+  const completed = planSteps.filter(s => s.status === "completed").length;
+  const total = planSteps.length;
+  const pct = Math.round((completed / total) * 100);
+  lines.push(`Progress: ${completed}/${total} (${pct}%)`);
+
+  for (const step of planSteps) {
+    const sym = STATUS_SYMBOLS[step.status];
+    let timing = "";
+    if (step.started_at && step.completed_at) {
+      const secs = Math.round((step.completed_at - step.started_at) / 1000);
+      timing = ` (${secs}s)`;
+    }
+    lines.push(`  ${sym} ${step.text}${timing}`);
+  }
+
+  return lines.join("\n");
+}
+
+// Also provide a way to set the full plan
+async function setPlan(args: Record<string, unknown>): Promise<string> {
+  const explanation = (args.explanation as string) || "";
+  const plan = args.plan as Array<{ step: string; status?: string }> | undefined;
+
+  if (plan && Array.isArray(plan)) {
+    planSteps = plan.map(p => ({
+      text: p.step,
+      status: (p.status as PlanStep["status"]) || "pending",
+      started_at: p.status === "in_progress" ? Date.now() : undefined,
+    }));
+  }
+
+  return updatePlan(args);
+}
+
+// ── note ─────────────────────────────────────────────────────
+
+async function note(args: Record<string, unknown>): Promise<string> {
+  const title = (args.title as string) || "Untitled";
+  const content = (args.content as string) || "";
+  const action = (args.action as string) || "add";
+
+  if (action === "add" || action === "set") {
+    // Update existing or add new
+    const existing = notes.find(n => n.title === title);
+    if (existing) {
+      existing.content = content;
+      existing.created_at = new Date().toISOString();
+    } else {
+      notes.push({ title, content, created_at: new Date().toISOString() });
+    }
+    return `Note saved: "${title}"`;
+  }
+
+  if (action === "list") {
+    if (!notes.length) return "No notes saved.";
+    return notes.map(n =>
+      `- **${n.title}** (${n.created_at.slice(0, 10)}): ${n.content.slice(0, 200)}`
+    ).join("\n");
+  }
+
+  if (action === "get") {
+    const n = notes.find(n => n.title === title);
+    return n ? `**${n.title}** (${n.created_at.slice(0, 10)}):\n${n.content}` : `Note not found: "${title}"`;
+  }
+
+  if (action === "delete") {
+    const idx = notes.findIndex(n => n.title === title);
+    if (idx >= 0) { notes.splice(idx, 1); return `Note deleted: "${title}"`; }
+    return `Note not found: "${title}"`;
+  }
+
+  return `Unknown action: ${action}. Use add/set, get, list, or delete.`;
+}
+
+export function registerPlanTools(): void {
+  const r = getRegistry();
+
+  r.register({
+    name: "checklist_write",
+    description: "Create an action checklist for your current coding session. Break work into concrete, verifiable steps. Mark the first one in_progress. Updates the sidebar so the user can track progress. Use this BEFORE starting any non-trivial task.",
+    parameters: {
+      type: "object",
+      properties: {
+        items: {
+          type: "array",
+          description: "Array of {content: string, status?: 'pending'|'in_progress'|'completed'} objects",
+          items: {
+            type: "object",
+            properties: {
+              content: { type: "string", description: "Task description" },
+              status: { type: "string", enum: ["pending", "in_progress", "completed"], default: "pending" },
+            },
+            required: ["content"],
+          },
+        },
+      },
+      required: ["items"],
+    },
+    execute: checklistWrite,
+    permission: PermissionLevel.ALWAYS_ALLOW,
+    category: "meta",
+    parallelOk: false,
+  });
+
+  r.register({
+    name: "update_plan",
+    description: "Manage a high-level strategic plan (3-6 phases). Use this for complex multi-phase work. Layer checklist_write under each phase for granular steps. Update status as phases progress. Include an explanation field for narrative context.",
+    parameters: {
+      type: "object",
+      properties: {
+        explanation: { type: "string", description: "Narrative explanation of the plan or progress update" },
+        plan: {
+          type: "array",
+          description: "Array of {step: string, status?: 'pending'|'in_progress'|'completed'} objects",
+          items: {
+            type: "object",
+            properties: {
+              step: { type: "string", description: "Phase or step name" },
+              status: { type: "string", enum: ["pending", "in_progress", "completed"], default: "pending" },
+            },
+            required: ["step"],
+          },
+        },
+      },
+    },
+    execute: setPlan,
+    permission: PermissionLevel.ALWAYS_ALLOW,
+    category: "meta",
+    parallelOk: false,
+  });
+
+  r.register({
+    name: "note",
+    description: "Persistent memory for cross-session context. Use sparingly for important decisions, open blockers, and architectural context. Not for temporary scratch notes — use think for that.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Note title (used as key)" },
+        content: { type: "string", description: "Note content" },
+        action: { type: "string", enum: ["add", "set", "get", "list", "delete"], default: "set" },
+      },
+      required: ["title"],
+    },
+    execute: note,
+    permission: PermissionLevel.ALWAYS_ALLOW,
+    category: "meta",
+    parallelOk: false,
+  });
+
+  // Also add a debug command
+  r.register({
+    name: "plan_status",
+    description: "Show current plan and checklist state. Read-only diagnostic.",
+    parameters: {
+      type: "object",
+      properties: {},
+    },
+    execute: async () => {
+      const lines: string[] = [];
+      if (planSteps.length) {
+        lines.push("## Plan\n");
+        const pct = Math.round((planSteps.filter(s => s.status === "completed").length / planSteps.length) * 100);
+        lines.push(`Progress: ${pct}%\n`);
+        for (const s of planSteps) lines.push(`  ${STATUS_SYMBOLS[s.status]} ${s.text}`);
+      }
+      if (todoItems.length) {
+        lines.push("\n## Checklist\n");
+        for (const t of todoItems) lines.push(`  ${STATUS_SYMBOLS[t.status]} [${t.id}] ${t.content}`);
+      }
+      return lines.join("\n") || "No active plan or checklist.";
+    },
+    permission: PermissionLevel.ALWAYS_ALLOW,
+    category: "meta",
+    parallelOk: true,
+  });
+}

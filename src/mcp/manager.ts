@@ -1,0 +1,277 @@
+/** MCP Manager — lifecycle and tool registration bridge. */
+
+import { loadConfig, loadUserConfigRaw, writeUserConfigRaw, type Config, type MCPConfig } from "../config.js";
+import { MCPClient } from "./client.js";
+import { PermissionLevel, type ToolDef } from "../tools/base.js";
+import { getRegistry } from "../tools/registry.js";
+import { createArtifact } from "../artifacts/store.js";
+
+export type MCPServerStatus = "configured" | "connected" | "disabled" | "failed";
+
+export interface MCPServerView extends MCPConfig {
+  status: MCPServerStatus;
+  message?: string;
+  tool_count?: number;
+  failure_count?: number;
+  log_artifact_id?: string;
+  stderr_tail?: string;
+}
+
+export class MCPManager {
+  private config: Config;
+  private clients: Map<string, MCPClient> = new Map();
+  private statuses: Map<string, { status: MCPServerStatus; message?: string; tool_count?: number; failure_count?: number; log_artifact_id?: string; stderr_tail?: string }> = new Map();
+  private toolFingerprints: Map<string, string> = new Map();
+  private reconnectTimers: Map<string, NodeJS.Timeout> = new Map();
+
+  constructor(config: Config) { this.config = config; }
+
+  async connectAll(): Promise<Record<string, string>> {
+    const results: Record<string, string> = {};
+    for (const serverCfg of this.config.mcp_servers) {
+      if (serverCfg.enabled === false) {
+        results[serverCfg.name] = "disabled";
+        this.statuses.set(serverCfg.name, { status: "disabled" });
+        continue;
+      }
+      results[serverCfg.name] = await this.connectOne(serverCfg);
+    }
+    return results;
+  }
+
+  async connectOne(serverCfg: MCPConfig): Promise<string> {
+    await this.disconnectOne(serverCfg.name);
+    const client = new MCPClient(serverCfg);
+    const log = createArtifact({
+      kind: "mcp_log",
+      name: `${serverCfg.name}.log`,
+      content: "",
+      metadata: { server: serverCfg.name, transport: serverCfg.transport },
+      extension: ".log",
+    });
+    client.setLogFile(log.path);
+    client.onClose((message) => {
+      const current = this.statuses.get(serverCfg.name);
+      this.clients.delete(serverCfg.name);
+      this.toolFingerprints.delete(serverCfg.name);
+      unregisterMCPTools(serverCfg.name);
+      this.statuses.set(serverCfg.name, {
+        ...current,
+        status: "failed",
+        message,
+        failure_count: (current?.failure_count || 0) + 1,
+        stderr_tail: client.getStderrTail(),
+        log_artifact_id: current?.log_artifact_id || log.id,
+      });
+      this.scheduleReconnect(serverCfg);
+    });
+    try {
+      await client.connect();
+      await client.initialize();
+      const tools = await client.listTools();
+      this.registerTools(serverCfg, client, tools);
+      this.clients.set(serverCfg.name, client);
+      const fingerprint = JSON.stringify(tools.map(tool => ({ name: tool.name, schema: tool.inputSchema })).sort((a, b) => a.name.localeCompare(b.name)));
+      this.toolFingerprints.set(serverCfg.name, fingerprint);
+      const message = `connected (${tools.length} tools)`;
+      this.statuses.set(serverCfg.name, { status: "connected", message, tool_count: tools.length, failure_count: this.statuses.get(serverCfg.name)?.failure_count || 0, log_artifact_id: log.id });
+      return message;
+    } catch (e: any) {
+      const message = `failed: ${e.message}`;
+      const previous = this.statuses.get(serverCfg.name);
+      this.statuses.set(serverCfg.name, { status: "failed", message, failure_count: (previous?.failure_count || 0) + 1, log_artifact_id: log.id, stderr_tail: client.getStderrTail() });
+      this.scheduleReconnect(serverCfg);
+      return message;
+    }
+  }
+
+  async healthCheck(name?: string): Promise<Record<string, MCPServerView>> {
+    const views: Record<string, MCPServerView> = {};
+    for (const serverCfg of this.config.mcp_servers) {
+      if (name && serverCfg.name !== name) continue;
+      const client = this.clients.get(serverCfg.name);
+      if (!client) {
+        views[serverCfg.name] = this.viewFor(serverCfg);
+        continue;
+      }
+      const health = await client.health();
+      if (!health.ok) {
+        const current = this.statuses.get(serverCfg.name);
+        this.statuses.set(serverCfg.name, { ...current, status: "failed", message: health.message, stderr_tail: health.stderr_tail, failure_count: (current?.failure_count || 0) + 1 });
+        this.scheduleReconnect(serverCfg);
+      } else {
+        await this.refreshTools(serverCfg);
+      }
+      views[serverCfg.name] = this.viewFor(serverCfg);
+    }
+    return views;
+  }
+
+  async refreshTools(serverCfg: MCPConfig): Promise<boolean> {
+    const client = this.clients.get(serverCfg.name);
+    if (!client) return false;
+    try {
+      const tools = await client.listTools();
+      const fingerprint = JSON.stringify(tools.map(tool => ({ name: tool.name, schema: tool.inputSchema })).sort((a, b) => a.name.localeCompare(b.name)));
+      if (fingerprint === this.toolFingerprints.get(serverCfg.name)) return false;
+      unregisterMCPTools(serverCfg.name);
+      this.registerTools(serverCfg, client, tools);
+      this.toolFingerprints.set(serverCfg.name, fingerprint);
+      const current = this.statuses.get(serverCfg.name);
+      this.statuses.set(serverCfg.name, { ...current, status: "connected", message: `tools refreshed (${tools.length} tools)`, tool_count: tools.length });
+      return true;
+    } catch (e: any) {
+      const current = this.statuses.get(serverCfg.name);
+      this.statuses.set(serverCfg.name, { ...current, status: "failed", message: e.message, failure_count: (current?.failure_count || 0) + 1 });
+      return false;
+    }
+  }
+
+  private registerTools(serverCfg: MCPConfig, client: MCPClient, tools: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>): void {
+      const registry = getRegistry();
+      for (const tool of tools) {
+        registry.register({
+          name: `mcp_${serverCfg.name}_${tool.name}`,
+          description: `[MCP:${serverCfg.name}] ${tool.description || tool.name}`,
+          parameters: tool.inputSchema || { type: "object", properties: {} },
+          execute: async (args: Record<string, unknown>) => {
+            try { return await client.callTool(tool.name, args); }
+            catch (e: any) { return `Error: ${e.message}`; }
+          },
+          permission: PermissionLevel.ASK,
+          category: "mcp",
+          parallelOk: true,
+        });
+      }
+  }
+
+  async disconnectOne(name: string): Promise<boolean> {
+    const client = this.clients.get(name);
+    if (!client) return false;
+    await client.disconnect();
+    this.clients.delete(name);
+    this.toolFingerprints.delete(name);
+    const timer = this.reconnectTimers.get(name);
+    if (timer) clearTimeout(timer);
+    this.reconnectTimers.delete(name);
+    unregisterMCPTools(name);
+    this.statuses.set(name, { status: "configured" });
+    return true;
+  }
+
+  async disconnectAll(): Promise<void> {
+    for (const [name, client] of this.clients) {
+      await client.disconnect();
+      unregisterMCPTools(name);
+    }
+    this.clients.clear();
+    for (const timer of this.reconnectTimers.values()) clearTimeout(timer);
+    this.reconnectTimers.clear();
+    this.toolFingerprints.clear();
+  }
+
+  list(): MCPServerView[] {
+    return this.config.mcp_servers.map(server => {
+      return this.viewFor(server);
+    });
+  }
+
+  get serverNames(): string[] { return [...this.clients.keys()]; }
+
+  private viewFor(server: MCPConfig): MCPServerView {
+    const status = this.statuses.get(server.name);
+    return {
+      ...server,
+      status: server.enabled === false ? "disabled" : status?.status || (this.clients.has(server.name) ? "connected" : "configured"),
+      message: status?.message,
+      tool_count: status?.tool_count,
+      failure_count: status?.failure_count,
+      log_artifact_id: status?.log_artifact_id,
+      stderr_tail: status?.stderr_tail,
+    };
+  }
+
+  private scheduleReconnect(serverCfg: MCPConfig): void {
+    if (serverCfg.enabled === false || this.reconnectTimers.has(serverCfg.name)) return;
+    const failures = this.statuses.get(serverCfg.name)?.failure_count || 1;
+    const delay = Math.min(30_000, 1000 * 2 ** Math.min(5, failures - 1));
+    const timer = setTimeout(() => {
+      this.reconnectTimers.delete(serverCfg.name);
+      void this.connectOne(serverCfg);
+    }, delay);
+    this.reconnectTimers.set(serverCfg.name, timer);
+  }
+}
+
+let manager: MCPManager | null = null;
+
+export function getMCPManager(config = loadConfig()): MCPManager {
+  if (!manager) manager = new MCPManager(config);
+  return manager;
+}
+
+export async function reloadMCPManager(config = loadConfig()): Promise<MCPManager> {
+  if (manager) await manager.disconnectAll();
+  manager = new MCPManager(config);
+  await manager.connectAll();
+  return manager;
+}
+
+export async function clearMCPManagerForTests(): Promise<void> {
+  if (manager) await manager.disconnectAll();
+  manager = null;
+}
+
+export function addMCPServer(server: MCPConfig): MCPConfig[] {
+  const config = loadUserConfigRaw();
+  const servers = normalizeServers(config.mcp_servers);
+  const next = [...servers.filter(item => item.name !== server.name), { ...server, enabled: server.enabled !== false }];
+  config.mcp_servers = next;
+  writeUserConfigRaw(config);
+  return next;
+}
+
+export function setMCPServerEnabled(name: string, enabled: boolean): MCPConfig[] {
+  const config = loadUserConfigRaw();
+  const servers = normalizeServers(config.mcp_servers);
+  let found = false;
+  const next = servers.map(server => {
+    if (server.name !== name) return server;
+    found = true;
+    return { ...server, enabled };
+  });
+  if (!found) throw new Error(`MCP server not found: ${name}`);
+  config.mcp_servers = next;
+  writeUserConfigRaw(config);
+  return next;
+}
+
+export function removeMCPServer(name: string): MCPConfig[] {
+  const config = loadUserConfigRaw();
+  const servers = normalizeServers(config.mcp_servers);
+  const next = servers.filter(server => server.name !== name);
+  if (next.length === servers.length) throw new Error(`MCP server not found: ${name}`);
+  config.mcp_servers = next;
+  writeUserConfigRaw(config);
+  return next;
+}
+
+function unregisterMCPTools(serverName: string): void {
+  const prefix = `mcp_${serverName}_`;
+  const registry = getRegistry();
+  for (const tool of registry.listAll()) {
+    if (tool.name.startsWith(prefix)) registry.unregister(tool.name);
+  }
+}
+
+function normalizeServers(value: unknown): MCPConfig[] {
+  return Array.isArray(value) ? value.map(item => ({
+    name: String((item as any).name || ""),
+    transport: ((item as any).transport || "stdio") as MCPConfig["transport"],
+    command: (item as any).command ? String((item as any).command) : undefined,
+    args: Array.isArray((item as any).args) ? (item as any).args.map(String) : [],
+    url: (item as any).url ? String((item as any).url) : undefined,
+    env: typeof (item as any).env === "object" && (item as any).env ? (item as any).env as Record<string, string> : {},
+    enabled: (item as any).enabled !== false,
+  })).filter(server => server.name) : [];
+}
