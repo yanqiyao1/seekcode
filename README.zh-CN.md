@@ -369,10 +369,12 @@ status_items = ["mode", "model", "workspace", "cache", "tools", "cost", "hints"]
 enabled = true
 mode = "live"
 # auto 会优先使用已配置的 API 搜索引擎，再回退到 Bing/DuckDuckGo。
-# 支持：auto, brave, tavily, serper, searxng, bing, duckduckgo。
+# 支持：auto, google, brave, tavily, serper, searxng, arxiv, baidu, bing, duckduckgo。
 search_engine = "auto"
 allowed_domains = []
 blocked_domains = []
+google_api_key = ""
+google_cx = ""
 brave_api_key = ""
 tavily_api_key = ""
 serper_api_key = ""

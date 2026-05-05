@@ -32,6 +32,76 @@ afterEach(() => {
 });
 
 describe("web tools", () => {
+  it("uses configured Google Custom Search results", async () => {
+    getRegistry().clear();
+    registerWebTools({ google_api_key: "google-key", google_cx: "cx-id" });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      expect(url).toContain("www.googleapis.com/customsearch/v1");
+      expect(url).toContain("key=google-key");
+      expect(url).toContain("cx=cx-id");
+      expect(url).toContain("q=google+query");
+      return new Response(JSON.stringify({
+        items: [
+          { title: "Google Result", link: "https://example.com/google", snippet: "Google snippet" },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "google query", engine: "google" });
+
+    expect(result).toContain("Source: Google");
+    expect(result).toContain("Google Result");
+    expect(result).toContain("Google snippet");
+  });
+
+  it("uses arXiv Atom search results", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      expect(url).toContain("export.arxiv.org/api/query");
+      expect(url).toContain("search_query=cat%3Acs.AI");
+      return new Response(`
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <entry>
+            <id>https://arxiv.org/abs/2401.00001</id>
+            <title>Example arXiv Paper</title>
+            <summary>Paper summary text.</summary>
+            <link href="https://arxiv.org/abs/2401.00001" rel="alternate" type="text/html" />
+          </entry>
+        </feed>
+      `, { status: 200, headers: { "content-type": "application/atom+xml" } });
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "cat:cs.AI", engine: "arxiv" });
+
+    expect(result).toContain("Source: arXiv");
+    expect(result).toContain("Example arXiv Paper");
+    expect(result).toContain("Paper summary text.");
+    expect(result).toContain("https://arxiv.org/abs/2401.00001");
+  });
+
+  it("uses Baidu HTML search results when explicitly selected", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      expect(url).toContain("www.baidu.com/s");
+      expect(url).toContain("wd=baidu+query");
+      return new Response(`
+        <html><body>
+          <div class="result">
+            <h3><a href="https://example.com/baidu">Baidu Result</a></h3>
+            <div class="c-abstract">Baidu snippet</div>
+          </div>
+        </body></html>
+      `, { status: 200, headers: { "content-type": "text/html" } });
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "baidu query", engine: "baidu" });
+
+    expect(result).toContain("Source: Baidu");
+    expect(result).toContain("Baidu Result");
+    expect(result).toContain("Baidu snippet");
+  });
+
   it("uses configured Brave search results", async () => {
     getRegistry().clear();
     registerWebTools({ brave_api_key: "brave-key" });
@@ -122,9 +192,14 @@ describe("web tools", () => {
 
   it("auto search prefers configured API engines before scraper fallback", async () => {
     getRegistry().clear();
-    registerWebTools({ brave_api_key: "brave-key" });
+    registerWebTools({ google_api_key: "google-key", google_cx: "cx-id", brave_api_key: "brave-key" });
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = String(input);
+      if (url.includes("www.googleapis.com")) {
+        return new Response(JSON.stringify({
+          items: [{ title: "Auto Google", link: "https://example.com/auto-google" }],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
       if (url.includes("api.search.brave.com")) {
         return new Response(JSON.stringify({
           web: { results: [{ title: "Auto Brave", url: "https://example.com/auto-brave" }] },
@@ -135,8 +210,8 @@ describe("web tools", () => {
 
     const result = await getRegistry().lookup("web_search")!.execute({ query: "auto brave" });
 
-    expect(result).toContain("Source: Brave");
-    expect(result).toContain("Auto Brave");
+    expect(result).toContain("Source: Google");
+    expect(result).toContain("Auto Google");
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 

@@ -50,8 +50,11 @@ const BING_SEARCH_HEADERS = {
 const BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search";
 const TAVILY_SEARCH_URL = "https://api.tavily.com/search";
 const SERPER_SEARCH_URL = "https://google.serper.dev/search";
+const GOOGLE_CUSTOM_SEARCH_URL = "https://www.googleapis.com/customsearch/v1";
+const ARXIV_SEARCH_URL = "https://export.arxiv.org/api/query";
+const BAIDU_SEARCH_URL = "https://www.baidu.com/s";
 
-type SearchEngine = "auto" | "bing" | "duckduckgo" | "brave" | "tavily" | "serper" | "searxng";
+type SearchEngine = "auto" | "bing" | "duckduckgo" | "brave" | "tavily" | "serper" | "searxng" | "google" | "arxiv" | "baidu";
 type SearchType = "auto" | "fast" | "deep";
 
 interface SearchEntry {
@@ -97,6 +100,8 @@ interface ResolvedWebConfig {
   searchEngine: SearchEngine;
   allowedDomains: string[];
   blockedDomains: string[];
+  googleApiKey: string;
+  googleCx: string;
   braveApiKey: string;
   tavilyApiKey: string;
   serperApiKey: string;
@@ -143,7 +148,10 @@ function normalizeSearchEngine(value: unknown): SearchEngine {
   if (normalized === "duckduckgo" || normalized === "ddg") return "duckduckgo";
   if (normalized === "brave" || normalized === "bravesearch") return "brave";
   if (normalized === "tavily") return "tavily";
-  if (normalized === "serper" || normalized === "google" || normalized === "googleserper") return "serper";
+  if (normalized === "serper" || normalized === "googleserper") return "serper";
+  if (normalized === "google" || normalized === "googlecustomsearch" || normalized === "googlecse") return "google";
+  if (normalized === "arxiv") return "arxiv";
+  if (normalized === "baidu") return "baidu";
   if (normalized === "searxng" || normalized === "searx") return "searxng";
   return "auto";
 }
@@ -191,6 +199,12 @@ function resolveWebConfig(config?: Partial<WebConfig>): ResolvedWebConfig {
     searchEngine: normalizeSearchEngine(config?.search_engine),
     allowedDomains: normalizeDomainList(config?.allowed_domains),
     blockedDomains: normalizeDomainList(config?.blocked_domains),
+    googleApiKey: typeof config?.google_api_key === "string" && config.google_api_key.trim()
+      ? config.google_api_key.trim()
+      : envString("GOOGLE_API_KEY"),
+    googleCx: typeof config?.google_cx === "string" && config.google_cx.trim()
+      ? config.google_cx.trim()
+      : envString("GOOGLE_CSE_ID") || envString("GOOGLE_CX"),
     braveApiKey: typeof config?.brave_api_key === "string" && config.brave_api_key.trim()
       ? config.brave_api_key.trim()
       : envString("BRAVE_SEARCH_API_KEY") || envString("BRAVE_API_KEY"),
@@ -487,6 +501,8 @@ function searchCacheKey(
     engine,
     searchType,
     blockedDomains: [...config.blockedDomains].sort(),
+    google: Boolean(config.googleApiKey && config.googleCx),
+    googleCx: config.googleCx,
     brave: Boolean(config.braveApiKey),
     tavily: Boolean(config.tavilyApiKey),
     serper: Boolean(config.serperApiKey),
@@ -622,6 +638,33 @@ function parseBingResults(html: string, maxResults: number): SearchEntry[] {
     return undefined;
   });
   return results;
+}
+
+function parseBaiduResults(html: string, maxResults: number): SearchEntry[] {
+  const $ = cheerio.load(html);
+  const results: SearchEntry[] = [];
+  const selectors = [
+    "div.result",
+    "div.c-container",
+    "div.result-op",
+  ].join(",");
+  $(selectors).each((_, el) => {
+    if (results.length >= maxResults) return false;
+    const anchor = $(el).find("h3 a[href], a[href]").first();
+    const title = normalizeText(anchor.html() || anchor.text());
+    const href = anchor.attr("href") || "";
+    const snippet = normalizeText(
+      $(el).find(".c-abstract").first().html()
+      || $(el).find(".content-right_8Zs40").first().html()
+      || $(el).text(),
+    );
+    if (title && href) {
+      const url = href.startsWith("//") ? `https:${href}` : href.startsWith("/") ? `https://www.baidu.com${href}` : href;
+      results.push({ title, url, snippet: snippet && snippet !== title ? snippet : undefined });
+    }
+    return undefined;
+  });
+  return dedupeSearchResults(results, maxResults);
 }
 
 function parseGenericResults(html: string, baseUrl: string, maxResults: number): SearchEntry[] {
@@ -976,6 +1019,79 @@ async function searchSerper(query: string, maxResults: number, timeoutMs: number
     .slice(0, maxResults);
 }
 
+async function searchGoogle(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
+  if (!config.googleApiKey || !config.googleCx) throw new Error("Google Custom Search API key and cx are not configured");
+  await assertPublicUrl(GOOGLE_CUSTOM_SEARCH_URL, { ...config, allowedDomains: [] });
+  const url = new URL(GOOGLE_CUSTOM_SEARCH_URL);
+  url.searchParams.set("key", config.googleApiKey);
+  url.searchParams.set("cx", config.googleCx);
+  url.searchParams.set("q", query);
+  url.searchParams.set("num", String(maxResults));
+  const payload = await fetchJson(url.toString(), timeoutMs, {
+    signal,
+    config,
+    headers: { "Accept": "application/json" },
+  });
+  const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).items : undefined;
+  if (!Array.isArray(items)) return [];
+  return items
+    .map(item => item && typeof item === "object"
+      ? entryFromRecord(item as Record<string, unknown>, { title: ["title", "htmlTitle"], url: ["link"], snippet: ["snippet", "htmlSnippet"] })
+      : null)
+    .filter((item): item is SearchEntry => Boolean(item))
+    .slice(0, maxResults);
+}
+
+async function searchArxiv(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
+  await assertPublicUrl(ARXIV_SEARCH_URL, { ...config, allowedDomains: [] });
+  const url = new URL(ARXIV_SEARCH_URL);
+  url.searchParams.set("search_query", query);
+  url.searchParams.set("start", "0");
+  url.searchParams.set("max_results", String(maxResults));
+  const resp = await fetchText(url.toString(), timeoutMs, "application/atom+xml,application/xml,text/xml,*/*;q=0.5", {
+    signal,
+    maxBytes: Math.min(DEFAULT_MAX_BYTES, config.maxBytes),
+    retries: 1,
+    config,
+  });
+  if (resp.status < 200 || resp.status >= 300) throw new Error(`arXiv HTTP ${resp.status}`);
+  const $ = cheerio.load(resp.text, { xmlMode: true });
+  const results: SearchEntry[] = [];
+  $("entry").each((_, el) => {
+    if (results.length >= maxResults) return false;
+    const title = normalizeText($(el).find("title").first().text());
+    const id = normalizeText($(el).find("id").first().text());
+    const summary = normalizeText($(el).find("summary").first().text());
+    const htmlLink = $(el).find("link[rel='alternate']").attr("href")
+      || $(el).find("link[type='text/html']").attr("href")
+      || id;
+    if (title && /^https?:\/\//.test(htmlLink)) {
+      results.push({ title, url: htmlLink, snippet: summary || undefined });
+    }
+    return undefined;
+  });
+  return results;
+}
+
+async function searchBaidu(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
+  await assertPublicUrl(BAIDU_SEARCH_URL, { ...config, allowedDomains: [] });
+  const url = new URL(BAIDU_SEARCH_URL);
+  url.searchParams.set("wd", query);
+  const resp = await fetchText(url.toString(), timeoutMs, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", {
+    signal,
+    maxBytes: Math.min(DEFAULT_MAX_BYTES, config.maxBytes),
+    retries: 1,
+    config,
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+    },
+  });
+  if (resp.status < 200 || resp.status >= 300) throw new Error(`Baidu HTTP ${resp.status}`);
+  const results = parseBaiduResults(resp.text, maxResults);
+  return results.length ? results : parseGenericResults(resp.text, resp.url, maxResults);
+}
+
 async function searchSearxng(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
   if (!config.searxngUrl) throw new Error("SearXNG URL is not configured");
   const base = config.searxngUrl.replace(/\/+$/, "");
@@ -1008,12 +1124,15 @@ interface SearchCandidate {
 
 function configuredSearchCandidates(config: ResolvedWebConfig): SearchCandidate[] {
   return [
+    { engine: "google", source: "Google", run: searchGoogle, available: Boolean(config.googleApiKey && config.googleCx) },
     { engine: "brave", source: "Brave", run: searchBrave, available: Boolean(config.braveApiKey) },
     { engine: "tavily", source: "Tavily", run: searchTavily, available: Boolean(config.tavilyApiKey) },
     { engine: "serper", source: "Serper", run: searchSerper, available: Boolean(config.serperApiKey) },
     { engine: "searxng", source: "SearXNG", run: searchSearxng, available: Boolean(config.searxngUrl) },
     { engine: "bing", source: "Bing", run: searchBing, available: true },
     { engine: "duckduckgo", source: "DuckDuckGo", run: searchDuckDuckGo, available: true },
+    { engine: "arxiv", source: "arXiv", run: searchArxiv, available: false },
+    { engine: "baidu", source: "Baidu", run: searchBaidu, available: false },
   ];
 }
 
@@ -1435,7 +1554,7 @@ export function registerWebTools(configInput?: Partial<WebConfig>): void {
         max_results: { type: "integer", default: DEFAULT_MAX_RESULTS, maximum: MAX_RESULTS },
         timeout_ms: { type: "integer", default: DEFAULT_SEARCH_TIMEOUT_MS, maximum: MAX_TIMEOUT_MS },
         domains: { type: "array", items: { type: "string" }, description: "Optional domain filter, e.g. [\"example.com\"]." },
-        engine: { type: "string", enum: ["auto", "brave", "tavily", "serper", "searxng", "bing", "duckduckgo"], default: "auto" },
+        engine: { type: "string", enum: ["auto", "google", "brave", "tavily", "serper", "searxng", "arxiv", "baidu", "bing", "duckduckgo"], default: "auto" },
         type: { type: "string", enum: ["auto", "fast", "deep"], default: "auto", description: "Search depth. deep merges engines and includes page context by default." },
         fetch_results: { type: "boolean", default: false, description: "Fetch top result pages and include extracted context." },
         include_content: { type: "boolean", default: false, description: "Alias for fetch_results." },

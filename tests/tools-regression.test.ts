@@ -1039,6 +1039,8 @@ describe("config and pricing", () => {
       'searchEngine = "duckduckgo"',
       'allowedDomains = ["example.com"]',
       'blocked_domains = ["blocked.example"]',
+      'googleApiKey = "google-user-key"',
+      'googleCx = "google-cx"',
       'braveApiKey = "brave-user-key"',
       'searxngUrl = "https://search.example"',
       'proxy = "http://proxy.example:8080"',
@@ -1054,6 +1056,8 @@ describe("config and pricing", () => {
     expect(cfg.web.search_engine).toBe("duckduckgo");
     expect(cfg.web.allowed_domains).toEqual(["example.com"]);
     expect(cfg.web.blocked_domains).toEqual(["blocked.example"]);
+    expect(cfg.web.google_api_key).toBe("google-user-key");
+    expect(cfg.web.google_cx).toBe("google-cx");
     expect(cfg.web.brave_api_key).toBe("brave-user-key");
     expect(cfg.web.searxng_url).toBe("https://search.example");
     expect(cfg.web.proxy).toBe("http://proxy.example:8080");

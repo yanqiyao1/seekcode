@@ -34,9 +34,11 @@ const StatusItemSchema = z.enum([
 const WebConfigSchema = z.object({
   enabled: z.boolean().default(true),
   mode: z.enum(["live", "off"]).default("live"),
-  search_engine: z.enum(["auto", "bing", "duckduckgo", "brave", "tavily", "serper", "searxng"]).default("auto"),
+  search_engine: z.enum(["auto", "bing", "duckduckgo", "brave", "tavily", "serper", "searxng", "google", "arxiv", "baidu"]).default("auto"),
   allowed_domains: z.array(z.string()).default([]),
   blocked_domains: z.array(z.string()).default([]),
+  google_api_key: z.string().default(""),
+  google_cx: z.string().default(""),
   brave_api_key: z.string().default(""),
   tavily_api_key: z.string().default(""),
   serper_api_key: z.string().default(""),
@@ -183,6 +185,8 @@ function loadEnv(): Record<string, unknown> {
     ["DEEPSEEK_WEB_SEARCH_ENGINE", "web.search_engine"],
     ["DEEPSEEK_WEB_ALLOWED_DOMAINS", "web.allowed_domains"],
     ["DEEPSEEK_WEB_BLOCKED_DOMAINS", "web.blocked_domains"],
+    ["DEEPSEEK_WEB_GOOGLE_API_KEY", "web.google_api_key"],
+    ["DEEPSEEK_WEB_GOOGLE_CX", "web.google_cx"],
     ["DEEPSEEK_WEB_BRAVE_API_KEY", "web.brave_api_key"],
     ["DEEPSEEK_WEB_TAVILY_API_KEY", "web.tavily_api_key"],
     ["DEEPSEEK_WEB_SERPER_API_KEY", "web.serper_api_key"],
@@ -217,6 +221,12 @@ function loadEnv(): Record<string, unknown> {
   }
   if (process.env.DEEPSEEK_WEB_ENABLED) {
     setNested(result, "web.enabled", parseBool(process.env.DEEPSEEK_WEB_ENABLED));
+  }
+  if (!getNested(result, "web.google_api_key") && process.env.GOOGLE_API_KEY) {
+    setNested(result, "web.google_api_key", process.env.GOOGLE_API_KEY);
+  }
+  if (!getNested(result, "web.google_cx") && (process.env.GOOGLE_CSE_ID || process.env.GOOGLE_CX)) {
+    setNested(result, "web.google_cx", process.env.GOOGLE_CSE_ID || process.env.GOOGLE_CX);
   }
   if (!getNested(result, "web.brave_api_key") && process.env.BRAVE_SEARCH_API_KEY) {
     setNested(result, "web.brave_api_key", process.env.BRAVE_SEARCH_API_KEY);
@@ -477,6 +487,8 @@ function migrateConfigObject(input: Record<string, unknown>): { config: Record<s
     webRename("searchEngine", "search_engine");
     webRename("allowedDomains", "allowed_domains");
     webRename("blockedDomains", "blocked_domains");
+    webRename("googleApiKey", "google_api_key");
+    webRename("googleCx", "google_cx");
     webRename("braveApiKey", "brave_api_key");
     webRename("tavilyApiKey", "tavily_api_key");
     webRename("serperApiKey", "serper_api_key");

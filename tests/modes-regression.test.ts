@@ -25,6 +25,8 @@ beforeEach(() => {
     "DEEPSEEK_WEB_SEARCH_ENGINE",
     "DEEPSEEK_WEB_ALLOWED_DOMAINS",
     "DEEPSEEK_WEB_BLOCKED_DOMAINS",
+    "DEEPSEEK_WEB_GOOGLE_API_KEY",
+    "DEEPSEEK_WEB_GOOGLE_CX",
     "DEEPSEEK_WEB_BRAVE_API_KEY",
     "DEEPSEEK_WEB_TAVILY_API_KEY",
     "DEEPSEEK_WEB_SERPER_API_KEY",
@@ -177,6 +179,8 @@ describe("config precedence and migration", () => {
       "",
     ].join("\n"));
     process.env.DEEPSEEK_WEB_ALLOWED_DOMAINS = "env.example";
+    process.env.DEEPSEEK_WEB_GOOGLE_API_KEY = "env-google";
+    process.env.DEEPSEEK_WEB_GOOGLE_CX = "env-cx";
     process.env.DEEPSEEK_WEB_BRAVE_API_KEY = "env-brave";
     process.env.DEEPSEEK_WEB_SEARXNG_URL = "https://env-search.example";
     process.env.DEEPSEEK_MAX_TOKENS = "999999";
@@ -189,6 +193,8 @@ describe("config precedence and migration", () => {
     expect(cfg.web.search_engine).toBe("bing");
     expect(cfg.web.allowed_domains).toEqual(["env.example"]);
     expect(cfg.web.blocked_domains).toEqual(["project-block.example"]);
+    expect(cfg.web.google_api_key).toBe("env-google");
+    expect(cfg.web.google_cx).toBe("env-cx");
     expect(cfg.web.brave_api_key).toBe("env-brave");
     expect(cfg.web.searxng_url).toBe("https://env-search.example");
     expect(cfg.web.proxy).toBe("http://user.proxy:8080");
