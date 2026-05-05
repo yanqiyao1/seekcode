@@ -278,7 +278,7 @@ describe("Renderer", () => {
     }
   });
 
-  it("keeps the default footer focused without context budget or elapsed time", () => {
+  it("keeps the default footer focused without context, cache, cost, or hints", () => {
     const originalColumns = process.stdout.columns;
     process.stdout.columns = 120;
     try {
@@ -288,16 +288,21 @@ describe("Renderer", () => {
         workspace: "/ssd/yqy/projects/seek-code",
         tokens: 42_000,
         contextLimit: 1_000_000,
+        cacheTokens: 7300,
         elapsedMs: 12_000,
+        cost: 0.001,
         keyHints: "esc to interrupt  Shift+Tab switch mode",
       }));
 
       expect(rendered).toContain("AGENT");
       expect(rendered).toContain("deepseek-v4-pro");
       expect(rendered).toContain("/ssd/yqy/projects/seek-code");
-      expect(rendered).toContain("Shift+Tab switch mode");
       expect(rendered).not.toContain("ctx ");
+      expect(rendered).not.toContain("cache ");
       expect(rendered).not.toContain("elapsed ");
+      expect(rendered).not.toContain("$");
+      expect(rendered).not.toContain("esc");
+      expect(rendered).not.toContain("Tab complete");
       expect(rendered).not.toContain("tools ");
     } finally {
       process.stdout.columns = originalColumns;

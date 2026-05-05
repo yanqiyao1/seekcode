@@ -542,8 +542,10 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     });
   };
 
+  const footerItems = () => cfg.status_items.filter(item => !["cache", "cost", "tools", "hints"].includes(item));
+
   const footerPrompt = () =>
-    r.footerConfigured(session.id, cfg.status_items, {
+    r.footerConfigured(session.id, footerItems(), {
       mode: cfg.mode,
       model: cfg.model,
       workspace: session.workspace_path || resolve("."),
@@ -553,9 +555,6 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       activeTools: activeToolLines.size,
       elapsedMs: engineRunning && activeTurnStartedAt ? Date.now() - activeTurnStartedAt : lastTurnDurationMs,
       cost: costTracker.totalCost,
-      keyHints: useAlternateScreen
-        ? "esc interrupt  PgUp/PgDn scroll  Tab complete  Shift+Tab mode"
-        : "esc interrupt  Tab complete  Shift+Tab mode",
     });
 
   const rebuildSystemPrompt = () => {
@@ -611,6 +610,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         if (message.reasoning_content) {
           transcript.append(r.thinkingHeader(undefined, false));
           transcript.append(r.thinkingText(message.reasoning_content));
+          if (message.content) transcript.append("");
         }
         if (message.content) transcript.append(renderMarkdown(message.content));
       } else if (message.role === "tool") {
@@ -663,6 +663,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     const formatted = r.thinkingText(thinkingBuf);
     if (formatted) {
       transcript.append(formatted);
+      transcript.append("");
       transcript.append("");
     }
     thinkingBodyFlushed = true;

@@ -163,7 +163,7 @@ export type StatusItemName =
 
 export function statusBarFromItems(items: string[], state: StatusBarState): string {
   const width = w();
-  const normalized = items.length ? items : ["mode", "model", "workspace", "cache", "cost", "hints"];
+  const normalized = items.length ? items : ["mode", "model", "workspace"];
   const leftParts: string[] = [];
   let right = "";
   for (const item of normalized) {
