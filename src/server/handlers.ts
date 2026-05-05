@@ -42,6 +42,7 @@ import { registerToolSearchTool } from "../tools/tool-search.js";
 import { registerTaskTools } from "../tools/tasks.js";
 import { registerDiagnosticsTools } from "../tools/diagnostics.js";
 import { registerArtifactTools } from "../tools/artifacts.js";
+import { VERSION } from "../version.js";
 
 // Ensure tools registered
 let toolsReadyKey = "";
@@ -71,7 +72,7 @@ function ensureTools(config?: Config) {
 }
 
 export async function health(c: Context) {
-  return c.json({ status: "ok", version: "0.1.0" });
+  return c.json({ status: "ok", version: VERSION });
 }
 
 export async function createSessionHandler(c: Context) {

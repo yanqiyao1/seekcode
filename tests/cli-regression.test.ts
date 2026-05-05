@@ -39,6 +39,7 @@ describe("CLI and packaging", () => {
   });
 
   it("prints help and version from source and dist entrypoints", () => {
+    const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf-8"));
     for (const cli of [srcCli, distCli]) {
       const help = runCli(cli, ["--help"]);
       const version = runCli(cli, ["--version"]);
@@ -49,7 +50,7 @@ describe("CLI and packaging", () => {
       expect(help.stdout).toContain("serve [options]");
       expect(help.stdout).toContain("config [options]");
       expect(version.status).toBe(0);
-      expect(version.stdout.trim()).toMatch(/^0\.1\.0$/);
+      expect(version.stdout.trim()).toBe(pkg.version);
     }
   });
 

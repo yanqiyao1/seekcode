@@ -3,6 +3,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import type { MCPConfig } from "../config.js";
+import { VERSION } from "../version.js";
 import { createRequest, type JSONRPCResponse, type MCPTool } from "./protocol.js";
 
 type PendingRequest = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
@@ -75,7 +76,7 @@ export class MCPClient {
     return this.request("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "seek-code", version: "0.1.0" },
+      clientInfo: { name: "seek-code", version: VERSION },
     }) as Promise<Record<string, unknown>>;
   }
 

@@ -84,8 +84,8 @@ import { injectAgentsMd } from "./engine/agents-md.js";
 import { defaultBaseUrlForProvider, extractCachedInputTokens, parseProvider, providerCapability, type ApiProvider } from "./client/capabilities.js";
 import { addMCPServer, getMCPManager, reloadMCPManager, removeMCPServer, setMCPServerEnabled } from "./mcp/manager.js";
 import { linkArtifact } from "./artifacts/store.js";
-
-const VERSION = "0.1.0";
+import { VERSION } from "./version.js";
+import { maybePromptForUpdate } from "./update-check.js";
 
 function parseOptionalInt(value: string | undefined): number | undefined {
   if (value === undefined || value === "") return undefined;
@@ -1710,6 +1710,7 @@ program
     if (prompt) {
       await runOneShot(cfg, prompt);
     } else {
+      await maybePromptForUpdate();
       await runInteractive(cfg);
     }
   });

@@ -130,6 +130,8 @@ export DEEPSEEK_API_KEY="sk-your-api-key"
 seek
 ```
 
+交互模式启动时，如果 stdin/stdout 是 TTY，Seek Code 会到 npm 查询 `seekcode` 是否有新版本。发现更新时会先询问，确认后才运行 `npm install -g seekcode@latest`；设置 `SEEKCODE_SKIP_UPDATE_CHECK=1` 或 `NO_UPDATE_NOTIFIER=1` 可以跳过检查。
+
 进入后可以直接输入自然语言任务：
 
 ```text
@@ -403,6 +405,8 @@ max_bytes = 1000000
 ```
 
 ### 配置管理命令
+
+这些命令会确保 `~/.seekcode/config.toml` 存在：`validate` 会校验解析后的配置，`explain` 会展示来源、优先级、冲突和最终值。
 
 ```bash
 seek config validate

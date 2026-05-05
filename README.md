@@ -156,6 +156,8 @@ export DEEPSEEK_API_KEY="sk-your-api-key"
 seek
 ```
 
+Interactive startup checks npm for a newer `seekcode` package when stdin/stdout are TTYs. If an update is available, Seek Code asks before running `npm install -g seekcode@latest`; set `SEEKCODE_SKIP_UPDATE_CHECK=1` or `NO_UPDATE_NOTIFIER=1` to skip this check.
+
 Inside the interactive session:
 
 ```text
@@ -448,8 +450,8 @@ max_bytes = 1000000
 
 | Command | Behavior |
 |---|---|
-| `seek config validate` | Reads configured sources and reports schema/semantic issues. Does not create files. |
-| `seek config explain` | Shows sources, precedence, conflicts, and resolved values. Does not create files. |
+| `seek config validate` | Ensures `~/.seekcode/config.toml` exists, then reports schema/semantic issues for the resolved config. |
+| `seek config explain` | Ensures `~/.seekcode/config.toml` exists, then shows sources, precedence, conflicts, and resolved values. |
 | `seek config migrate --target user --dry-run` | Reports legacy-key migrations for the user config without writing. |
 | `seek config migrate --target user` | Rewrites the existing user config, or copies/migrates legacy `~/.config/deepseek/config.toml` to `~/.seekcode/config.toml`. |
 | `seek config migrate --target project` | Rewrites the existing project config, or copies/migrates legacy `.deepseek/config.toml` to `.seekcode/config.toml`. |
