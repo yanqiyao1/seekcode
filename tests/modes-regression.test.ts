@@ -25,6 +25,10 @@ beforeEach(() => {
     "DEEPSEEK_WEB_SEARCH_ENGINE",
     "DEEPSEEK_WEB_ALLOWED_DOMAINS",
     "DEEPSEEK_WEB_BLOCKED_DOMAINS",
+    "DEEPSEEK_WEB_BRAVE_API_KEY",
+    "DEEPSEEK_WEB_TAVILY_API_KEY",
+    "DEEPSEEK_WEB_SERPER_API_KEY",
+    "DEEPSEEK_WEB_SEARXNG_URL",
     "DEEPSEEK_WEB_PROXY",
     "DEEPSEEK_APPROVAL_POLICY",
     "DEEPSEEK_SANDBOX_MODE",
@@ -173,6 +177,8 @@ describe("config precedence and migration", () => {
       "",
     ].join("\n"));
     process.env.DEEPSEEK_WEB_ALLOWED_DOMAINS = "env.example";
+    process.env.DEEPSEEK_WEB_BRAVE_API_KEY = "env-brave";
+    process.env.DEEPSEEK_WEB_SEARXNG_URL = "https://env-search.example";
     process.env.DEEPSEEK_MAX_TOKENS = "999999";
     process.chdir(tmp);
 
@@ -183,6 +189,8 @@ describe("config precedence and migration", () => {
     expect(cfg.web.search_engine).toBe("bing");
     expect(cfg.web.allowed_domains).toEqual(["env.example"]);
     expect(cfg.web.blocked_domains).toEqual(["project-block.example"]);
+    expect(cfg.web.brave_api_key).toBe("env-brave");
+    expect(cfg.web.searxng_url).toBe("https://env-search.example");
     expect(cfg.web.proxy).toBe("http://user.proxy:8080");
     expect(cfg.web.fetch_timeout_ms).toBe(2200);
     expect(cfg.max_tokens).toBe(262_144);

@@ -34,9 +34,13 @@ const StatusItemSchema = z.enum([
 const WebConfigSchema = z.object({
   enabled: z.boolean().default(true),
   mode: z.enum(["live", "off"]).default("live"),
-  search_engine: z.enum(["auto", "bing", "duckduckgo"]).default("auto"),
+  search_engine: z.enum(["auto", "bing", "duckduckgo", "brave", "tavily", "serper", "searxng"]).default("auto"),
   allowed_domains: z.array(z.string()).default([]),
   blocked_domains: z.array(z.string()).default([]),
+  brave_api_key: z.string().default(""),
+  tavily_api_key: z.string().default(""),
+  serper_api_key: z.string().default(""),
+  searxng_url: z.string().default(""),
   proxy: z.string().default(""),
   no_proxy: z.array(z.string()).default([]),
   search_timeout_ms: z.number().int().positive().default(15_000),
@@ -179,6 +183,10 @@ function loadEnv(): Record<string, unknown> {
     ["DEEPSEEK_WEB_SEARCH_ENGINE", "web.search_engine"],
     ["DEEPSEEK_WEB_ALLOWED_DOMAINS", "web.allowed_domains"],
     ["DEEPSEEK_WEB_BLOCKED_DOMAINS", "web.blocked_domains"],
+    ["DEEPSEEK_WEB_BRAVE_API_KEY", "web.brave_api_key"],
+    ["DEEPSEEK_WEB_TAVILY_API_KEY", "web.tavily_api_key"],
+    ["DEEPSEEK_WEB_SERPER_API_KEY", "web.serper_api_key"],
+    ["DEEPSEEK_WEB_SEARXNG_URL", "web.searxng_url"],
     ["DEEPSEEK_WEB_PROXY", "web.proxy"],
     ["DEEPSEEK_WEB_NO_PROXY", "web.no_proxy"],
     ["DEEPSEEK_WEB_SEARCH_TIMEOUT_MS", "web.search_timeout_ms"],
@@ -210,6 +218,18 @@ function loadEnv(): Record<string, unknown> {
   if (process.env.DEEPSEEK_WEB_ENABLED) {
     setNested(result, "web.enabled", parseBool(process.env.DEEPSEEK_WEB_ENABLED));
   }
+  if (!getNested(result, "web.brave_api_key") && process.env.BRAVE_SEARCH_API_KEY) {
+    setNested(result, "web.brave_api_key", process.env.BRAVE_SEARCH_API_KEY);
+  }
+  if (!getNested(result, "web.tavily_api_key") && process.env.TAVILY_API_KEY) {
+    setNested(result, "web.tavily_api_key", process.env.TAVILY_API_KEY);
+  }
+  if (!getNested(result, "web.serper_api_key") && process.env.SERPER_API_KEY) {
+    setNested(result, "web.serper_api_key", process.env.SERPER_API_KEY);
+  }
+  if (!getNested(result, "web.searxng_url") && process.env.SEARXNG_URL) {
+    setNested(result, "web.searxng_url", process.env.SEARXNG_URL);
+  }
   if (process.env.DEEPSEEK_TRUSTED_WORKSPACES) {
     result.trusted_workspaces = process.env.DEEPSEEK_TRUSTED_WORKSPACES
       .split(":")
@@ -236,6 +256,15 @@ function setNested(target: Record<string, unknown>, key: string, value: unknown)
     current = current[part] as Record<string, unknown>;
   }
   current[parts[parts.length - 1]!] = value;
+}
+
+function getNested(target: Record<string, unknown>, key: string): unknown {
+  let current: unknown = target;
+  for (const part of key.split(".")) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
+    current = (current as Record<string, unknown>)[part];
+  }
+  return current;
 }
 
 export function loadConfig(cliOverrides: Record<string, unknown> = {}): Config {
@@ -448,6 +477,10 @@ function migrateConfigObject(input: Record<string, unknown>): { config: Record<s
     webRename("searchEngine", "search_engine");
     webRename("allowedDomains", "allowed_domains");
     webRename("blockedDomains", "blocked_domains");
+    webRename("braveApiKey", "brave_api_key");
+    webRename("tavilyApiKey", "tavily_api_key");
+    webRename("serperApiKey", "serper_api_key");
+    webRename("searxngUrl", "searxng_url");
     webRename("noProxy", "no_proxy");
     webRename("searchTimeoutMs", "search_timeout_ms");
     webRename("fetchTimeoutMs", "fetch_timeout_ms");
@@ -527,6 +560,9 @@ function semanticConfigIssues(config: Record<string, unknown>, source: string, p
     }
     if (typeof web.proxy === "string" && web.proxy && !/^https?:\/\//i.test(web.proxy)) {
       issues.push({ level: "error", source, path, key: "web.proxy", message: "web.proxy must be an http:// or https:// URL" });
+    }
+    if (typeof web.searxng_url === "string" && web.searxng_url && !/^https?:\/\//i.test(web.searxng_url)) {
+      issues.push({ level: "error", source, path, key: "web.searxng_url", message: "web.searxng_url must be an http:// or https:// URL" });
     }
   }
   return issues;

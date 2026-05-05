@@ -5,6 +5,7 @@ import { lookup as callbackLookup } from "node:dns";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { Agent, EnvHttpProxyAgent, ProxyAgent, type Dispatcher } from "undici";
+import type { Element } from "domhandler";
 import type { WebConfig } from "../config.js";
 import { PermissionLevel } from "./base.js";
 import type { ToolExecutionContext } from "./base.js";
@@ -20,12 +21,46 @@ const DEFAULT_MAX_BYTES = 1_000_000;
 const MAX_BYTES = 10 * 1024 * 1024;
 const USER_AGENT =
   "Mozilla/5.0 (compatible; seek-code/0.1; +https://github.com/seek-code/seek-code)";
+const SEARCH_CACHE_TTL_MS = 15 * 60 * 1000;
+const SEARCH_CACHE_MAX = 64;
+const FETCH_CACHE_TTL_MS = 15 * 60 * 1000;
+const FETCH_CACHE_MAX = 64;
+const DEFAULT_CONTEXT_MAX_CHARACTERS = 10_000;
+const MAX_CONTEXT_MAX_CHARACTERS = 50_000;
+const DEFAULT_CONTEXT_RESULTS = 3;
+const MAX_CONTEXT_RESULTS = 5;
+const SEARCH_FETCH_MAX_BYTES = 512_000;
+const BING_SEARCH_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+  "Accept":
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Cache-Control": "no-cache",
+  "Pragma": "no-cache",
+  "Sec-Ch-Ua": "\"Microsoft Edge\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+  "Sec-Ch-Ua-Mobile": "?0",
+  "Sec-Ch-Ua-Platform": "\"macOS\"",
+  "Sec-Fetch-Dest": "document",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-Site": "none",
+  "Sec-Fetch-User": "?1",
+  "Upgrade-Insecure-Requests": "1",
+};
+const BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search";
+const TAVILY_SEARCH_URL = "https://api.tavily.com/search";
+const SERPER_SEARCH_URL = "https://google.serper.dev/search";
+
+type SearchEngine = "auto" | "bing" | "duckduckgo" | "brave" | "tavily" | "serper" | "searxng";
+type SearchType = "auto" | "fast" | "deep";
 
 interface SearchEntry {
   title: string;
   url: string;
   snippet?: string;
   ref_id?: string;
+  content?: string;
+  content_error?: string;
 }
 
 interface FetchResponse {
@@ -34,6 +69,17 @@ interface FetchResponse {
   contentType: string;
   text: string;
   truncated: boolean;
+}
+
+interface SearchOutcome {
+  source: string;
+  results: SearchEntry[];
+  failures: string[];
+}
+
+interface CacheEntry<T> {
+  createdAt: number;
+  value: T;
 }
 
 interface WebRef {
@@ -48,9 +94,13 @@ interface WebRef {
 interface ResolvedWebConfig {
   enabled: boolean;
   mode: "live" | "off";
-  searchEngine: "auto" | "bing" | "duckduckgo";
+  searchEngine: SearchEngine;
   allowedDomains: string[];
   blockedDomains: string[];
+  braveApiKey: string;
+  tavilyApiKey: string;
+  serperApiKey: string;
+  searxngUrl: string;
   proxy: string;
   noProxy: string[];
   searchTimeoutMs: number;
@@ -59,6 +109,8 @@ interface ResolvedWebConfig {
 }
 
 const WEB_REFS = new Map<string, WebRef>();
+const SEARCH_CACHE = new Map<string, CacheEntry<SearchOutcome>>();
+const FETCH_CACHE = new Map<string, CacheEntry<FetchResponse>>();
 const PROXY_DISPATCHERS = new Map<string, Dispatcher>();
 const SAFE_DISPATCHER = new Agent({
   connect: {
@@ -84,11 +136,23 @@ function asBool(value: unknown, fallback: boolean): boolean {
   return fallback;
 }
 
-function normalizeSearchEngine(value: unknown): "auto" | "bing" | "duckduckgo" {
+function normalizeSearchEngine(value: unknown): SearchEngine {
   if (typeof value !== "string") return "auto";
   const normalized = value.trim().toLowerCase().replace(/[-_\s]/g, "");
   if (normalized === "bing") return "bing";
   if (normalized === "duckduckgo" || normalized === "ddg") return "duckduckgo";
+  if (normalized === "brave" || normalized === "bravesearch") return "brave";
+  if (normalized === "tavily") return "tavily";
+  if (normalized === "serper" || normalized === "google" || normalized === "googleserper") return "serper";
+  if (normalized === "searxng" || normalized === "searx") return "searxng";
+  return "auto";
+}
+
+function normalizeSearchType(value: unknown): SearchType {
+  if (typeof value !== "string") return "auto";
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "fast" || normalized === "quick") return "fast";
+  if (normalized === "deep" || normalized === "comprehensive") return "deep";
   return "auto";
 }
 
@@ -116,6 +180,10 @@ function normalizeDomainList(value: unknown): string[] {
   return [];
 }
 
+function envString(name: string): string {
+  return process.env[name]?.trim() || "";
+}
+
 function resolveWebConfig(config?: Partial<WebConfig>): ResolvedWebConfig {
   return {
     enabled: config?.enabled !== false,
@@ -123,6 +191,18 @@ function resolveWebConfig(config?: Partial<WebConfig>): ResolvedWebConfig {
     searchEngine: normalizeSearchEngine(config?.search_engine),
     allowedDomains: normalizeDomainList(config?.allowed_domains),
     blockedDomains: normalizeDomainList(config?.blocked_domains),
+    braveApiKey: typeof config?.brave_api_key === "string" && config.brave_api_key.trim()
+      ? config.brave_api_key.trim()
+      : envString("BRAVE_SEARCH_API_KEY") || envString("BRAVE_API_KEY"),
+    tavilyApiKey: typeof config?.tavily_api_key === "string" && config.tavily_api_key.trim()
+      ? config.tavily_api_key.trim()
+      : envString("TAVILY_API_KEY"),
+    serperApiKey: typeof config?.serper_api_key === "string" && config.serper_api_key.trim()
+      ? config.serper_api_key.trim()
+      : envString("SERPER_API_KEY"),
+    searxngUrl: typeof config?.searxng_url === "string" && config.searxng_url.trim()
+      ? config.searxng_url.trim().replace(/\/+$/, "")
+      : envString("SEARXNG_URL").replace(/\/+$/, ""),
     proxy: typeof config?.proxy === "string" ? config.proxy.trim() : "",
     noProxy: normalizeDomainList(config?.no_proxy),
     searchTimeoutMs: asPositiveInt(config?.search_timeout_ms, DEFAULT_SEARCH_TIMEOUT_MS, MAX_TIMEOUT_MS),
@@ -184,6 +264,57 @@ function extractSearchDomains(args: Record<string, unknown>): string[] {
   return [];
 }
 
+function extractSearchContextEnabled(args: Record<string, unknown>, searchType: SearchType): boolean {
+  const direct = args.fetch_results ?? args.include_content ?? args.context;
+  if (direct !== undefined) return asBool(direct, false);
+
+  const searchQuery = args.search_query;
+  if (Array.isArray(searchQuery)) {
+    for (const item of searchQuery) {
+      if (!item || typeof item !== "object") continue;
+      const record = item as Record<string, unknown>;
+      const nested = record.fetch_results ?? record.include_content ?? record.context;
+      if (nested !== undefined) return asBool(nested, false);
+    }
+  }
+
+  return searchType === "deep";
+}
+
+function extractContextMaxCharacters(args: Record<string, unknown>): number {
+  const direct = asPositiveInt(args.context_max_characters ?? args.contextMaxCharacters, 0, MAX_CONTEXT_MAX_CHARACTERS);
+  if (direct > 0) return direct;
+
+  const searchQuery = args.search_query;
+  if (Array.isArray(searchQuery)) {
+    for (const item of searchQuery) {
+      if (!item || typeof item !== "object") continue;
+      const record = item as Record<string, unknown>;
+      const nested = asPositiveInt(record.context_max_characters ?? record.contextMaxCharacters, 0, MAX_CONTEXT_MAX_CHARACTERS);
+      if (nested > 0) return nested;
+    }
+  }
+
+  return DEFAULT_CONTEXT_MAX_CHARACTERS;
+}
+
+function extractContextResults(args: Record<string, unknown>): number {
+  const direct = asPositiveInt(args.context_results ?? args.contextResults, 0, MAX_CONTEXT_RESULTS);
+  if (direct > 0) return direct;
+
+  const searchQuery = args.search_query;
+  if (Array.isArray(searchQuery)) {
+    for (const item of searchQuery) {
+      if (!item || typeof item !== "object") continue;
+      const record = item as Record<string, unknown>;
+      const nested = asPositiveInt(record.context_results ?? record.contextResults, 0, MAX_CONTEXT_RESULTS);
+      if (nested > 0) return nested;
+    }
+  }
+
+  return DEFAULT_CONTEXT_RESULTS;
+}
+
 function extractRefId(args: Record<string, unknown>): string {
   for (const key of ["ref_id", "refId"]) {
     const value = args[key];
@@ -206,6 +337,175 @@ function decodeHtml(text: string): string {
 
 function normalizeText(text: string): string {
   return decodeHtml(text.replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+}
+
+function cloneSearchResults(results: SearchEntry[]): SearchEntry[] {
+  return results.map(result => ({ ...result }));
+}
+
+function cloneSearchOutcome(outcome: SearchOutcome): SearchOutcome {
+  return {
+    source: outcome.source,
+    results: cloneSearchResults(outcome.results),
+    failures: [...outcome.failures],
+  };
+}
+
+function cloneFetchResponse(resp: FetchResponse): FetchResponse {
+  return { ...resp };
+}
+
+function compactSnippet(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const normalized = normalizeText(value);
+    return normalized || undefined;
+  }
+  if (Array.isArray(value)) {
+    const normalized = value
+      .map(item => typeof item === "string" ? normalizeText(item) : "")
+      .filter(Boolean)
+      .join(" ");
+    return normalized || undefined;
+  }
+  return undefined;
+}
+
+function recordValue(record: Record<string, unknown>, keys: string[]): unknown {
+  for (const key of keys) {
+    const value = record[key];
+    if (value !== undefined && value !== null && value !== "") return value;
+  }
+  return undefined;
+}
+
+function entryFromRecord(record: Record<string, unknown>, keys: { title: string[]; url: string[]; snippet: string[] }): SearchEntry | null {
+  const rawUrl = recordValue(record, keys.url);
+  if (typeof rawUrl !== "string" || !/^https?:\/\//i.test(rawUrl)) return null;
+  const title = compactSnippet(recordValue(record, keys.title)) || rawUrl;
+  return {
+    title: title.slice(0, 180),
+    url: rawUrl,
+    snippet: compactSnippet(recordValue(record, keys.snippet)),
+  };
+}
+
+async function fetchJson(
+  url: string,
+  timeoutMs: number,
+  options: { method?: "GET" | "POST"; headers?: Record<string, string>; body?: unknown; signal?: AbortSignal; config: ResolvedWebConfig },
+): Promise<unknown> {
+  const resp = await fetchText(url, timeoutMs, "application/json,text/json,*/*;q=0.2", {
+    signal: options.signal,
+    maxBytes: Math.min(DEFAULT_MAX_BYTES, options.config.maxBytes),
+    retries: 1,
+    config: options.config,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+    method: options.method || (options.body === undefined ? "GET" : "POST"),
+    body: options.body,
+  });
+  if (resp.status < 200 || resp.status >= 300) throw new Error(`HTTP ${resp.status}`);
+  try {
+    return JSON.parse(resp.text);
+  } catch {
+    throw new Error("invalid JSON response");
+  }
+}
+
+function getTimedCache<T>(cache: Map<string, CacheEntry<T>>, key: string, ttlMs: number): T | undefined {
+  const entry = cache.get(key);
+  if (!entry) return undefined;
+  if (Date.now() - entry.createdAt > ttlMs) {
+    cache.delete(key);
+    return undefined;
+  }
+  cache.delete(key);
+  cache.set(key, entry);
+  return entry.value;
+}
+
+function setTimedCache<T>(cache: Map<string, CacheEntry<T>>, key: string, value: T, maxSize: number): void {
+  cache.set(key, { createdAt: Date.now(), value });
+  while (cache.size > maxSize) {
+    const first = cache.keys().next().value;
+    if (!first) break;
+    cache.delete(first);
+  }
+}
+
+function canonicalSearchUrl(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    const removable = [
+      "utm_source",
+      "utm_medium",
+      "utm_campaign",
+      "utm_term",
+      "utm_content",
+      "utm_id",
+      "fbclid",
+      "gclid",
+      "mc_cid",
+      "mc_eid",
+    ];
+    for (const key of removable) parsed.searchParams.delete(key);
+    if ((parsed.protocol === "http:" && parsed.port === "80") || (parsed.protocol === "https:" && parsed.port === "443")) parsed.port = "";
+    if (parsed.pathname !== "/" && parsed.pathname.endsWith("/")) parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    parsed.hostname = parsed.hostname.toLowerCase();
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function dedupeSearchResults(results: SearchEntry[], maxResults: number): SearchEntry[] {
+  const seen = new Set<string>();
+  const deduped: SearchEntry[] = [];
+  for (const result of results) {
+    const canonical = canonicalSearchUrl(result.url);
+    if (!canonical || seen.has(canonical)) continue;
+    seen.add(canonical);
+    deduped.push({ ...result, url: canonical });
+    if (deduped.length >= maxResults) break;
+  }
+  return deduped;
+}
+
+function searchCacheKey(
+  query: string,
+  maxResults: number,
+  engine: SearchEngine,
+  searchType: SearchType,
+  config: ResolvedWebConfig,
+): string {
+  return JSON.stringify({
+    query,
+    maxResults,
+    engine,
+    searchType,
+    blockedDomains: [...config.blockedDomains].sort(),
+    brave: Boolean(config.braveApiKey),
+    tavily: Boolean(config.tavilyApiKey),
+    serper: Boolean(config.serperApiKey),
+    searxng: config.searxngUrl,
+    proxy: config.proxy,
+    noProxy: [...config.noProxy].sort(),
+  });
+}
+
+function fetchCacheKey(url: string, accept: string, maxBytes: number, config?: ResolvedWebConfig, method = "GET", body?: unknown): string {
+  return JSON.stringify({
+    url,
+    accept,
+    maxBytes,
+    method,
+    body: body === undefined ? undefined : body,
+    proxy: config?.proxy || "",
+    noProxy: [...(config?.noProxy || [])].sort(),
+  });
 }
 
 function percentDecode(value: string): string {
@@ -241,7 +541,7 @@ function normalizeBingUrl(href: string): string {
   const encoded = queryParam(href, "u");
   if (encoded) {
     const decoded = percentDecode(encoded);
-    const token = decoded.startsWith("a1") ? decoded.slice(2) : decoded;
+    const token = decoded.startsWith("a1") || decoded.startsWith("a0") ? decoded.slice(2) : decoded;
     const padded = token.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(token.length / 4) * 4, "=");
     try {
       const url = Buffer.from(padded, "base64").toString("utf-8");
@@ -290,6 +590,24 @@ function parseDuckResults(html: string, maxResults: number): SearchEntry[] {
   return results;
 }
 
+function extractBingSnippet($: cheerio.CheerioAPI, el: Element): string {
+  const lineClamp = normalizeText($(el).find("p[class*='b_lineclamp']").first().html() || $(el).find("p[class*='b_lineclamp']").first().text());
+  if (lineClamp) return lineClamp;
+  const captionP = normalizeText($(el).find(".b_caption p").first().html() || $(el).find(".b_caption p").first().text());
+  if (captionP) return captionP;
+  return normalizeText($(el).find(".b_caption").first().html() || $(el).find(".b_caption").first().text());
+}
+
+function isInternalSearchUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    return host === "www.bing.com" || host.endsWith(".bing.com") || host === "duckduckgo.com" || host.endsWith(".duckduckgo.com");
+  } catch {
+    return true;
+  }
+}
+
 function parseBingResults(html: string, maxResults: number): SearchEntry[] {
   const $ = cheerio.load(html);
   const results: SearchEntry[] = [];
@@ -298,8 +616,9 @@ function parseBingResults(html: string, maxResults: number): SearchEntry[] {
     const anchor = $(el).find("h2 a").first();
     const title = normalizeText(anchor.html() || anchor.text());
     const href = anchor.attr("href") || "";
-    const snippet = normalizeText($(el).find(".b_caption p").first().html() || $(el).find(".b_caption p").first().text());
-    if (title && href) results.push({ title, url: normalizeBingUrl(href), snippet: snippet || undefined });
+    const url = normalizeBingUrl(href);
+    const snippet = extractBingSnippet($, el);
+    if (title && href && !isInternalSearchUrl(url)) results.push({ title, url, snippet: snippet || undefined });
     return undefined;
   });
   return results;
@@ -351,12 +670,19 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && (error.name === "AbortError" || /aborted|abort/i.test(error.message));
 }
 
+function makeAbortError(): Error {
+  const error = new Error("aborted");
+  error.name = "AbortError";
+  return error;
+}
+
 async function fetchTextOnce(
   url: string,
   timeoutMs: number,
   accept: string,
-  options: { signal?: AbortSignal; maxBytes?: number; validateRedirect?: (url: string) => Promise<void>; config?: ResolvedWebConfig } = {},
+  options: { signal?: AbortSignal; maxBytes?: number; validateRedirect?: (url: string) => Promise<void>; config?: ResolvedWebConfig; headers?: Record<string, string>; method?: "GET" | "POST"; body?: unknown } = {},
 ): Promise<FetchResponse> {
+  if (options.signal?.aborted) throw makeAbortError();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const abortFromParent = () => controller.abort();
@@ -368,6 +694,8 @@ async function fetchTextOnce(
     for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
       const dispatcher = dispatcherForUrl(current, options.config);
       resp = await fetch(current, {
+        method: options.method || "GET",
+        body: options.body === undefined ? undefined : JSON.stringify(options.body),
         redirect: "manual",
         signal: controller.signal,
         dispatcher: dispatcher as any,
@@ -376,6 +704,7 @@ async function fetchTextOnce(
           "Accept": accept,
           "Accept-Language": "en-US,en;q=0.9",
           "Cache-Control": "no-cache",
+          ...options.headers,
         },
       });
       if (![301, 302, 303, 307, 308].includes(resp.status)) break;
@@ -404,8 +733,17 @@ async function fetchText(
   url: string,
   timeoutMs: number,
   accept: string,
-  options: { signal?: AbortSignal; maxBytes?: number; retries?: number; validateRedirect?: (url: string) => Promise<void>; config?: ResolvedWebConfig } = {},
+  options: { signal?: AbortSignal; maxBytes?: number; retries?: number; validateRedirect?: (url: string) => Promise<void>; config?: ResolvedWebConfig; headers?: Record<string, string>; cache?: boolean; method?: "GET" | "POST"; body?: unknown } = {},
 ): Promise<FetchResponse> {
+  const maxBytes = options.maxBytes || DEFAULT_MAX_BYTES;
+  if (options.signal?.aborted) throw makeAbortError();
+  const shouldCache = options.cache !== false;
+  const cacheKey = shouldCache ? fetchCacheKey(url, accept, maxBytes, options.config, options.method || "GET", options.body) : "";
+  if (cacheKey) {
+    const cached = getTimedCache(FETCH_CACHE, cacheKey, FETCH_CACHE_TTL_MS);
+    if (cached) return cloneFetchResponse(cached);
+  }
+
   const retries = Math.max(0, Math.min(options.retries ?? 1, 3));
   let lastError: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -416,6 +754,7 @@ async function fetchText(
         await delay(150 * (attempt + 1));
         continue;
       }
+      if (cacheKey) setTimedCache(FETCH_CACHE, cacheKey, cloneFetchResponse(response), FETCH_CACHE_MAX);
       return response;
     } catch (error) {
       lastError = error;
@@ -545,35 +884,201 @@ async function searchDuckDuckGo(query: string, maxResults: number, timeoutMs: nu
 
 async function searchBing(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
   await assertPublicUrl("https://www.bing.com/", { ...config, allowedDomains: [] });
-  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}`;
-  const resp = await fetchText(url, timeoutMs, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", { signal, maxBytes: Math.min(DEFAULT_MAX_BYTES, config.maxBytes), retries: 1, config });
+  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setmkt=en-US`;
+  const resp = await fetchText(url, timeoutMs, BING_SEARCH_HEADERS.Accept, {
+    signal,
+    maxBytes: Math.min(DEFAULT_MAX_BYTES, config.maxBytes),
+    retries: 1,
+    config,
+    headers: BING_SEARCH_HEADERS,
+  });
   if (resp.status < 200 || resp.status >= 300) throw new Error(`Bing HTTP ${resp.status}`);
   const results = parseBingResults(resp.text, maxResults);
   return results.length ? results : parseGenericResults(resp.text, resp.url, maxResults);
+}
+
+async function searchBrave(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
+  if (!config.braveApiKey) throw new Error("Brave API key is not configured");
+  await assertPublicUrl(BRAVE_SEARCH_URL, { ...config, allowedDomains: [] });
+  const url = new URL(BRAVE_SEARCH_URL);
+  url.searchParams.set("q", query);
+  url.searchParams.set("count", String(maxResults));
+  const payload = await fetchJson(url.toString(), timeoutMs, {
+    signal,
+    config,
+    headers: {
+      "Accept": "application/json",
+      "X-Subscription-Token": config.braveApiKey,
+    },
+  });
+  const web = payload && typeof payload === "object" ? (payload as Record<string, unknown>).web : undefined;
+  const items = web && typeof web === "object" ? (web as Record<string, unknown>).results : undefined;
+  if (!Array.isArray(items)) return [];
+  return items
+    .map(item => item && typeof item === "object"
+      ? entryFromRecord(item as Record<string, unknown>, { title: ["title"], url: ["url"], snippet: ["description", "snippet", "snippets"] })
+      : null)
+    .filter((item): item is SearchEntry => Boolean(item))
+    .slice(0, maxResults);
+}
+
+async function searchTavily(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
+  if (!config.tavilyApiKey) throw new Error("Tavily API key is not configured");
+  await assertPublicUrl(TAVILY_SEARCH_URL, { ...config, allowedDomains: [] });
+  const payload = await fetchJson(TAVILY_SEARCH_URL, timeoutMs, {
+    signal,
+    config,
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${config.tavilyApiKey}`,
+    },
+    body: {
+      query,
+      max_results: maxResults,
+      search_depth: "basic",
+      include_answer: false,
+      include_raw_content: false,
+    },
+  });
+  const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).results : undefined;
+  if (!Array.isArray(items)) return [];
+  return items
+    .map(item => item && typeof item === "object"
+      ? entryFromRecord(item as Record<string, unknown>, { title: ["title"], url: ["url"], snippet: ["content", "snippet"] })
+      : null)
+    .filter((item): item is SearchEntry => Boolean(item))
+    .slice(0, maxResults);
+}
+
+async function searchSerper(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
+  if (!config.serperApiKey) throw new Error("Serper API key is not configured");
+  await assertPublicUrl(SERPER_SEARCH_URL, { ...config, allowedDomains: [] });
+  const payload = await fetchJson(SERPER_SEARCH_URL, timeoutMs, {
+    signal,
+    config,
+    method: "POST",
+    headers: {
+      "X-API-KEY": config.serperApiKey,
+    },
+    body: {
+      q: query,
+      num: maxResults,
+    },
+  });
+  const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+  const organic = Array.isArray(record.organic) ? record.organic : [];
+  const news = Array.isArray(record.news) ? record.news : [];
+  return [...organic, ...news]
+    .map(item => item && typeof item === "object"
+      ? entryFromRecord(item as Record<string, unknown>, { title: ["title"], url: ["link"], snippet: ["snippet", "description"] })
+      : null)
+    .filter((item): item is SearchEntry => Boolean(item))
+    .slice(0, maxResults);
+}
+
+async function searchSearxng(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
+  if (!config.searxngUrl) throw new Error("SearXNG URL is not configured");
+  const base = config.searxngUrl.replace(/\/+$/, "");
+  await assertPublicUrl(base, { ...config, allowedDomains: [] });
+  const url = new URL(`${base}/search`);
+  url.searchParams.set("q", query);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("categories", "general");
+  const payload = await fetchJson(url.toString(), timeoutMs, {
+    signal,
+    config,
+    headers: { "Accept": "application/json" },
+  });
+  const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).results : undefined;
+  if (!Array.isArray(items)) return [];
+  return items
+    .map(item => item && typeof item === "object"
+      ? entryFromRecord(item as Record<string, unknown>, { title: ["title"], url: ["url"], snippet: ["content", "snippet"] })
+      : null)
+    .filter((item): item is SearchEntry => Boolean(item))
+    .slice(0, maxResults);
+}
+
+interface SearchCandidate {
+  engine: SearchEngine;
+  source: string;
+  run: (query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal) => Promise<SearchEntry[]>;
+  available: boolean;
+}
+
+function configuredSearchCandidates(config: ResolvedWebConfig): SearchCandidate[] {
+  return [
+    { engine: "brave", source: "Brave", run: searchBrave, available: Boolean(config.braveApiKey) },
+    { engine: "tavily", source: "Tavily", run: searchTavily, available: Boolean(config.tavilyApiKey) },
+    { engine: "serper", source: "Serper", run: searchSerper, available: Boolean(config.serperApiKey) },
+    { engine: "searxng", source: "SearXNG", run: searchSearxng, available: Boolean(config.searxngUrl) },
+    { engine: "bing", source: "Bing", run: searchBing, available: true },
+    { engine: "duckduckgo", source: "DuckDuckGo", run: searchDuckDuckGo, available: true },
+  ];
+}
+
+function searchCandidates(engine: SearchEngine, config: ResolvedWebConfig): SearchCandidate[] {
+  const all = configuredSearchCandidates(config);
+  if (engine === "auto") return all.filter(candidate => candidate.available);
+  const candidate = all.find(item => item.engine === engine);
+  return candidate ? [candidate] : [];
 }
 
 async function searchWithFallback(
   query: string,
   maxResults: number,
   timeoutMs: number,
-  engine: "auto" | "bing" | "duckduckgo",
+  engine: SearchEngine,
+  searchType: SearchType,
   config: ResolvedWebConfig,
   signal?: AbortSignal,
-): Promise<{ source: string; results: SearchEntry[]; failures: string[] }> {
+): Promise<SearchOutcome> {
+  if (signal?.aborted) throw makeAbortError();
+  const cacheKey = searchCacheKey(query, maxResults, engine, searchType, config);
+  if (cacheKey) {
+    const cached = getTimedCache(SEARCH_CACHE, cacheKey, SEARCH_CACHE_TTL_MS);
+    if (cached) return cloneSearchOutcome(cached);
+  }
+
   const failures: string[] = [];
-  const candidates = engine === "bing"
-    ? [{ source: "Bing", run: searchBing }]
-    : engine === "duckduckgo"
-      ? [{ source: "DuckDuckGo", run: searchDuckDuckGo }]
-      : [
-          { source: "Bing", run: searchBing },
-          { source: "DuckDuckGo", run: searchDuckDuckGo },
-        ];
+  const candidates = searchCandidates(engine, config);
+
+  if (engine === "auto" && searchType === "deep") {
+    const settled = await Promise.allSettled(candidates.map(candidate =>
+      candidate.run(query, maxResults, timeoutMs, config, signal).then(results => ({ source: candidate.source, results }))
+    ));
+    const merged: SearchEntry[] = [];
+    const sources: string[] = [];
+    settled.forEach((result, index) => {
+      const source = candidates[index]?.source || "unknown";
+      if (result.status === "fulfilled") {
+        if (result.value.results.length) {
+          sources.push(result.value.source);
+          merged.push(...result.value.results);
+        } else {
+          failures.push(`${source}: no parseable results`);
+        }
+        return;
+      }
+      if (isAbortError(result.reason) || signal?.aborted) throw result.reason;
+      failures.push(`${source}: ${formatFetchError(result.reason)}`);
+    });
+    const outcome = {
+      source: sources.join(" + "),
+      results: dedupeSearchResults(merged, maxResults),
+      failures,
+    };
+    if (cacheKey && outcome.results.length) setTimedCache(SEARCH_CACHE, cacheKey, cloneSearchOutcome(outcome), SEARCH_CACHE_MAX);
+    return outcome;
+  }
+
   for (const candidate of candidates) {
     try {
       const results = await candidate.run(query, maxResults, timeoutMs, config, signal);
       if (results.length) {
-        return { source: candidate.source, results, failures };
+        const outcome = { source: candidate.source, results: dedupeSearchResults(results, maxResults), failures };
+        if (cacheKey) setTimedCache(SEARCH_CACHE, cacheKey, cloneSearchOutcome(outcome), SEARCH_CACHE_MAX);
+        return outcome;
       }
       failures.push(`${candidate.source}: no parseable results`);
     } catch (error) {
@@ -636,6 +1141,10 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
   const maxResults = extractSearchMaxResults(args);
   const timeoutMs = asPositiveInt(args.timeout_ms, config.searchTimeoutMs, MAX_TIMEOUT_MS);
   const engine = normalizeSearchEngine(args.engine || args.source || config.searchEngine);
+  const searchType = normalizeSearchType(args.type || args.search_type || args.searchType);
+  const includeContent = extractSearchContextEnabled(args, searchType);
+  const contextMaxCharacters = extractContextMaxCharacters(args);
+  const contextResults = extractContextResults(args);
   const jsonOutput = asBool(args.json, false);
   const requestedDomains = extractSearchDomains(args);
   const effectiveAllowedDomains = requestedDomains.length
@@ -649,8 +1158,12 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
   const searchQuery = effectiveAllowedDomains.length
     ? `${query} ${effectiveAllowedDomains.map(domain => `site:${domain.replace(/^\*\./, "").replace(/^\./, "")}`).join(" OR ")}`
     : query;
-  const { source, results: rawResults, failures } = await searchWithFallback(searchQuery, maxResults, timeoutMs, engine, config, signal);
-  const results = assignRefs(query, source, filterSearchResults(rawResults, effectiveAllowedDomains, config.blockedDomains));
+  const { source, results: rawResults, failures } = await searchWithFallback(searchQuery, maxResults, timeoutMs, engine, searchType, config, signal);
+  const filteredResults = filterSearchResults(rawResults, effectiveAllowedDomains, config.blockedDomains);
+  const contextualResults = includeContent
+    ? await attachResultContent(filteredResults, config, { contextResults, contextMaxCharacters, timeoutMs, signal })
+    : filteredResults;
+  const results = assignRefs(query, source, contextualResults);
 
   if (!results.length) {
     const payload = { query, source: "", count: 0, results: [], failures, message: `No results for '${query}'` };
@@ -664,6 +1177,8 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
       count: results.length,
       results,
       failures,
+      search_type: searchType,
+      context_included: includeContent,
       message: `Found ${results.length} result(s)`,
     }, null, 2);
   }
@@ -672,6 +1187,8 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
   results.forEach((result, index) => {
     lines.push(`${index + 1}. ${result.title}`, `   ref_id: ${result.ref_id}`, `   ${result.url}`);
     if (result.snippet) lines.push(`   ${result.snippet}`);
+    if (result.content) lines.push("", trimForContext(result.content, Math.max(500, Math.floor(contextMaxCharacters / Math.max(1, Math.min(contextResults, results.length))))));
+    if (result.content_error) lines.push(`   Content: unavailable (${result.content_error})`);
     lines.push("");
   });
   if (failures.length) lines.push(`Note: ${failures.join(" | ")}`);
@@ -805,6 +1322,46 @@ function processBody(body: string, contentType: string, format: "markdown" | "te
   return format === "markdown" ? htmlToMarkdown(body) : htmlToText(body);
 }
 
+function trimForContext(content: string, maxChars: number): string {
+  const normalized = content.replace(/\n{3,}/g, "\n\n").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 24)).trimEnd()}\n[content truncated]`;
+}
+
+async function attachResultContent(
+  results: SearchEntry[],
+  config: ResolvedWebConfig,
+  options: { contextResults: number; contextMaxCharacters: number; timeoutMs: number; signal?: AbortSignal },
+): Promise<SearchEntry[]> {
+  if (!results.length || options.contextResults <= 0 || options.contextMaxCharacters <= 0) return results;
+
+  const count = Math.min(results.length, options.contextResults, MAX_CONTEXT_RESULTS);
+  const charsPerResult = Math.max(500, Math.floor(options.contextMaxCharacters / count));
+  const enriched = cloneSearchResults(results);
+  await Promise.all(enriched.slice(0, count).map(async (result, index) => {
+    try {
+      const parsed = await assertPublicUrl(result.url, config);
+      const resp = await fetchText(parsed.toString(), options.timeoutMs, "text/html,text/plain,application/json,application/xml,*/*;q=0.8", {
+        signal: options.signal,
+        maxBytes: Math.min(config.maxBytes, SEARCH_FETCH_MAX_BYTES),
+        retries: 0,
+        config,
+        validateRedirect: async (url) => { await assertPublicUrl(url, config); },
+      });
+      if (resp.status < 200 || resp.status >= 400) {
+        enriched[index] = { ...result, content_error: `HTTP ${resp.status}` };
+        return;
+      }
+      const content = processBody(resp.text, resp.contentType, "markdown");
+      enriched[index] = { ...result, content: trimForContext(content, charsPerResult) };
+    } catch (error) {
+      if (isAbortError(error) || options.signal?.aborted) throw error;
+      enriched[index] = { ...result, content_error: formatFetchError(error) };
+    }
+  }));
+  return enriched;
+}
+
 function formatFetchResult(resp: FetchResponse, content: string, jsonOutput: boolean): string {
   if (jsonOutput) {
     return JSON.stringify({
@@ -864,7 +1421,7 @@ export function registerWebTools(configInput?: Partial<WebConfig>): void {
     webFetchWithConfig(args, webConfig, context?.signal);
   r.register({
     name: "web_search",
-    description: "Search the web using Bing with DuckDuckGo fallback. Returns titles, URLs, snippets.",
+    description: "Search the web using configured engines (Brave, Tavily, Serper, SearXNG, Bing, DuckDuckGo). Returns titles, URLs, snippets, and optional fetched context.",
     parameters: {
       type: "object",
       properties: {
@@ -878,7 +1435,12 @@ export function registerWebTools(configInput?: Partial<WebConfig>): void {
         max_results: { type: "integer", default: DEFAULT_MAX_RESULTS, maximum: MAX_RESULTS },
         timeout_ms: { type: "integer", default: DEFAULT_SEARCH_TIMEOUT_MS, maximum: MAX_TIMEOUT_MS },
         domains: { type: "array", items: { type: "string" }, description: "Optional domain filter, e.g. [\"example.com\"]." },
-        engine: { type: "string", enum: ["auto", "bing", "duckduckgo"], default: "auto" },
+        engine: { type: "string", enum: ["auto", "brave", "tavily", "serper", "searxng", "bing", "duckduckgo"], default: "auto" },
+        type: { type: "string", enum: ["auto", "fast", "deep"], default: "auto", description: "Search depth. deep merges engines and includes page context by default." },
+        fetch_results: { type: "boolean", default: false, description: "Fetch top result pages and include extracted context." },
+        include_content: { type: "boolean", default: false, description: "Alias for fetch_results." },
+        context_results: { type: "integer", default: DEFAULT_CONTEXT_RESULTS, maximum: MAX_CONTEXT_RESULTS },
+        context_max_characters: { type: "integer", default: DEFAULT_CONTEXT_MAX_CHARACTERS, maximum: MAX_CONTEXT_MAX_CHARACTERS },
         json: { type: "boolean", default: false },
       },
     },

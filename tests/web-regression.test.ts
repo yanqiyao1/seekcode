@@ -32,6 +32,172 @@ afterEach(() => {
 });
 
 describe("web tools", () => {
+  it("uses configured Brave search results", async () => {
+    getRegistry().clear();
+    registerWebTools({ brave_api_key: "brave-key" });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      expect(url).toContain("api.search.brave.com/res/v1/web/search");
+      expect(url).toContain("q=brave+query");
+      expect((init?.headers as Record<string, string>)["X-Subscription-Token"]).toBe("brave-key");
+      return new Response(JSON.stringify({
+        web: {
+          results: [
+            { title: "Brave Result", url: "https://example.com/brave", description: "Brave snippet" },
+          ],
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "brave query", engine: "brave" });
+
+    expect(result).toContain("Source: Brave");
+    expect(result).toContain("Brave Result");
+    expect(result).toContain("Brave snippet");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses configured Tavily search results", async () => {
+    getRegistry().clear();
+    registerWebTools({ tavily_api_key: "tavily-key" });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("https://api.tavily.com/search");
+      expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer tavily-key");
+      expect(JSON.parse(String(init?.body)).query).toBe("tavily query");
+      return new Response(JSON.stringify({
+        results: [
+          { title: "Tavily Result", url: "https://example.com/tavily", content: "Tavily content snippet" },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "tavily query", engine: "tavily" });
+
+    expect(result).toContain("Source: Tavily");
+    expect(result).toContain("Tavily Result");
+    expect(result).toContain("Tavily content snippet");
+  });
+
+  it("uses configured Serper search results", async () => {
+    getRegistry().clear();
+    registerWebTools({ serper_api_key: "serper-key" });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("https://google.serper.dev/search");
+      expect((init?.headers as Record<string, string>)["X-API-KEY"]).toBe("serper-key");
+      expect(JSON.parse(String(init?.body)).q).toBe("serper query");
+      return new Response(JSON.stringify({
+        organic: [
+          { title: "Serper Result", link: "https://example.com/serper", snippet: "Serper snippet" },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "serper query", engine: "serper" });
+
+    expect(result).toContain("Source: Serper");
+    expect(result).toContain("Serper Result");
+    expect(result).toContain("Serper snippet");
+  });
+
+  it("uses configured SearXNG search results", async () => {
+    getRegistry().clear();
+    registerWebTools({ searxng_url: "https://search.example" });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      expect(url).toContain("https://search.example/search");
+      expect(url).toContain("format=json");
+      return new Response(JSON.stringify({
+        results: [
+          { title: "SearXNG Result", url: "https://example.com/searxng", content: "SearXNG snippet" },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "searxng query", engine: "searxng" });
+
+    expect(result).toContain("Source: SearXNG");
+    expect(result).toContain("SearXNG Result");
+    expect(result).toContain("SearXNG snippet");
+  });
+
+  it("auto search prefers configured API engines before scraper fallback", async () => {
+    getRegistry().clear();
+    registerWebTools({ brave_api_key: "brave-key" });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("api.search.brave.com")) {
+        return new Response(JSON.stringify({
+          web: { results: [{ title: "Auto Brave", url: "https://example.com/auto-brave" }] },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "auto brave" });
+
+    expect(result).toContain("Source: Brave");
+    expect(result).toContain("Auto Brave");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports missing API key for explicitly selected API engines", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("should not fetch", { status: 200 }));
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "missing key", engine: "brave" });
+
+    expect(result).toContain("No results for 'missing key'");
+    expect(result).toContain("Brave API key is not configured");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("merges and deduplicates engines for deep search", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("bing.com")) {
+        return new Response(`
+          <html><body>
+            <li class="b_algo">
+              <h2><a href="https://example.com/shared?utm_source=bing">Shared Result</a></h2>
+              <p class="b_lineclamp">Bing lineclamp snippet.</p>
+            </li>
+            <li class="b_algo">
+              <h2><a href="https://example.com/bing-only">Bing Only</a></h2>
+              <div class="b_caption"><p>Bing only snippet.</p></div>
+            </li>
+          </body></html>
+        `, { status: 200, headers: { "content-type": "text/html" } });
+      }
+      if (url.includes("duckduckgo.com")) {
+        return new Response(`
+          <html><body>
+            <div class="result">
+              <a class="result__a" href="/l/?uddg=https%3A%2F%2Fexample.com%2Fshared%2F">Shared Duplicate</a>
+              <a class="result__snippet">Duck duplicate snippet.</a>
+            </div>
+            <div class="result">
+              <a class="result__a" href="/l/?uddg=https%3A%2F%2Fexample.org%2Fduck-only">Duck Only</a>
+              <a class="result__snippet">Duck only snippet.</a>
+            </div>
+          </body></html>
+        `, { status: 200, headers: { "content-type": "text/html" } });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({
+      query: "deep merge unique",
+      type: "deep",
+      fetch_results: false,
+      max_results: 5,
+    });
+
+    expect(result).toContain("Source: Bing + DuckDuckGo");
+    expect(result).toContain("Bing lineclamp snippet.");
+    expect(result).toContain("Bing Only");
+    expect(result).toContain("Duck Only");
+    expect(result.match(/shared/g)?.length).toBe(1);
+  });
+
   it("falls back to DuckDuckGo when Bing fails", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = String(input);
@@ -137,6 +303,42 @@ describe("web tools", () => {
     expect(fetched).toContain("Body text");
   });
 
+  it("can include fetched page context in search results", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("bing.com")) {
+        return new Response(`
+          <html><body>
+            <li class="b_algo">
+              <h2><a href="https://example.com/context-page">Context Page</a></h2>
+              <div class="b_caption"><p>Search snippet</p></div>
+            </li>
+          </body></html>
+        `, { status: 200, headers: { "content-type": "text/html" } });
+      }
+      if (url === "https://example.com/context-page") {
+        return new Response(`
+          <html>
+            <head><title>Context Title</title></head>
+            <body><main><h1>Fetched Context</h1><p>Important page body for the model.</p></main></body>
+          </html>
+        `, { status: 200, headers: { "content-type": "text/html" } });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({
+      query: "context fetch unique",
+      engine: "bing",
+      fetch_results: true,
+      context_results: 1,
+    });
+
+    expect(result).toContain("Context Page");
+    expect(result).toContain("# Fetched Context");
+    expect(result).toContain("Important page body for the model.");
+  });
+
   it("retries transient search failures before falling back", async () => {
     let bingCalls = 0;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -173,6 +375,35 @@ describe("web tools", () => {
 
     expect(parsed.status).toBe(404);
     expect(parsed.content).toContain("not found");
+  });
+
+  it("caches repeated direct URL fetches during the session", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("<html><body><h1>Cached page</h1></body></html>", {
+      status: 200,
+      headers: { "content-type": "text/html" },
+    }));
+
+    const first = await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/cache-test" });
+    const second = await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/cache-test" });
+
+    expect(first).toContain("Cached page");
+    expect(second).toContain("Cached page");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("caches fetches even when the engine passes an abort signal", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("cached with signal", {
+      status: 200,
+      headers: { "content-type": "text/plain" },
+    }));
+    const controller = new AbortController();
+
+    const first = await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/cache-signal-test" }, { signal: controller.signal });
+    const second = await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/cache-signal-test" }, { signal: controller.signal });
+
+    expect(first).toContain("cached with signal");
+    expect(second).toContain("cached with signal");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("blocks redirects to restricted hosts", async () => {
@@ -243,6 +474,31 @@ describe("web tools", () => {
     expect(result).toContain("Allowed Result");
     expect(result).toContain("https://allowed.example/ok");
     expect(result).not.toContain("Blocked Result");
+  });
+
+  it("decodes Bing redirect URLs and skips Bing-internal results", async () => {
+    const target = Buffer.from("https://example.com/decoded").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(`
+        <html><body>
+          <li class="b_algo">
+            <h2><a href="https://www.bing.com/ck/a?u=a1${target}">Decoded Result</a></h2>
+            <p class="b_lineclamp">Line clamp snippet</p>
+          </li>
+          <li class="b_algo">
+            <h2><a href="/search?q=internal">Internal Result</a></h2>
+            <div class="b_caption"><p>Should not appear</p></div>
+          </li>
+        </body></html>
+      `, { status: 200, headers: { "content-type": "text/html" } })
+    );
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "bing redirect unique", engine: "bing", max_results: 5 });
+
+    expect(result).toContain("Decoded Result");
+    expect(result).toContain("https://example.com/decoded");
+    expect(result).toContain("Line clamp snippet");
+    expect(result).not.toContain("Internal Result");
   });
 
   it("applies blocked domain filters to search results", async () => {
