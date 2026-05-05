@@ -631,6 +631,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
   let thinkingStartedAt = 0;
   let thinkingRenderTimer: NodeJS.Timeout | null = null;
   let thinkingBodyFlushed = false;
+  let lastTranscriptEvent: "tool" | "thinking" | "content" | "other" = "other";
   const clearThinkingTimer = () => {
     if (thinkingRenderTimer) {
       clearInterval(thinkingRenderTimer);
@@ -649,6 +650,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
   const ensureThinkingHeader = (startedAt = Date.now()) => {
     if (thinkingStartedAt) return;
     thinkingStartedAt = startedAt;
+    lastTranscriptEvent = "thinking";
     activeStatusLine = r.thinkingStatusLine(0, true);
     renderScreen();
     clearThinkingTimer();
@@ -665,6 +667,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       transcript.append(formatted);
       transcript.append("");
       transcript.append("");
+      lastTranscriptEvent = "thinking";
     }
     thinkingBodyFlushed = true;
     inThinking = false;
@@ -680,6 +683,13 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     activeStatusLine = null;
     thinkingBodyFlushed = false;
   };
+  const separateAfterTool = () => {
+    if (lastTranscriptEvent !== "tool") return;
+    if (!transcript.lines.length) return;
+    if (!transcript.lines.at(-1)?.text.trim()) return;
+    transcript.append("");
+    lastTranscriptEvent = "other";
+  };
   const ui: UICallbacks = {
     onApiCallStart() {
       if (!cfg.thinking_visible) return;
@@ -687,6 +697,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     },
     onThinking(text) {
       if (!cfg.thinking_visible) return;
+      if (!inThinking) separateAfterTool();
       if (!inThinking) { thinkingBuf = ""; inThinking = true; thinkingBodyFlushed = false; ensureThinkingHeader(activeTurnStartedAt || Date.now()); }
       thinkingBuf += text;
       updateThinkingHeader(false);
@@ -694,6 +705,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     onContent(text) {
       flushThinkingBody();
       assistantStream.append(transcript, text);
+      lastTranscriptEvent = "content";
       autoFollowBottom();
       requestRender();
     },
@@ -713,6 +725,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       const diffPreview = r.toolDiffPreview(preview);
       if (diffPreview) transcript.append(diffPreview);
       assistantStream.reset();
+      lastTranscriptEvent = "tool";
       autoFollowBottom();
       renderScreen();
     },

@@ -411,15 +411,20 @@ status_items = ["mode", "model", "workspace", "cache", "tools", "cost", "hints"]
 enabled = true
 mode = "live"
 # auto uses configured API engines first, then falls back to Bing/DuckDuckGo.
-# Supported: auto, google, brave, tavily, serper, searxng, arxiv, baidu, bing, duckduckgo.
+# Supported: auto, google, exa, kagi, brave, tavily, serper, searxng,
+# arxiv, semantic_scholar, pubmed, baidu, bing, duckduckgo.
 search_engine = "auto"
 allowed_domains = []
 blocked_domains = []
 google_api_key = ""
 google_cx = ""
+exa_api_key = ""
+kagi_api_key = ""
 brave_api_key = ""
 tavily_api_key = ""
 serper_api_key = ""
+semantic_scholar_api_key = ""
+pubmed_api_key = ""
 searxng_url = ""
 proxy = ""
 no_proxy = []

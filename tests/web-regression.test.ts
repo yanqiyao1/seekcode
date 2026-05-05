@@ -55,6 +55,49 @@ describe("web tools", () => {
     expect(result).toContain("Google snippet");
   });
 
+  it("uses configured Exa search results", async () => {
+    getRegistry().clear();
+    registerWebTools({ exa_api_key: "exa-key" });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("https://api.exa.ai/search");
+      expect((init?.headers as Record<string, string>)["x-api-key"]).toBe("exa-key");
+      expect(JSON.parse(String(init?.body)).query).toBe("exa query");
+      return new Response(JSON.stringify({
+        results: [
+          { title: "Exa Result", url: "https://example.com/exa", text: "Exa snippet" },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "exa query", engine: "exa" });
+
+    expect(result).toContain("Source: Exa");
+    expect(result).toContain("Exa Result");
+    expect(result).toContain("Exa snippet");
+  });
+
+  it("uses configured Kagi search results", async () => {
+    getRegistry().clear();
+    registerWebTools({ kagi_api_key: "kagi-key" });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      expect(url).toContain("kagi.com/api/v0/search");
+      expect(url).toContain("q=kagi+query");
+      expect((init?.headers as Record<string, string>).Authorization).toBe("Bot kagi-key");
+      return new Response(JSON.stringify({
+        data: [
+          { title: "Kagi Result", url: "https://example.com/kagi", snippet: "Kagi snippet" },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "kagi query", engine: "kagi" });
+
+    expect(result).toContain("Source: Kagi");
+    expect(result).toContain("Kagi Result");
+    expect(result).toContain("Kagi snippet");
+  });
+
   it("uses arXiv Atom search results", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = String(input);
@@ -78,6 +121,63 @@ describe("web tools", () => {
     expect(result).toContain("Example arXiv Paper");
     expect(result).toContain("Paper summary text.");
     expect(result).toContain("https://arxiv.org/abs/2401.00001");
+  });
+
+  it("uses Semantic Scholar paper search results", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      expect(url).toContain("api.semanticscholar.org/graph/v1/paper/search");
+      expect(url).toContain("query=semantic+query");
+      return new Response(JSON.stringify({
+        data: [
+          {
+            title: "Semantic Scholar Paper",
+            url: "https://www.semanticscholar.org/paper/abc",
+            abstract: "Semantic Scholar abstract",
+            year: 2026,
+            venue: "ICML",
+          },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "semantic query", engine: "semantic_scholar" });
+
+    expect(result).toContain("Source: Semantic Scholar");
+    expect(result).toContain("Semantic Scholar Paper");
+    expect(result).toContain("2026 ICML");
+    expect(result).toContain("Semantic Scholar abstract");
+  });
+
+  it("uses PubMed E-utilities search results", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("esearch.fcgi")) {
+        expect(url).toContain("term=pubmed+query");
+        return new Response(JSON.stringify({ esearchresult: { idlist: ["123", "456"] } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.includes("esummary.fcgi")) {
+        expect(url).toContain("id=123%2C456");
+        return new Response(JSON.stringify({
+          result: {
+            uids: ["123", "456"],
+            "123": { title: "PubMed Result One", source: "Nature", pubdate: "2026 Jan" },
+            "456": { title: "PubMed Result Two", source: "Science", pubdate: "2025 Dec" },
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "pubmed query", engine: "pubmed", max_results: 2 });
+
+    expect(result).toContain("Source: PubMed");
+    expect(result).toContain("PubMed Result One");
+    expect(result).toContain("https://pubmed.ncbi.nlm.nih.gov/123");
+    expect(result).toContain("Nature 2026 Jan");
   });
 
   it("uses Baidu HTML search results when explicitly selected", async () => {
@@ -192,7 +292,7 @@ describe("web tools", () => {
 
   it("auto search prefers configured API engines before scraper fallback", async () => {
     getRegistry().clear();
-    registerWebTools({ google_api_key: "google-key", google_cx: "cx-id", brave_api_key: "brave-key" });
+    registerWebTools({ google_api_key: "google-key", google_cx: "cx-id", exa_api_key: "exa-key", brave_api_key: "brave-key" });
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = String(input);
       if (url.includes("www.googleapis.com")) {

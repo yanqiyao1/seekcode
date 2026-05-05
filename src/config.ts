@@ -34,14 +34,18 @@ const StatusItemSchema = z.enum([
 const WebConfigSchema = z.object({
   enabled: z.boolean().default(true),
   mode: z.enum(["live", "off"]).default("live"),
-  search_engine: z.enum(["auto", "bing", "duckduckgo", "brave", "tavily", "serper", "searxng", "google", "arxiv", "baidu"]).default("auto"),
+  search_engine: z.enum(["auto", "bing", "duckduckgo", "brave", "tavily", "serper", "searxng", "google", "arxiv", "baidu", "exa", "kagi", "semantic_scholar", "pubmed"]).default("auto"),
   allowed_domains: z.array(z.string()).default([]),
   blocked_domains: z.array(z.string()).default([]),
   google_api_key: z.string().default(""),
   google_cx: z.string().default(""),
+  exa_api_key: z.string().default(""),
+  kagi_api_key: z.string().default(""),
   brave_api_key: z.string().default(""),
   tavily_api_key: z.string().default(""),
   serper_api_key: z.string().default(""),
+  semantic_scholar_api_key: z.string().default(""),
+  pubmed_api_key: z.string().default(""),
   searxng_url: z.string().default(""),
   proxy: z.string().default(""),
   no_proxy: z.array(z.string()).default([]),
@@ -187,9 +191,13 @@ function loadEnv(): Record<string, unknown> {
     ["DEEPSEEK_WEB_BLOCKED_DOMAINS", "web.blocked_domains"],
     ["DEEPSEEK_WEB_GOOGLE_API_KEY", "web.google_api_key"],
     ["DEEPSEEK_WEB_GOOGLE_CX", "web.google_cx"],
+    ["DEEPSEEK_WEB_EXA_API_KEY", "web.exa_api_key"],
+    ["DEEPSEEK_WEB_KAGI_API_KEY", "web.kagi_api_key"],
     ["DEEPSEEK_WEB_BRAVE_API_KEY", "web.brave_api_key"],
     ["DEEPSEEK_WEB_TAVILY_API_KEY", "web.tavily_api_key"],
     ["DEEPSEEK_WEB_SERPER_API_KEY", "web.serper_api_key"],
+    ["DEEPSEEK_WEB_SEMANTIC_SCHOLAR_API_KEY", "web.semantic_scholar_api_key"],
+    ["DEEPSEEK_WEB_PUBMED_API_KEY", "web.pubmed_api_key"],
     ["DEEPSEEK_WEB_SEARXNG_URL", "web.searxng_url"],
     ["DEEPSEEK_WEB_PROXY", "web.proxy"],
     ["DEEPSEEK_WEB_NO_PROXY", "web.no_proxy"],
@@ -228,6 +236,12 @@ function loadEnv(): Record<string, unknown> {
   if (!getNested(result, "web.google_cx") && (process.env.GOOGLE_CSE_ID || process.env.GOOGLE_CX)) {
     setNested(result, "web.google_cx", process.env.GOOGLE_CSE_ID || process.env.GOOGLE_CX);
   }
+  if (!getNested(result, "web.exa_api_key") && process.env.EXA_API_KEY) {
+    setNested(result, "web.exa_api_key", process.env.EXA_API_KEY);
+  }
+  if (!getNested(result, "web.kagi_api_key") && process.env.KAGI_API_KEY) {
+    setNested(result, "web.kagi_api_key", process.env.KAGI_API_KEY);
+  }
   if (!getNested(result, "web.brave_api_key") && process.env.BRAVE_SEARCH_API_KEY) {
     setNested(result, "web.brave_api_key", process.env.BRAVE_SEARCH_API_KEY);
   }
@@ -236,6 +250,12 @@ function loadEnv(): Record<string, unknown> {
   }
   if (!getNested(result, "web.serper_api_key") && process.env.SERPER_API_KEY) {
     setNested(result, "web.serper_api_key", process.env.SERPER_API_KEY);
+  }
+  if (!getNested(result, "web.semantic_scholar_api_key") && (process.env.SEMANTIC_SCHOLAR_API_KEY || process.env.S2_API_KEY)) {
+    setNested(result, "web.semantic_scholar_api_key", process.env.SEMANTIC_SCHOLAR_API_KEY || process.env.S2_API_KEY);
+  }
+  if (!getNested(result, "web.pubmed_api_key") && (process.env.PUBMED_API_KEY || process.env.NCBI_API_KEY)) {
+    setNested(result, "web.pubmed_api_key", process.env.PUBMED_API_KEY || process.env.NCBI_API_KEY);
   }
   if (!getNested(result, "web.searxng_url") && process.env.SEARXNG_URL) {
     setNested(result, "web.searxng_url", process.env.SEARXNG_URL);
@@ -489,9 +509,13 @@ function migrateConfigObject(input: Record<string, unknown>): { config: Record<s
     webRename("blockedDomains", "blocked_domains");
     webRename("googleApiKey", "google_api_key");
     webRename("googleCx", "google_cx");
+    webRename("exaApiKey", "exa_api_key");
+    webRename("kagiApiKey", "kagi_api_key");
     webRename("braveApiKey", "brave_api_key");
     webRename("tavilyApiKey", "tavily_api_key");
     webRename("serperApiKey", "serper_api_key");
+    webRename("semanticScholarApiKey", "semantic_scholar_api_key");
+    webRename("pubmedApiKey", "pubmed_api_key");
     webRename("searxngUrl", "searxng_url");
     webRename("noProxy", "no_proxy");
     webRename("searchTimeoutMs", "search_timeout_ms");

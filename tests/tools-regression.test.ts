@@ -1041,7 +1041,11 @@ describe("config and pricing", () => {
       'blocked_domains = ["blocked.example"]',
       'googleApiKey = "google-user-key"',
       'googleCx = "google-cx"',
+      'exaApiKey = "exa-user-key"',
+      'kagiApiKey = "kagi-user-key"',
       'braveApiKey = "brave-user-key"',
+      'semanticScholarApiKey = "s2-user-key"',
+      'pubmedApiKey = "pubmed-user-key"',
       'searxngUrl = "https://search.example"',
       'proxy = "http://proxy.example:8080"',
       "searchTimeoutMs = 2500",
@@ -1058,7 +1062,11 @@ describe("config and pricing", () => {
     expect(cfg.web.blocked_domains).toEqual(["blocked.example"]);
     expect(cfg.web.google_api_key).toBe("google-user-key");
     expect(cfg.web.google_cx).toBe("google-cx");
+    expect(cfg.web.exa_api_key).toBe("exa-user-key");
+    expect(cfg.web.kagi_api_key).toBe("kagi-user-key");
     expect(cfg.web.brave_api_key).toBe("brave-user-key");
+    expect(cfg.web.semantic_scholar_api_key).toBe("s2-user-key");
+    expect(cfg.web.pubmed_api_key).toBe("pubmed-user-key");
     expect(cfg.web.searxng_url).toBe("https://search.example");
     expect(cfg.web.proxy).toBe("http://proxy.example:8080");
     expect(cfg.web.search_timeout_ms).toBe(2500);

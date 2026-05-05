@@ -183,7 +183,7 @@ describe("Markdown renderer", () => {
     const rendered = renderMarkdown([
       "# Title",
       "",
-      "- **Bold** and `code`",
+      "- **Bold** and *italic* and `code`",
       "> quoted",
       "```ts",
       "const x = 1;",
@@ -194,12 +194,26 @@ describe("Markdown renderer", () => {
     expect(plain).toEqual([
       "Title",
       "",
-      "• Bold and code",
+      "• Bold and italic and code",
       "│ quoted",
       "  │ ts",
       "  │ const x = 1;",
       "  │",
     ]);
+  });
+
+  it("renders single-star emphasis without leaking markdown markers", () => {
+    const rendered = renderMarkdown("This is *2025* and **bold**");
+    const plain = stripAnsi(rendered);
+
+    expect(plain).toBe("This is 2025 and bold");
+    expect(rendered).not.toContain("*2025*");
+  });
+
+  it("keeps ordinary single stars when they are not emphasis", () => {
+    const rendered = renderMarkdown("Math stays 2 * 3 * 4 and unfinished *text");
+
+    expect(stripAnsi(rendered)).toBe("Math stays 2 * 3 * 4 and unfinished *text");
   });
 });
 
@@ -402,11 +416,13 @@ describe("Renderer", () => {
   });
 
   it("lightly renders markdown inside thinking text", () => {
-    const rendered = stripAnsi(thinkingText(["- **Plan** with `code`", "> quote"].join("\n")));
+    const renderedRaw = thinkingText(["- **Plan** with *emphasis* and `code`", "> quote"].join("\n"));
+    const rendered = stripAnsi(renderedRaw);
 
-    expect(rendered).toContain("  • Plan with code");
+    expect(rendered).toContain("  • Plan with emphasis and code");
     expect(rendered).toContain("  │ quote");
     expect(rendered).not.toContain("**");
+    expect(rendered).not.toContain("*emphasis*");
     expect(rendered).not.toContain("`");
   });
 

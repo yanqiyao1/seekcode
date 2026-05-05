@@ -27,9 +27,13 @@ beforeEach(() => {
     "DEEPSEEK_WEB_BLOCKED_DOMAINS",
     "DEEPSEEK_WEB_GOOGLE_API_KEY",
     "DEEPSEEK_WEB_GOOGLE_CX",
+    "DEEPSEEK_WEB_EXA_API_KEY",
+    "DEEPSEEK_WEB_KAGI_API_KEY",
     "DEEPSEEK_WEB_BRAVE_API_KEY",
     "DEEPSEEK_WEB_TAVILY_API_KEY",
     "DEEPSEEK_WEB_SERPER_API_KEY",
+    "DEEPSEEK_WEB_SEMANTIC_SCHOLAR_API_KEY",
+    "DEEPSEEK_WEB_PUBMED_API_KEY",
     "DEEPSEEK_WEB_SEARXNG_URL",
     "DEEPSEEK_WEB_PROXY",
     "DEEPSEEK_APPROVAL_POLICY",
@@ -181,7 +185,11 @@ describe("config precedence and migration", () => {
     process.env.DEEPSEEK_WEB_ALLOWED_DOMAINS = "env.example";
     process.env.DEEPSEEK_WEB_GOOGLE_API_KEY = "env-google";
     process.env.DEEPSEEK_WEB_GOOGLE_CX = "env-cx";
+    process.env.DEEPSEEK_WEB_EXA_API_KEY = "env-exa";
+    process.env.DEEPSEEK_WEB_KAGI_API_KEY = "env-kagi";
     process.env.DEEPSEEK_WEB_BRAVE_API_KEY = "env-brave";
+    process.env.DEEPSEEK_WEB_SEMANTIC_SCHOLAR_API_KEY = "env-s2";
+    process.env.DEEPSEEK_WEB_PUBMED_API_KEY = "env-pubmed";
     process.env.DEEPSEEK_WEB_SEARXNG_URL = "https://env-search.example";
     process.env.DEEPSEEK_MAX_TOKENS = "999999";
     process.chdir(tmp);
@@ -195,7 +203,11 @@ describe("config precedence and migration", () => {
     expect(cfg.web.blocked_domains).toEqual(["project-block.example"]);
     expect(cfg.web.google_api_key).toBe("env-google");
     expect(cfg.web.google_cx).toBe("env-cx");
+    expect(cfg.web.exa_api_key).toBe("env-exa");
+    expect(cfg.web.kagi_api_key).toBe("env-kagi");
     expect(cfg.web.brave_api_key).toBe("env-brave");
+    expect(cfg.web.semantic_scholar_api_key).toBe("env-s2");
+    expect(cfg.web.pubmed_api_key).toBe("env-pubmed");
     expect(cfg.web.searxng_url).toBe("https://env-search.example");
     expect(cfg.web.proxy).toBe("http://user.proxy:8080");
     expect(cfg.web.fetch_timeout_ms).toBe(2200);

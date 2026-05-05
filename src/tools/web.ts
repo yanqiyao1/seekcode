@@ -51,10 +51,15 @@ const BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search";
 const TAVILY_SEARCH_URL = "https://api.tavily.com/search";
 const SERPER_SEARCH_URL = "https://google.serper.dev/search";
 const GOOGLE_CUSTOM_SEARCH_URL = "https://www.googleapis.com/customsearch/v1";
+const EXA_SEARCH_URL = "https://api.exa.ai/search";
+const KAGI_SEARCH_URL = "https://kagi.com/api/v0/search";
 const ARXIV_SEARCH_URL = "https://export.arxiv.org/api/query";
 const BAIDU_SEARCH_URL = "https://www.baidu.com/s";
+const SEMANTIC_SCHOLAR_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search";
+const PUBMED_ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi";
+const PUBMED_ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi";
 
-type SearchEngine = "auto" | "bing" | "duckduckgo" | "brave" | "tavily" | "serper" | "searxng" | "google" | "arxiv" | "baidu";
+type SearchEngine = "auto" | "bing" | "duckduckgo" | "brave" | "tavily" | "serper" | "searxng" | "google" | "arxiv" | "baidu" | "exa" | "kagi" | "semantic_scholar" | "pubmed";
 type SearchType = "auto" | "fast" | "deep";
 
 interface SearchEntry {
@@ -102,9 +107,13 @@ interface ResolvedWebConfig {
   blockedDomains: string[];
   googleApiKey: string;
   googleCx: string;
+  exaApiKey: string;
+  kagiApiKey: string;
   braveApiKey: string;
   tavilyApiKey: string;
   serperApiKey: string;
+  semanticScholarApiKey: string;
+  pubmedApiKey: string;
   searxngUrl: string;
   proxy: string;
   noProxy: string[];
@@ -152,6 +161,10 @@ function normalizeSearchEngine(value: unknown): SearchEngine {
   if (normalized === "google" || normalized === "googlecustomsearch" || normalized === "googlecse") return "google";
   if (normalized === "arxiv") return "arxiv";
   if (normalized === "baidu") return "baidu";
+  if (normalized === "exa" || normalized === "exasearch") return "exa";
+  if (normalized === "kagi") return "kagi";
+  if (normalized === "semanticscholar" || normalized === "semanticsscholar" || normalized === "s2") return "semantic_scholar";
+  if (normalized === "pubmed" || normalized === "ncbi") return "pubmed";
   if (normalized === "searxng" || normalized === "searx") return "searxng";
   return "auto";
 }
@@ -205,6 +218,12 @@ function resolveWebConfig(config?: Partial<WebConfig>): ResolvedWebConfig {
     googleCx: typeof config?.google_cx === "string" && config.google_cx.trim()
       ? config.google_cx.trim()
       : envString("GOOGLE_CSE_ID") || envString("GOOGLE_CX"),
+    exaApiKey: typeof config?.exa_api_key === "string" && config.exa_api_key.trim()
+      ? config.exa_api_key.trim()
+      : envString("EXA_API_KEY"),
+    kagiApiKey: typeof config?.kagi_api_key === "string" && config.kagi_api_key.trim()
+      ? config.kagi_api_key.trim()
+      : envString("KAGI_API_KEY"),
     braveApiKey: typeof config?.brave_api_key === "string" && config.brave_api_key.trim()
       ? config.brave_api_key.trim()
       : envString("BRAVE_SEARCH_API_KEY") || envString("BRAVE_API_KEY"),
@@ -214,6 +233,12 @@ function resolveWebConfig(config?: Partial<WebConfig>): ResolvedWebConfig {
     serperApiKey: typeof config?.serper_api_key === "string" && config.serper_api_key.trim()
       ? config.serper_api_key.trim()
       : envString("SERPER_API_KEY"),
+    semanticScholarApiKey: typeof config?.semantic_scholar_api_key === "string" && config.semantic_scholar_api_key.trim()
+      ? config.semantic_scholar_api_key.trim()
+      : envString("SEMANTIC_SCHOLAR_API_KEY") || envString("S2_API_KEY"),
+    pubmedApiKey: typeof config?.pubmed_api_key === "string" && config.pubmed_api_key.trim()
+      ? config.pubmed_api_key.trim()
+      : envString("PUBMED_API_KEY") || envString("NCBI_API_KEY"),
     searxngUrl: typeof config?.searxng_url === "string" && config.searxng_url.trim()
       ? config.searxng_url.trim().replace(/\/+$/, "")
       : envString("SEARXNG_URL").replace(/\/+$/, ""),
@@ -503,9 +528,13 @@ function searchCacheKey(
     blockedDomains: [...config.blockedDomains].sort(),
     google: Boolean(config.googleApiKey && config.googleCx),
     googleCx: config.googleCx,
+    exa: Boolean(config.exaApiKey),
+    kagi: Boolean(config.kagiApiKey),
     brave: Boolean(config.braveApiKey),
     tavily: Boolean(config.tavilyApiKey),
     serper: Boolean(config.serperApiKey),
+    semanticScholar: Boolean(config.semanticScholarApiKey),
+    pubmed: Boolean(config.pubmedApiKey),
     searxng: config.searxngUrl,
     proxy: config.proxy,
     noProxy: [...config.noProxy].sort(),
@@ -1042,6 +1071,63 @@ async function searchGoogle(query: string, maxResults: number, timeoutMs: number
     .slice(0, maxResults);
 }
 
+async function searchExa(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
+  if (!config.exaApiKey) throw new Error("Exa API key is not configured");
+  await assertPublicUrl(EXA_SEARCH_URL, { ...config, allowedDomains: [] });
+  const payload = await fetchJson(EXA_SEARCH_URL, timeoutMs, {
+    signal,
+    config,
+    method: "POST",
+    headers: {
+      "x-api-key": config.exaApiKey,
+    },
+    body: {
+      query,
+      numResults: maxResults,
+      type: "auto",
+      useAutoprompt: true,
+    },
+  });
+  const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).results : undefined;
+  if (!Array.isArray(items)) return [];
+  return items
+    .map(item => item && typeof item === "object"
+      ? entryFromRecord(item as Record<string, unknown>, { title: ["title"], url: ["url"], snippet: ["text", "summary", "snippet"] })
+      : null)
+    .filter((item): item is SearchEntry => Boolean(item))
+    .slice(0, maxResults);
+}
+
+async function searchKagi(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
+  if (!config.kagiApiKey) throw new Error("Kagi API key is not configured");
+  await assertPublicUrl(KAGI_SEARCH_URL, { ...config, allowedDomains: [] });
+  const url = new URL(KAGI_SEARCH_URL);
+  url.searchParams.set("q", query);
+  url.searchParams.set("limit", String(maxResults));
+  const payload = await fetchJson(url.toString(), timeoutMs, {
+    signal,
+    config,
+    headers: {
+      "Authorization": `Bot ${config.kagiApiKey}`,
+      "Accept": "application/json",
+    },
+  });
+  const rawData = payload && typeof payload === "object" ? (payload as Record<string, unknown>).data : undefined;
+  let items: unknown[] = [];
+  if (Array.isArray(rawData)) {
+    items = rawData;
+  } else if (rawData && typeof rawData === "object") {
+    const nested = (rawData as Record<string, unknown>).results;
+    if (Array.isArray(nested)) items = nested;
+  }
+  return items
+    .map(item => item && typeof item === "object"
+      ? entryFromRecord(item as Record<string, unknown>, { title: ["title"], url: ["url"], snippet: ["snippet", "description"] })
+      : null)
+    .filter((item): item is SearchEntry => Boolean(item))
+    .slice(0, maxResults);
+}
+
 async function searchArxiv(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
   await assertPublicUrl(ARXIV_SEARCH_URL, { ...config, allowedDomains: [] });
   const url = new URL(ARXIV_SEARCH_URL);
@@ -1071,6 +1157,86 @@ async function searchArxiv(query: string, maxResults: number, timeoutMs: number,
     return undefined;
   });
   return results;
+}
+
+async function searchSemanticScholar(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
+  await assertPublicUrl(SEMANTIC_SCHOLAR_SEARCH_URL, { ...config, allowedDomains: [] });
+  const url = new URL(SEMANTIC_SCHOLAR_SEARCH_URL);
+  url.searchParams.set("query", query);
+  url.searchParams.set("limit", String(maxResults));
+  url.searchParams.set("fields", "title,url,abstract,year,authors,venue");
+  const payload = await fetchJson(url.toString(), timeoutMs, {
+    signal,
+    config,
+    headers: {
+      "Accept": "application/json",
+      ...(config.semanticScholarApiKey ? { "x-api-key": config.semanticScholarApiKey } : {}),
+    },
+  });
+  const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).data : undefined;
+  if (!Array.isArray(items)) return [];
+  return items
+    .map(item => {
+      if (!item || typeof item !== "object") return null;
+      const record = item as Record<string, unknown>;
+      const entry = entryFromRecord(record, { title: ["title"], url: ["url"], snippet: ["abstract"] });
+      if (!entry) return null;
+      const year = record.year ? String(record.year) : "";
+      const venue = typeof record.venue === "string" ? record.venue : "";
+      const prefix = [year, venue].filter(Boolean).join(" ");
+      return prefix ? { ...entry, snippet: [prefix, entry.snippet].filter(Boolean).join(" - ") } : entry;
+    })
+    .filter((item): item is SearchEntry => Boolean(item))
+    .slice(0, maxResults);
+}
+
+async function searchPubmed(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
+  await assertPublicUrl(PUBMED_ESEARCH_URL, { ...config, allowedDomains: [] });
+  await assertPublicUrl(PUBMED_ESUMMARY_URL, { ...config, allowedDomains: [] });
+  const searchUrl = new URL(PUBMED_ESEARCH_URL);
+  searchUrl.searchParams.set("db", "pubmed");
+  searchUrl.searchParams.set("term", query);
+  searchUrl.searchParams.set("retmode", "json");
+  searchUrl.searchParams.set("retmax", String(maxResults));
+  if (config.pubmedApiKey) searchUrl.searchParams.set("api_key", config.pubmedApiKey);
+  const searchPayload = await fetchJson(searchUrl.toString(), timeoutMs, {
+    signal,
+    config,
+    headers: { "Accept": "application/json" },
+  });
+  const esearch = searchPayload && typeof searchPayload === "object" ? (searchPayload as Record<string, unknown>).esearchresult : undefined;
+  const rawIds = esearch && typeof esearch === "object" ? (esearch as Record<string, unknown>).idlist : undefined;
+  const ids: string[] = Array.isArray(rawIds)
+    ? rawIds.map(String).filter(Boolean).slice(0, maxResults)
+    : [];
+  if (!ids.length) return [];
+
+  const summaryUrl = new URL(PUBMED_ESUMMARY_URL);
+  summaryUrl.searchParams.set("db", "pubmed");
+  summaryUrl.searchParams.set("id", ids.join(","));
+  summaryUrl.searchParams.set("retmode", "json");
+  if (config.pubmedApiKey) summaryUrl.searchParams.set("api_key", config.pubmedApiKey);
+  const summaryPayload = await fetchJson(summaryUrl.toString(), timeoutMs, {
+    signal,
+    config,
+    headers: { "Accept": "application/json" },
+  });
+  const result = summaryPayload && typeof summaryPayload === "object" ? (summaryPayload as Record<string, unknown>).result : undefined;
+  const records = result && typeof result === "object" ? result as Record<string, unknown> : {};
+  const entries: Array<SearchEntry | null> = ids.map((id: string) => {
+    const record = records[id];
+    if (!record || typeof record !== "object") return null;
+    const data = record as Record<string, unknown>;
+    const title = compactSnippet(data.title) || `PubMed ${id}`;
+    const source = compactSnippet(data.source);
+    const pubdate = compactSnippet(data.pubdate);
+    return {
+      title,
+      url: `https://pubmed.ncbi.nlm.nih.gov/${id}/`,
+      snippet: [source, pubdate].filter(Boolean).join(" "),
+    };
+  });
+  return entries.filter((item): item is SearchEntry => Boolean(item)).slice(0, maxResults);
 }
 
 async function searchBaidu(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
@@ -1125,6 +1291,8 @@ interface SearchCandidate {
 function configuredSearchCandidates(config: ResolvedWebConfig): SearchCandidate[] {
   return [
     { engine: "google", source: "Google", run: searchGoogle, available: Boolean(config.googleApiKey && config.googleCx) },
+    { engine: "exa", source: "Exa", run: searchExa, available: Boolean(config.exaApiKey) },
+    { engine: "kagi", source: "Kagi", run: searchKagi, available: Boolean(config.kagiApiKey) },
     { engine: "brave", source: "Brave", run: searchBrave, available: Boolean(config.braveApiKey) },
     { engine: "tavily", source: "Tavily", run: searchTavily, available: Boolean(config.tavilyApiKey) },
     { engine: "serper", source: "Serper", run: searchSerper, available: Boolean(config.serperApiKey) },
@@ -1132,6 +1300,8 @@ function configuredSearchCandidates(config: ResolvedWebConfig): SearchCandidate[
     { engine: "bing", source: "Bing", run: searchBing, available: true },
     { engine: "duckduckgo", source: "DuckDuckGo", run: searchDuckDuckGo, available: true },
     { engine: "arxiv", source: "arXiv", run: searchArxiv, available: false },
+    { engine: "semantic_scholar", source: "Semantic Scholar", run: searchSemanticScholar, available: false },
+    { engine: "pubmed", source: "PubMed", run: searchPubmed, available: false },
     { engine: "baidu", source: "Baidu", run: searchBaidu, available: false },
   ];
 }
@@ -1554,7 +1724,7 @@ export function registerWebTools(configInput?: Partial<WebConfig>): void {
         max_results: { type: "integer", default: DEFAULT_MAX_RESULTS, maximum: MAX_RESULTS },
         timeout_ms: { type: "integer", default: DEFAULT_SEARCH_TIMEOUT_MS, maximum: MAX_TIMEOUT_MS },
         domains: { type: "array", items: { type: "string" }, description: "Optional domain filter, e.g. [\"example.com\"]." },
-        engine: { type: "string", enum: ["auto", "google", "brave", "tavily", "serper", "searxng", "arxiv", "baidu", "bing", "duckduckgo"], default: "auto" },
+        engine: { type: "string", enum: ["auto", "google", "exa", "kagi", "brave", "tavily", "serper", "searxng", "arxiv", "semantic_scholar", "pubmed", "baidu", "bing", "duckduckgo"], default: "auto" },
         type: { type: "string", enum: ["auto", "fast", "deep"], default: "auto", description: "Search depth. deep merges engines and includes page context by default." },
         fetch_results: { type: "boolean", default: false, description: "Fetch top result pages and include extracted context." },
         include_content: { type: "boolean", default: false, description: "Alias for fetch_results." },
