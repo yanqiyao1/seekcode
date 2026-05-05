@@ -34,6 +34,10 @@
   <code>seek "review this repository"</code>
 </p>
 
+<p align="center">
+  <img src="./example.png" alt="Seek Code terminal interface preview" width="900">
+</p>
+
 ---
 
 ## Table Of Contents

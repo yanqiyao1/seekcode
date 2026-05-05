@@ -35,6 +35,10 @@
   <code>seek "review this repo"</code>
 </p>
 
+<p align="center">
+  <img src="./example.png" alt="Seek Code 终端界面预览" width="900">
+</p>
+
 ---
 
 ## 目录
