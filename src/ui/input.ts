@@ -127,6 +127,53 @@ export function splitInputSequences(chunk: string): string[] {
   return sequences;
 }
 
+export function isPlainTextInputSequence(sequence: string): boolean {
+  const chars = Array.from(sequence);
+  return chars.length > 0 && chars.every(char => {
+    const codePoint = char.codePointAt(0) ?? 0;
+    return codePoint >= 32 && codePoint !== 0x7f && char !== "\x1b";
+  });
+}
+
+export function coalesceInputSequences(sequences: string[], options: { inBracketedPaste?: boolean } = {}): string[] {
+  const coalesced: string[] = [];
+  const pending: string[] = [];
+  let inBracketedPaste = !!options.inBracketedPaste;
+
+  const flushPending = () => {
+    if (!pending.length) return;
+    coalesced.push(pending.join(""));
+    pending.length = 0;
+  };
+
+  for (const sequence of sequences) {
+    if (isBracketedPasteStart(sequence)) {
+      flushPending();
+      coalesced.push(sequence);
+      inBracketedPaste = true;
+      continue;
+    }
+
+    if (isBracketedPasteEnd(sequence)) {
+      flushPending();
+      coalesced.push(sequence);
+      inBracketedPaste = false;
+      continue;
+    }
+
+    if (inBracketedPaste || isPlainTextInputSequence(sequence)) {
+      pending.push(sequence);
+      continue;
+    }
+
+    flushPending();
+    coalesced.push(sequence);
+  }
+
+  flushPending();
+  return coalesced;
+}
+
 export function trailingIncompleteEscapeStart(chunk: string): number {
   const lastEscape = chunk.lastIndexOf("\x1b");
   if (lastEscape < 0) return -1;
@@ -173,6 +220,8 @@ export async function readInput(
   let pendingEscapeTimer: NodeJS.Timeout | null = null;
   let inBracketedPaste = false;
   let pasteWindowUntil = 0;
+  let suppressRedraw = false;
+  let needsRedraw = false;
 
   const formatCompletions = (comps: [string, string][]): string[] => comps.slice(0, 9).map(([name, desc]) => {
     const partial = buf.slice(1).toLowerCase();
@@ -235,12 +284,23 @@ export async function readInput(
       return true;
     };
 
+    const requestInputRedraw = (comps?: [string, string][]) => {
+      if (suppressRedraw) {
+        needsRedraw = true;
+        return;
+      }
+      redraw(comps);
+    };
+
+    const redrawForBuffer = () => {
+      requestInputRedraw(buf.startsWith("/") ? matches(buf) : undefined);
+    };
+
     const insertText = (text: string) => {
       if (!text) return;
       buf = buf.slice(0, pos) + text + buf.slice(pos);
       pos += text.length;
-      if (buf.startsWith("/")) redraw(matches(buf));
-      else redraw();
+      redrawForBuffer();
     };
 
     const handleKey = (s: string, context?: { index: number; sequenceCount: number; now: number }): boolean => {
@@ -257,7 +317,7 @@ export async function readInput(
       if (isBracketedPasteEnd(s)) {
         inBracketedPaste = false;
         pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
-        redraw();
+        requestInputRedraw();
         return false;
       }
 
@@ -269,14 +329,14 @@ export async function readInput(
         }
         const nextPrompt = opts?.onModeCycle?.();
         if (typeof nextPrompt === "string") currentPrompt = nextPrompt;
-        redraw();
+        requestInputRedraw();
         return false;
       }
 
       const scrollAction = scrollActionForSequence(s);
       if (scrollAction && !inBracketedPaste) {
         opts?.onScroll?.(scrollAction.direction, scrollAction.amount);
-        redraw();
+        requestInputRedraw();
         return false;
       }
 
@@ -284,10 +344,10 @@ export async function readInput(
       if (s.startsWith("\x1b") && s.length > 1 && !inBracketedPaste) {
         if (s === "\x1b[A" || s === "\x1bOA") return false; // up — ignore
         if (s === "\x1b[B" || s === "\x1bOB") return false; // down — ignore
-        if (s === "\x1b[D" || s === "\x1bOD") { if (pos > 0) pos = previousGraphemeIndex(buf, pos); redraw(); return false; }
-        if (s === "\x1b[C" || s === "\x1bOC") { if (pos < buf.length) pos = nextGraphemeIndex(buf, pos); redraw(); return false; }
-        if (s === "\x1b[H" || s === "\x1bOH") { pos = 0; redraw(); return false; }
-        if (s === "\x1b[F" || s === "\x1bOF") { pos = buf.length; redraw(); return false; }
+        if (s === "\x1b[D" || s === "\x1bOD") { if (pos > 0) pos = previousGraphemeIndex(buf, pos); requestInputRedraw(); return false; }
+        if (s === "\x1b[C" || s === "\x1bOC") { if (pos < buf.length) pos = nextGraphemeIndex(buf, pos); requestInputRedraw(); return false; }
+        if (s === "\x1b[H" || s === "\x1bOH") { pos = 0; requestInputRedraw(); return false; }
+        if (s === "\x1b[F" || s === "\x1bOF") { pos = buf.length; requestInputRedraw(); return false; }
         return false;
       }
 
@@ -297,11 +357,11 @@ export async function readInput(
       // Tab — complete
       if (s === "\t" && !inBracketedPaste) {
         const m = matches(buf);
-        if (m.length === 1) { buf = "/" + m[0][0] + " "; pos = buf.length; redraw(); }
+        if (m.length === 1) { buf = "/" + m[0][0] + " "; pos = buf.length; requestInputRedraw(); }
         else if (m.length > 1) {
           const pre = "/" + commonPrefix(m.map(([n]) => n));
           if (pre.length > buf.length) { buf = pre; pos = buf.length; }
-          redraw(m);
+          requestInputRedraw(m);
         }
         return false;
       }
@@ -328,18 +388,17 @@ export async function readInput(
           const previous = previousGraphemeIndex(buf, pos);
           buf = buf.slice(0, previous) + buf.slice(pos);
           pos = previous;
-          redraw();
+          requestInputRedraw();
         }
         return false;
       }
 
       // Home / End
-      if (s === "\x01" && !inBracketedPaste) { pos = 0; redraw(); return false; }
-      if (s === "\x05" && !inBracketedPaste) { pos = buf.length; redraw(); return false; }
+      if (s === "\x01" && !inBracketedPaste) { pos = 0; requestInputRedraw(); return false; }
+      if (s === "\x05" && !inBracketedPaste) { pos = buf.length; requestInputRedraw(); return false; }
 
       // Printable
-      const codePoint = s.codePointAt(0) ?? 0;
-      if (Array.from(s).length === 1 && codePoint >= 32 && codePoint !== 0x7f) {
+      if (isPlainTextInputSequence(s)) {
         insertText(s);
         if (inBracketedPaste || (context?.sequenceCount ?? 1) >= 3) {
           pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
@@ -356,8 +415,21 @@ export async function readInput(
 
     const handleKeys = (keys: string[]) => {
       const now = Date.now();
-      for (let index = 0; index < keys.length; index++) {
-        if (handleKey(keys[index]!, { index, sequenceCount: keys.length, now })) break;
+      const sequenceCount = keys.length;
+      const coalesced = coalesceInputSequences(keys, { inBracketedPaste });
+      const shouldBatchRender = sequenceCount >= 3 || coalesced.length < sequenceCount || inBracketedPaste;
+      const previousSuppressRedraw = suppressRedraw;
+      if (shouldBatchRender) suppressRedraw = true;
+      try {
+        for (let index = 0; index < coalesced.length; index++) {
+          if (handleKey(coalesced[index]!, { index, sequenceCount, now })) break;
+        }
+      } finally {
+        suppressRedraw = previousSuppressRedraw;
+        if (!suppressRedraw && needsRedraw && !settled) {
+          needsRedraw = false;
+          redrawForBuffer();
+        }
       }
     };
 

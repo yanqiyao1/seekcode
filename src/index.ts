@@ -4,6 +4,8 @@
 import { Command } from "commander";
 import {
   COMMANDS,
+  coalesceInputSequences,
+  isPlainTextInputSequence,
   isShiftTabSequence,
   isBracketedPasteEnd,
   isBracketedPasteStart,
@@ -223,6 +225,8 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
   let pendingGlobalEscapeTimer: NodeJS.Timeout | null = null;
   let inGlobalBracketedPaste = false;
   let globalPasteWindowUntil = 0;
+  let suppressGlobalInputRender = false;
+  let globalInputNeedsRender = false;
   let activeSkillInstruction: string | null = null;
   let promptState = { value: "", cursor: 0, completions: [] as string[] };
   let activeStatusLine: string | null = null;
@@ -333,13 +337,21 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     requestImmediateRender();
   };
 
+  const requestLiveInputRender = (immediate = false) => {
+    if (suppressGlobalInputRender) {
+      globalInputNeedsRender = true;
+      return;
+    }
+    if (immediate) requestImmediateRender();
+    else requestRender();
+  };
+
   const insertLiveInputText = (text: string, immediate = false) => {
     if (!text) return;
     promptState.value = promptState.value.slice(0, promptState.cursor) + text + promptState.value.slice(promptState.cursor);
     promptState.cursor += text.length;
     promptState.completions = commandCompletions(promptState.value);
-    if (immediate) requestImmediateRender();
-    else requestRender();
+    requestLiveInputRender(immediate);
   };
 
   const editLiveInput = (key: string, context?: { index: number; sequenceCount: number; now: number }): boolean => {
@@ -353,7 +365,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     if (isBracketedPasteEnd(key)) {
       inGlobalBracketedPaste = false;
       globalPasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
-      requestImmediateRender();
+      requestLiveInputRender(true);
       return true;
     }
 
@@ -361,7 +373,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       cfg.mode = nextModeName(cfg.mode);
       session.mode = cfg.mode;
       modeObj = getMode(cfg.mode);
-      requestImmediateRender();
+      requestLiveInputRender(true);
       return true;
     }
     if (key === "\r" || key === "\n") {
@@ -386,28 +398,28 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         promptState.value = promptState.value.slice(0, previous) + promptState.value.slice(promptState.cursor);
         promptState.cursor = previous;
         promptState.completions = commandCompletions(promptState.value);
-        requestImmediateRender();
+        requestLiveInputRender(true);
       }
       return true;
     }
     if ((key === "\x01" || key === "\x1b[H" || key === "\x1bOH") && !inGlobalBracketedPaste) {
       promptState.cursor = 0;
-      requestImmediateRender();
+      requestLiveInputRender(true);
       return true;
     }
     if ((key === "\x05" || key === "\x1b[F" || key === "\x1bOF") && !inGlobalBracketedPaste) {
       promptState.cursor = promptState.value.length;
-      requestImmediateRender();
+      requestLiveInputRender(true);
       return true;
     }
     if ((key === "\x1b[D" || key === "\x1bOD") && !inGlobalBracketedPaste) {
       if (promptState.cursor > 0) promptState.cursor = previousGraphemeIndex(promptState.value, promptState.cursor);
-      requestImmediateRender();
+      requestLiveInputRender(true);
       return true;
     }
     if ((key === "\x1b[C" || key === "\x1bOC") && !inGlobalBracketedPaste) {
       if (promptState.cursor < promptState.value.length) promptState.cursor = nextGraphemeIndex(promptState.value, promptState.cursor);
-      requestImmediateRender();
+      requestLiveInputRender(true);
       return true;
     }
     if (key === "\t" && !inGlobalBracketedPaste) {
@@ -417,12 +429,11 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         promptState.cursor = promptState.value.length;
       }
       promptState.completions = commandCompletions(promptState.value);
-      requestImmediateRender();
+      requestLiveInputRender(true);
       return true;
     }
     if (key.startsWith("\x1b") && !inGlobalBracketedPaste) return false;
-    const codePoint = key.codePointAt(0) ?? 0;
-    if (Array.from(key).length === 1 && codePoint >= 32 && codePoint !== 0x7f) {
+    if (isPlainTextInputSequence(key)) {
       insertLiveInputText(key);
       if (inGlobalBracketedPaste || (context?.sequenceCount ?? 1) >= 3) globalPasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
       return true;
@@ -452,8 +463,21 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
 
   const handleGlobalKeys = (keys: string[]) => {
     const now = Date.now();
-    for (let index = 0; index < keys.length; index++) {
-      handleGlobalKey(keys[index]!, { index, sequenceCount: keys.length, now });
+    const sequenceCount = keys.length;
+    const coalesced = coalesceInputSequences(keys, { inBracketedPaste: inGlobalBracketedPaste });
+    const shouldBatchRender = sequenceCount >= 3 || coalesced.length < sequenceCount || inGlobalBracketedPaste;
+    const previousSuppressRender = suppressGlobalInputRender;
+    if (shouldBatchRender) suppressGlobalInputRender = true;
+    try {
+      for (let index = 0; index < coalesced.length; index++) {
+        handleGlobalKey(coalesced[index]!, { index, sequenceCount, now });
+      }
+    } finally {
+      suppressGlobalInputRender = previousSuppressRender;
+      if (!suppressGlobalInputRender && globalInputNeedsRender) {
+        globalInputNeedsRender = false;
+        requestImmediateRender();
+      }
     }
   };
 

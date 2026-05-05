@@ -4,10 +4,12 @@ import { nextModeName } from "../src/modes/base.js";
 import { fitAnsi, stripAnsi, truncateAnsi, visibleLength, wrapAnsi } from "../src/ui/ansi.js";
 import {
   COMMANDS,
+  coalesceInputSequences,
   disableBracketedPaste,
   enableBracketedPaste,
   isBracketedPasteEnd,
   isBracketedPasteStart,
+  isPlainTextInputSequence,
   isShiftTabSequence,
   nextGraphemeIndex,
   previousGraphemeIndex,
@@ -486,12 +488,25 @@ describe("Input shortcuts", () => {
     expect(splitInputSequences("qwq")).toEqual(["q", "w", "q"]);
   });
 
+  it("coalesces printable input bursts before editing the prompt", () => {
+    expect(isPlainTextInputSequence("hello")).toBe(true);
+    expect(isPlainTextInputSequence("hello\n")).toBe(false);
+    expect(coalesceInputSequences(splitInputSequences("hello"))).toEqual(["hello"]);
+    expect(coalesceInputSequences(splitInputSequences("hi\x1b[D!"))).toEqual(["hi", "\x1b[D", "!"]);
+  });
+
   it("recognizes bracketed paste delimiters", () => {
     const keys = splitInputSequences("\x1b[200~hello\nworld\x1b[201~");
 
     expect(isBracketedPasteStart(keys[0]!)).toBe(true);
     expect(isBracketedPasteEnd(keys.at(-1)!)).toBe(true);
     expect(keys).toContain("\n");
+  });
+
+  it("coalesces bracketed paste payloads including newlines", () => {
+    const keys = splitInputSequences("\x1b[200~hello\nworld\x1b[201~");
+
+    expect(coalesceInputSequences(keys)).toEqual(["\x1b[200~", "hello\nworld", "\x1b[201~"]);
   });
 
   it("treats newlines in paste-like bursts as input text", () => {
