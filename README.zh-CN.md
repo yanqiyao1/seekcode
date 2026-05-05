@@ -314,8 +314,9 @@ Seek Code 使用分层配置，后面的来源覆盖前面的来源：
 - 用户配置主路径是 `~/.seekcode/config.toml`。
 - 项目配置主路径是当前工作目录下的 `.seekcode/config.toml`。
 - 配置文件不使用 `XDG_CONFIG_HOME`。
-- 旧配置 `~/.config/deepseek/config.toml` 和 `.deepseek/config.toml` 仍会被读取；新 `.seekcode` 路径中的值优先级更高。
-- `seek config validate`、`seek config explain` 和普通启动不会自动创建缺失的配置文件。
+- 旧配置 `~/.config/deepseek/config.toml` 和 `.deepseek/config.toml` 不会被自动加载；需要复制旧配置时，请显式运行 `seek config migrate --target user|project`。
+- 普通启动、`seek config validate` 和 `seek config explain` 会在缺失时自动创建 `~/.seekcode/config.toml`。
+- 运行时命令需要 API key 但未配置时，Seek Code 会提示你粘贴从 `https://platform.deepseek.com` 获取的 key，或自行到 `~/.seekcode/config.toml` 中配置 `api_key`。
 - `seek config migrate --target user|project` 会迁移已有的 `.seekcode` 配置；如果只存在旧 DeepSeek 配置，会把迁移结果写入新的 `.seekcode` 路径；如果两者都不存在，则只报告警告。
 - `/mcp add` 等持久化 MCP 修改会写入用户配置，并自动创建父目录。
 

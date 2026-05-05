@@ -127,6 +127,31 @@ export interface ConfigExplainReport {
 }
 
 const DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com";
+const DEFAULT_USER_CONFIG_TEMPLATE = `# Seek Code user configuration
+# This file is created automatically on first use.
+# You can also set these values with DEEPSEEK_* environment variables.
+
+api_key = ""
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-pro"
+flash_model = "deepseek-v4-flash"
+
+mode = "agent"
+max_tokens = 8192
+max_turns = 50
+reasoning_effort = "high"
+
+tui_alternate_screen = "never"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+workspace_boundary = true
+
+[web]
+enabled = true
+mode = "live"
+search_engine = "auto"
+`;
 
 function loadTomlFile(path: string): Record<string, unknown> {
   try {
@@ -164,14 +189,29 @@ export function legacyProjectConfigPath(): string {
 }
 
 export function loadUserConfigRaw(): Record<string, unknown> {
-  const merged: Record<string, unknown> = {};
-  mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(legacyUserConfigPath())).config);
-  mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(userConfigPath())).config);
-  return merged;
+  ensureUserConfigFile();
+  return loadTomlFile(userConfigPath());
 }
 
 export function writeUserConfigRaw(config: Record<string, unknown>): void {
   const path = userConfigPath();
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, stringifyToml(config as any), "utf-8");
+}
+
+export function ensureUserConfigFile(): void {
+  const path = userConfigPath();
+  if (existsSync(path)) return;
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, DEFAULT_USER_CONFIG_TEMPLATE, "utf-8");
+}
+
+export function writeUserApiKey(apiKey: string): void {
+  ensureUserConfigFile();
+  const path = userConfigPath();
+  const loaded = readTomlFile(path);
+  if (loaded.error) throw new Error(`Could not read config file ${path}: ${loaded.error}`);
+  const config = { ...loaded.data, api_key: apiKey };
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, stringifyToml(config as any), "utf-8");
 }
@@ -310,17 +350,12 @@ function getNested(target: Record<string, unknown>, key: string): unknown {
 }
 
 export function loadConfig(cliOverrides: Record<string, unknown> = {}): Config {
-  // Layered loading: defaults < legacy user < user < legacy project < project < env < CLI
+  // Layered loading: defaults < user < project < env < CLI
+  ensureUserConfigFile();
   const merged: Record<string, unknown> = {};
-
-  // Legacy user config
-  mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(legacyUserConfigPath())).config);
 
   // User config
   mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(userConfigPath())).config);
-
-  // Legacy project-local config
-  mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(legacyProjectConfigPath())).config);
 
   // Project-local config
   mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(projectConfigPath())).config);
@@ -385,7 +420,7 @@ export function validateConfig(cliOverrides: Record<string, unknown> = {}): Conf
 }
 
 export function migrateUserConfig(options: { dryRun?: boolean } = {}): ConfigMigrationReport {
-  if (!existsSync(userConfigPath()) && existsSync(legacyUserConfigPath())) {
+  if ((!existsSync(userConfigPath()) || isGeneratedDefaultUserConfig()) && existsSync(legacyUserConfigPath())) {
     return migrateConfigFileFrom(legacyUserConfigPath(), userConfigPath(), options);
   }
   return migrateConfigFile(userConfigPath(), options);
@@ -417,6 +452,14 @@ function migrateConfigFileFrom(sourcePath: string, outputPath: string, options: 
   return { changed, path: outputPath, actions, warnings: migrated.warnings };
 }
 
+function isGeneratedDefaultUserConfig(): boolean {
+  try {
+    return readFileSync(userConfigPath(), "utf-8") === DEFAULT_USER_CONFIG_TEMPLATE;
+  } catch {
+    return false;
+  }
+}
+
 export function explainConfig(cliOverrides: Record<string, unknown> = {}): ConfigExplainReport {
   const sources = configSources(cliOverrides);
   const conflicts: ConfigConflict[] = [];
@@ -445,14 +488,11 @@ export function explainConfig(cliOverrides: Record<string, unknown> = {}): Confi
 }
 
 function configSources(cliOverrides: Record<string, unknown>): Array<{ source: string; path?: string; exists?: boolean; values: Record<string, unknown>; error?: string }> {
-  const legacyUser = readTomlFile(legacyUserConfigPath());
+  ensureUserConfigFile();
   const user = readTomlFile(userConfigPath());
-  const legacyProject = readTomlFile(legacyProjectConfigPath());
   const project = readTomlFile(projectConfigPath());
   return [
-    { source: "legacy_user", path: legacyUserConfigPath(), exists: legacyUser.exists, values: legacyUser.data, error: legacyUser.error },
     { source: "user", path: userConfigPath(), exists: user.exists, values: user.data, error: user.error },
-    { source: "legacy_project", path: legacyProjectConfigPath(), exists: legacyProject.exists, values: legacyProject.data, error: legacyProject.error },
     { source: "project", path: projectConfigPath(), exists: project.exists, values: project.data, error: project.error },
     { source: "env", values: loadEnv() },
     { source: "cli", values: normalizeCliOverrides(cliOverrides) },

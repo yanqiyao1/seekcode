@@ -69,6 +69,16 @@ describe("CLI and packaging", () => {
     expect(JSON.parse(fromCli.stdout).resolved).toMatchObject({ model: "deepseek-v4-flash", mode: "agent" });
   });
 
+  it("creates ~/.seekcode/config.toml during config commands", () => {
+    const configPath = join(tmp, "home", ".seekcode", "config.toml");
+
+    const result = runCli(srcCli, ["config", "validate"]);
+
+    expect(result.status).toBe(0);
+    expect(existsSync(configPath)).toBe(true);
+    expect(readFileSync(configPath, "utf-8")).toContain('api_key = ""');
+  });
+
   it("runs one-shot prompts with multiple words against an OpenAI-compatible endpoint", async () => {
     const requests: any[] = [];
     await startFakeOpenAIServer(requests);
@@ -139,6 +149,8 @@ describe("CLI and packaging", () => {
 
     expect(result.status).toBe(1);
     expect(stripAnsi(result.stderr)).toContain("DEEPSEEK_API_KEY is required");
+    expect(stripAnsi(result.stderr)).toContain("platform.deepseek.com");
+    expect(stripAnsi(result.stderr)).toContain(".seekcode/config.toml");
     expect(stripAnsi(result.stdout)).not.toContain("Seek Code");
   });
 });

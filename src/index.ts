@@ -23,6 +23,7 @@ import {
 import { movePickerIndex, pickerActionForSequence, pickerWindow, type PickItem } from "./ui/picker.js";
 import { basename, resolve } from "node:path";
 import { existsSync } from "node:fs";
+import { createInterface } from "node:readline/promises";
 import * as r from "./ui/renderer.js";
 import { p } from "./ui/palette.js";
 import * as screen from "./tui/screen.js";
@@ -33,7 +34,7 @@ import { ActiveToolLines } from "./tui/tool-lines.js";
 import { AssistantStream } from "./tui/assistant-stream.js";
 import { renderMarkdown } from "./ui/markdown.js";
 
-import { explainConfig, loadConfig, migrateProjectConfig, migrateUserConfig, validateConfig } from "./config.js";
+import { explainConfig, loadConfig, migrateProjectConfig, migrateUserConfig, userConfigPath, validateConfig, writeUserApiKey, type Config } from "./config.js";
 import { DeepSeekClient } from "./client/deepseek.js";
 import { getRegistry } from "./tools/registry.js";
 import { getMode, nextModeName, type UICallbacks } from "./modes/base.js";
@@ -138,6 +139,30 @@ function setupTools(cfg?: ReturnType<typeof loadConfig>) {
   registerTaskTools();
   registerArtifactTools();
   registerDiagnosticsTools();
+}
+
+async function ensureRuntimeApiKey(cfg: Config, cliOverrides: Record<string, unknown>): Promise<Config> {
+  if (cfg.api_key) return cfg;
+  const path = userConfigPath();
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error(`DEEPSEEK_API_KEY is required. Paste an API key from https://platform.deepseek.com into api_key in ${path}, or pass --api-key.`);
+  }
+
+  console.log(p.warning("DeepSeek API key is not configured."));
+  console.log(`Get an API key from: ${p.blue("https://platform.deepseek.com")}`);
+  console.log(`Config file: ${p.blue(path)}`);
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question("Paste API key to save it now, or press Enter to configure the file yourself: ")).trim();
+    if (!answer) {
+      throw new Error(`DEEPSEEK_API_KEY is required. Add api_key to ${path}, then run seek again.`);
+    }
+    writeUserApiKey(answer);
+    console.log(p.success(`Saved API key to ${path}`));
+    return loadConfig(cliOverrides);
+  } finally {
+    rl.close();
+  }
 }
 
 async function runOneShot(cfg: ReturnType<typeof loadConfig>, prompt: string) {
@@ -1678,7 +1703,8 @@ program
   .option("--alt-screen", "Use fullscreen alternate screen")
   .option("--no-alt-screen", "Use inline mode with terminal-native scrollback")
   .action(async (promptParts: string[] | undefined, options) => {
-    const cfg = loadConfig(configOverridesFromCliOptions(options));
+    const cliOverrides = configOverridesFromCliOptions(options);
+    const cfg = await ensureRuntimeApiKey(loadConfig(cliOverrides), cliOverrides);
 
     const prompt = (promptParts || []).join(" ").trim();
     if (prompt) {
@@ -1694,7 +1720,8 @@ program
   .option("-p, --port <port>", "Port to listen on", "8080")
   .option("-h, --host <host>", "Host to bind to", "0.0.0.0")
   .action(async (options) => {
-    setupTools(loadConfig(configOverridesFromCliOptions(program.opts())));
+    const cliOverrides = configOverridesFromCliOptions(program.opts());
+    setupTools(await ensureRuntimeApiKey(loadConfig(cliOverrides), cliOverrides));
     const { runServer } = await import("./server/app.js");
     runServer(options.host, parseOptionalInt(options.port) ?? 8080);
   });

@@ -958,6 +958,50 @@ describe("engine", () => {
 });
 
 describe("config and pricing", () => {
+  it("creates ~/.seekcode/config.toml with defaults on first config load", () => {
+    const userConfig = join(process.env.HOME!, ".seekcode", "config.toml");
+
+    expect(existsSync(userConfig)).toBe(false);
+    const cfg = loadConfig();
+
+    expect(cfg.api_key).toBe("");
+    expect(existsSync(userConfig)).toBe(true);
+    expect(readFileSync(userConfig, "utf-8")).toContain('api_key = ""');
+  });
+
+  it("does not auto-copy legacy user config on first config load", () => {
+    const legacyUserDir = join(process.env.HOME!, ".config", "deepseek");
+    const userConfig = join(process.env.HOME!, ".seekcode", "config.toml");
+    mkdirSync(legacyUserDir, { recursive: true });
+    writeFileSync(join(legacyUserDir, "config.toml"), 'api_key = "legacy-key"\nbaseUrl = "http://legacy.local"\n');
+
+    const cfg = loadConfig();
+
+    expect(cfg.api_key).toBe("");
+    expect(existsSync(userConfig)).toBe(true);
+    const raw = readFileSync(userConfig, "utf-8");
+    expect(raw).toContain('api_key = ""');
+    expect(raw).not.toContain("legacy-key");
+    expect(raw).not.toContain("baseUrl");
+  });
+
+  it("migrates legacy user config only when explicitly requested", () => {
+    const legacyUserDir = join(process.env.HOME!, ".config", "deepseek");
+    const userConfig = join(process.env.HOME!, ".seekcode", "config.toml");
+    mkdirSync(legacyUserDir, { recursive: true });
+    writeFileSync(join(legacyUserDir, "config.toml"), 'api_key = "legacy-key"\nbaseUrl = "http://legacy.local"\n');
+
+    expect(loadConfig().api_key).toBe("");
+    const report = migrateUserConfig();
+
+    expect(report.changed).toBe(true);
+    expect(report.actions.join("\n")).toContain("copied legacy config");
+    const raw = readFileSync(userConfig, "utf-8");
+    expect(raw).toContain("legacy-key");
+    expect(raw).toContain("base_url");
+    expect(raw).not.toContain("baseUrl");
+  });
+
   it("ignores invalid numeric environment values instead of throwing", () => {
     const old = process.env.DEEPSEEK_MAX_TOKENS;
     process.env.DEEPSEEK_MAX_TOKENS = "not-a-number";
@@ -985,7 +1029,7 @@ describe("config and pricing", () => {
     expect(cfg.model).toBe("deepseek/deepseek-v4-pro");
   });
 
-  it("loads ~/.seekcode config and keeps legacy DeepSeek paths as lower-precedence fallbacks", () => {
+  it("loads ~/.seekcode config without implicitly reading legacy DeepSeek paths", () => {
     const legacyUserDir = join(process.env.HOME!, ".config", "deepseek");
     const userDir = join(process.env.HOME!, ".seekcode");
     const legacyProjectDir = join(tmp, ".deepseek");
@@ -1005,10 +1049,11 @@ describe("config and pricing", () => {
       const explain = explainConfig();
 
       expect(cfg.api_key).toBe("seekcode-user-key");
-      expect(cfg.model).toBe("deepseek-v4-flash");
+      expect(cfg.model).toBe("deepseek-v4-pro");
       expect(cfg.mode).toBe("agent");
-      expect(explain.conflicts.some(conflict => conflict.key === "api_key" && conflict.winner === "user")).toBe(true);
-      expect(explain.conflicts.some(conflict => conflict.key === "mode" && conflict.winner === "project")).toBe(true);
+      expect(explain.sources.map(source => source.source)).toEqual(["user", "project", "env", "cli"]);
+      expect(explain.conflicts.some(conflict => conflict.key === "api_key")).toBe(false);
+      expect(explain.conflicts.some(conflict => conflict.key === "mode" && conflict.winner === "project")).toBe(false);
     } finally {
       process.chdir(cwd);
     }

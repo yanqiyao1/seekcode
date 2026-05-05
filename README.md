@@ -356,8 +356,9 @@ Current path behavior:
 - The user config path is hard-coded from `HOME` as `~/.seekcode/config.toml`.
 - The project config path is `.seekcode/config.toml` under the current working directory.
 - `XDG_CONFIG_HOME` is not used for config files.
-- Legacy config files are still read from `~/.config/deepseek/config.toml` and `.deepseek/config.toml`; values in the new `.seekcode` locations take precedence.
-- Loading config, `seek config validate`, and `seek config explain` do not create a missing config file.
+- Legacy config files at `~/.config/deepseek/config.toml` and `.deepseek/config.toml` are not loaded automatically. Run `seek config migrate --target user|project` when you want to copy one into the new `.seekcode` location.
+- Loading config, `seek config validate`, and `seek config explain` create `~/.seekcode/config.toml` if it is missing.
+- If a runtime command needs an API key and none is configured, Seek Code prompts you to paste a key from `https://platform.deepseek.com` or configure `api_key` in `~/.seekcode/config.toml` yourself.
 - `seek config migrate --target user|project` migrates an existing `.seekcode` file. If only the legacy DeepSeek file exists, it writes the migrated result to the new `.seekcode` path. If neither file exists, it reports a warning.
 - Persistent MCP changes, such as `/mcp add`, write to the user config file and create its parent directory if needed.
 
