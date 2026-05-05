@@ -28,7 +28,7 @@
 </p>
 
 <p align="center">
-  <code>npm install -g seek-code</code>
+  <code>npm install -g seekcode</code>
   &nbsp;&nbsp;|&nbsp;&nbsp;
   <code>seek</code>
   &nbsp;&nbsp;|&nbsp;&nbsp;
@@ -115,7 +115,7 @@ Seek Code 从默认模型、请求格式、能力矩阵、缓存统计、thinkin
 ### 1. 安装
 
 ```bash
-npm install -g seek-code
+npm install -g seekcode
 ```
 
 ### 2. 设置 API Key
@@ -820,7 +820,7 @@ src/
 
 ```bash
 git clone <repo-url>
-cd seek-code
+cd seekcode
 npm install
 npm run build
 npm link

@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <code>npm install -g seek-code</code>
+  <code>npm install -g seekcode</code>
   &nbsp;&nbsp;|&nbsp;&nbsp;
   <code>seek</code>
   &nbsp;&nbsp;|&nbsp;&nbsp;
@@ -141,7 +141,7 @@ You can use the same CLI while moving between official DeepSeek APIs, hosted com
 ### 1. Install
 
 ```bash
-npm install -g seek-code
+npm install -g seekcode
 ```
 
 ### 2. Set Your API Key
@@ -862,7 +862,7 @@ src/
 
 ```bash
 git clone <repo-url>
-cd seek-code
+cd seekcode
 npm install
 npm run build
 npm link

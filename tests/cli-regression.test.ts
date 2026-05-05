@@ -31,8 +31,8 @@ describe("CLI and packaging", () => {
     const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf-8"));
     const dist = join(repoRoot, "dist", "index.js");
 
-    expect(pkg.name).toBe("seek-code");
-    expect(pkg.bin).toEqual({ seek: "./dist/index.js" });
+    expect(pkg.name).toBe("seekcode");
+    expect(pkg.bin).toEqual({ seek: "dist/index.js" });
     expect(existsSync(dist)).toBe(true);
     expect(readFileSync(dist, "utf-8").startsWith("#!/usr/bin/env node")).toBe(true);
     expect((statSync(dist).mode & 0o111) !== 0).toBe(true);

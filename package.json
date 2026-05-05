@@ -1,5 +1,5 @@
 {
-  "name": "seek-code",
+  "name": "seekcode",
   "version": "0.1.0",
   "description": "Seek Code — a terminal-native coding agent powered by DeepSeek models",
   "type": "module",
@@ -26,6 +26,7 @@
     "test:watch": "vitest"
   },
   "keywords": [
+    "seekcode",
     "seek-code",
     "seek",
     "cli",
