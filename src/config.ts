@@ -73,7 +73,7 @@ const ConfigSchema = z.object({
   lsp_diagnostics_severity: z.enum(["error", "warning", "information", "hint", "all"]).default("warning"),
   tool_call_budget_per_turn: z.number().int().default(80),
   tool_failure_degrade_threshold: z.number().int().default(3),
-  status_items: z.array(StatusItemSchema).default(["mode", "model", "workspace", "cache", "tools", "cost", "hints"]),
+  status_items: z.array(StatusItemSchema).default(["mode", "model", "workspace", "cache", "cost", "hints"]),
   web: WebConfigSchema.default({}),
 });
 

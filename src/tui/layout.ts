@@ -1,6 +1,6 @@
 /** Full-screen TUI layout controller. */
 
-import { fitAnsi, visibleLength } from "../ui/ansi.js";
+import { fitAnsi, visibleLength, wrapAnsiLine } from "../ui/ansi.js";
 import * as screen from "./screen.js";
 import { Transcript } from "./transcript.js";
 
@@ -207,30 +207,29 @@ export class TuiLayout {
   }
 
   private inputLines(prompt: string, input: string, cols: number): string[] {
-    const line = prompt + input;
-    if (visibleLength(line) <= cols) return [line];
-
     const rows: string[] = [];
-    let current = "";
-    for (const char of line) {
-      if (visibleLength(current + char) > cols) {
-        rows.push(current);
-        current = char;
-      } else {
-        current += char;
-      }
+    const logicalLines = input.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    for (let index = 0; index < logicalLines.length; index++) {
+      const prefix = index === 0 ? prompt : " ".repeat(visibleLength(prompt));
+      rows.push(...wrapAnsiLine(prefix + logicalLines[index], cols));
     }
-    rows.push(current);
     return rows.slice(-3);
   }
 
   cursorPosition(prompt: string, input: string, cursor: number, cols: number, rows: number): { row: number; col: number } {
-    const beforeCursor = prompt + input.slice(0, cursor);
-    const width = visibleLength(beforeCursor);
-    const promptInputRows = Math.max(1, Math.floor(width / cols) + 1);
-    const visibleRows = Math.min(3, promptInputRows);
-    const hiddenRows = Math.max(0, promptInputRows - visibleRows);
-    const row = rows - visibleRows + Math.max(0, Math.floor(width / cols) - hiddenRows) + 1;
+    const beforeCursor = input.slice(0, cursor).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const logicalBeforeCursor = beforeCursor.split("\n");
+    let promptInputRows = 0;
+    for (let index = 0; index < logicalBeforeCursor.length; index++) {
+      const prefix = index === 0 ? prompt : " ".repeat(visibleLength(prompt));
+      promptInputRows += wrapAnsiLine(prefix + logicalBeforeCursor[index], cols).length;
+    }
+
+    const promptWidth = visibleLength(prompt);
+    const currentLogicalLine = logicalBeforeCursor.at(-1) ?? "";
+    const width = promptWidth + visibleLength(currentLogicalLine);
+    const visibleRows = Math.min(3, Math.max(1, promptInputRows));
+    const row = rows - visibleRows + Math.min(visibleRows, Math.max(1, promptInputRows));
     const col = (width % cols) + 1;
     return { row, col };
   }

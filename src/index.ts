@@ -5,11 +5,15 @@ import { Command } from "commander";
 import {
   COMMANDS,
   isShiftTabSequence,
+  isBracketedPasteEnd,
+  isBracketedPasteStart,
   nextGraphemeIndex,
+  PASTE_BURST_NEWLINE_WINDOW_MS,
   previousGraphemeIndex,
   readInput,
   restoreTTYInput,
   scrollActionForSequence,
+  shouldTreatNewlineAsPaste,
   splitInputSequences,
   trailingIncompleteEscapeStart,
   type ScrollDirection,
@@ -217,6 +221,8 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
   let exitSummary: string | null = null;
   let pendingGlobalEscape = "";
   let pendingGlobalEscapeTimer: NodeJS.Timeout | null = null;
+  let inGlobalBracketedPaste = false;
+  let globalPasteWindowUntil = 0;
   let activeSkillInstruction: string | null = null;
   let promptState = { value: "", cursor: 0, completions: [] as string[] };
   let activeStatusLine: string | null = null;
@@ -327,8 +333,31 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     requestImmediateRender();
   };
 
-  const editLiveInput = (key: string): boolean => {
-    if (isShiftTabSequence(key)) {
+  const insertLiveInputText = (text: string, immediate = false) => {
+    if (!text) return;
+    promptState.value = promptState.value.slice(0, promptState.cursor) + text + promptState.value.slice(promptState.cursor);
+    promptState.cursor += text.length;
+    promptState.completions = commandCompletions(promptState.value);
+    if (immediate) requestImmediateRender();
+    else requestRender();
+  };
+
+  const editLiveInput = (key: string, context?: { index: number; sequenceCount: number; now: number }): boolean => {
+    const now = context?.now ?? Date.now();
+
+    if (isBracketedPasteStart(key)) {
+      inGlobalBracketedPaste = true;
+      globalPasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+      return true;
+    }
+    if (isBracketedPasteEnd(key)) {
+      inGlobalBracketedPaste = false;
+      globalPasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+      requestImmediateRender();
+      return true;
+    }
+
+    if (isShiftTabSequence(key) && !inGlobalBracketedPaste) {
       cfg.mode = nextModeName(cfg.mode);
       session.mode = cfg.mode;
       modeObj = getMode(cfg.mode);
@@ -336,17 +365,22 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       return true;
     }
     if (key === "\r" || key === "\n") {
+      if (inGlobalBracketedPaste || shouldTreatNewlineAsPaste(context?.index ?? 0, context?.sequenceCount ?? 1, now, globalPasteWindowUntil)) {
+        insertLiveInputText("\n", true);
+        globalPasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+        return true;
+      }
       submitLiveInput();
       return true;
     }
-    if (key === "\x03") {
+    if (key === "\x03" && !inGlobalBracketedPaste) {
       activeAbortController?.abort();
       engine.interrupt();
       transcript.append(r.interruptedMsg());
       requestImmediateRender();
       return true;
     }
-    if (key === "\x7f" || key === "\x08") {
+    if ((key === "\x7f" || key === "\x08") && !inGlobalBracketedPaste) {
       if (promptState.cursor > 0) {
         const previous = previousGraphemeIndex(promptState.value, promptState.cursor);
         promptState.value = promptState.value.slice(0, previous) + promptState.value.slice(promptState.cursor);
@@ -356,27 +390,27 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       }
       return true;
     }
-    if (key === "\x01" || key === "\x1b[H" || key === "\x1bOH") {
+    if ((key === "\x01" || key === "\x1b[H" || key === "\x1bOH") && !inGlobalBracketedPaste) {
       promptState.cursor = 0;
       requestImmediateRender();
       return true;
     }
-    if (key === "\x05" || key === "\x1b[F" || key === "\x1bOF") {
+    if ((key === "\x05" || key === "\x1b[F" || key === "\x1bOF") && !inGlobalBracketedPaste) {
       promptState.cursor = promptState.value.length;
       requestImmediateRender();
       return true;
     }
-    if (key === "\x1b[D" || key === "\x1bOD") {
+    if ((key === "\x1b[D" || key === "\x1bOD") && !inGlobalBracketedPaste) {
       if (promptState.cursor > 0) promptState.cursor = previousGraphemeIndex(promptState.value, promptState.cursor);
       requestImmediateRender();
       return true;
     }
-    if (key === "\x1b[C" || key === "\x1bOC") {
+    if ((key === "\x1b[C" || key === "\x1bOC") && !inGlobalBracketedPaste) {
       if (promptState.cursor < promptState.value.length) promptState.cursor = nextGraphemeIndex(promptState.value, promptState.cursor);
       requestImmediateRender();
       return true;
     }
-    if (key === "\t") {
+    if (key === "\t" && !inGlobalBracketedPaste) {
       const matches = COMMANDS.filter(([name]) => promptState.value.startsWith("/") && name.startsWith(promptState.value.slice(1).toLowerCase()));
       if (matches.length === 1) {
         promptState.value = "/" + matches[0][0] + " ";
@@ -386,20 +420,23 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       requestImmediateRender();
       return true;
     }
-    if (key.startsWith("\x1b")) return false;
+    if (key.startsWith("\x1b") && !inGlobalBracketedPaste) return false;
     const codePoint = key.codePointAt(0) ?? 0;
     if (Array.from(key).length === 1 && codePoint >= 32 && codePoint !== 0x7f) {
-      promptState.value = promptState.value.slice(0, promptState.cursor) + key + promptState.value.slice(promptState.cursor);
-      promptState.cursor = nextGraphemeIndex(promptState.value, promptState.cursor);
-      promptState.completions = commandCompletions(promptState.value);
-      requestRender();
+      insertLiveInputText(key);
+      if (inGlobalBracketedPaste || (context?.sequenceCount ?? 1) >= 3) globalPasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+      return true;
+    }
+    if (inGlobalBracketedPaste) {
+      insertLiveInputText(key, true);
+      globalPasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
       return true;
     }
     return false;
   };
 
-  const handleGlobalKey = (key: string) => {
-    if (key === "\x1b") {
+  const handleGlobalKey = (key: string, context?: { index: number; sequenceCount: number; now: number }) => {
+    if (key === "\x1b" && !inGlobalBracketedPaste) {
       if (engineRunning) {
         activeAbortController?.abort();
         engine.interrupt();
@@ -409,8 +446,15 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       return;
     }
     const scrollAction = scrollActionForSequence(key);
-    if (scrollAction) scrollTranscript(scrollAction.direction, scrollAction.amount);
-    else if (engineRunning) editLiveInput(key);
+    if (scrollAction && !inGlobalBracketedPaste) scrollTranscript(scrollAction.direction, scrollAction.amount);
+    else if (engineRunning) editLiveInput(key, context);
+  };
+
+  const handleGlobalKeys = (keys: string[]) => {
+    const now = Date.now();
+    for (let index = 0; index < keys.length; index++) {
+      handleGlobalKey(keys[index]!, { index, sequenceCount: keys.length, now });
+    }
   };
 
     const onGlobalData = (data: Buffer) => {
@@ -424,16 +468,16 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     if (incompleteEscapeStart >= 0) {
       const complete = value.slice(0, incompleteEscapeStart);
       pendingGlobalEscape = value.slice(incompleteEscapeStart);
-      for (const key of splitInputSequences(complete)) handleGlobalKey(key);
+      handleGlobalKeys(splitInputSequences(complete));
       pendingGlobalEscapeTimer = setTimeout(() => {
         const pending = pendingGlobalEscape;
         pendingGlobalEscape = "";
         pendingGlobalEscapeTimer = null;
-        for (const key of splitInputSequences(pending)) handleGlobalKey(key);
+        handleGlobalKeys(splitInputSequences(pending));
       }, 25);
       return;
     }
-    for (const key of splitInputSequences(value)) handleGlobalKey(key);
+    handleGlobalKeys(splitInputSequences(value));
     };
 
     const onResize = () => {
@@ -446,6 +490,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
 
     const startGlobalInput = () => {
       const { stdin } = process;
+      screen.enableBracketedPaste();
       stdin.setRawMode?.(true);
       stdin.resume();
       stdin.on("data", onGlobalData);
@@ -460,6 +505,9 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         pendingGlobalEscapeTimer = null;
       }
       pendingGlobalEscape = "";
+      inGlobalBracketedPaste = false;
+      globalPasteWindowUntil = 0;
+      screen.disableBracketedPaste();
       if (resizeRenderTimer) {
         clearTimeout(resizeRenderTimer);
         resizeRenderTimer = null;
@@ -506,8 +554,8 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       elapsedMs: engineRunning && activeTurnStartedAt ? Date.now() - activeTurnStartedAt : lastTurnDurationMs,
       cost: costTracker.totalCost,
       keyHints: useAlternateScreen
-        ? "esc to interrupt  PgUp/PgDn scroll  Tab complete  Shift+Tab switch mode  Ctrl+C exit"
-        : "esc to interrupt  Tab complete  Shift+Tab switch mode  Ctrl+C exit",
+        ? "esc interrupt  PgUp/PgDn scroll  Tab complete  Shift+Tab mode"
+        : "esc interrupt  Tab complete  Shift+Tab mode",
     });
 
   const rebuildSystemPrompt = () => {
@@ -733,6 +781,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
   };
 
   try {
+    screen.enableBracketedPaste();
     renderScreen();
 
     while (true) {
@@ -870,6 +919,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       }
     }
   } finally {
+    screen.disableBracketedPaste();
     clearThinkingTimer();
     if (pendingRenderTimer) {
       clearTimeout(pendingRenderTimer);

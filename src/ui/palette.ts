@@ -14,10 +14,10 @@ const warning = (s: string) => chalk.hex("#f0ad4e")(s);
 const info = (s: string) => chalk.hex("#5bc0de")(s);
 
 // Content
-const text = (s: string) => chalk.white(s);
-const dim = (s: string) => chalk.hex("#888888")(s);
-const subtle = (s: string) => chalk.hex("#666666")(s);
-const thinking = (s: string) => chalk.hex("#7799bb")(s);
+const text = (s: string) => chalk.whiteBright(s);
+const dim = (s: string) => chalk.hex("#a8a8a8")(s);
+const subtle = (s: string) => chalk.hex("#8a8a8a")(s);
+const thinking = (s: string) => chalk.hex("#9ab5d1")(s);
 
 // Tool-specific
 const toolName = (s: string) => chalk.hex("#f0ad4e").bold(s);

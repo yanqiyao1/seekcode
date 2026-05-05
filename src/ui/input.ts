@@ -16,9 +16,20 @@ export const COMMANDS: [string, string][] = [
 export type InputResult = { type: "line"; value: string } | { type: "interrupt" } | { type: "eof" };
 
 const SHIFT_TAB_SEQUENCES = new Set(["\x1b[Z", "\x1b[1;2Z"]);
+const BRACKETED_PASTE_START = "\x1b[200~";
+const BRACKETED_PASTE_END = "\x1b[201~";
+export const PASTE_BURST_NEWLINE_WINDOW_MS = 80;
 
 export function isShiftTabSequence(sequence: string): boolean {
   return SHIFT_TAB_SEQUENCES.has(sequence);
+}
+
+export function enableBracketedPaste(stdout: Pick<NodeJS.WriteStream, "write"> = process.stdout): void {
+  stdout.write("\x1b[?2004h");
+}
+
+export function disableBracketedPaste(stdout: Pick<NodeJS.WriteStream, "write"> = process.stdout): void {
+  stdout.write("\x1b[?2004l");
 }
 
 function matches(prefix: string): [string, string][] {
@@ -128,6 +139,18 @@ export function trailingIncompleteEscapeStart(chunk: string): number {
   return -1;
 }
 
+export function isBracketedPasteStart(sequence: string): boolean {
+  return sequence === BRACKETED_PASTE_START;
+}
+
+export function isBracketedPasteEnd(sequence: string): boolean {
+  return sequence === BRACKETED_PASTE_END;
+}
+
+export function shouldTreatNewlineAsPaste(_newlineIndex: number, sequenceCount: number, now: number, pasteWindowUntil: number): boolean {
+  return sequenceCount >= 3 || (pasteWindowUntil > 0 && now <= pasteWindowUntil);
+}
+
 export async function readInput(
   prompt: string,
   opts?: ReadInputOptions,
@@ -142,11 +165,14 @@ export async function readInput(
   const wasRaw = stdin.isRaw;
   stdin.setRawMode?.(true);
   stdin.resume();
+  enableBracketedPaste(stdout);
 
   let buf = "", pos = 0, showComps = false;
   let currentPrompt = prompt;
   let pendingEscape = "";
   let pendingEscapeTimer: NodeJS.Timeout | null = null;
+  let inBracketedPaste = false;
+  let pasteWindowUntil = 0;
 
   const formatCompletions = (comps: [string, string][]): string[] => comps.slice(0, 9).map(([name, desc]) => {
     const partial = buf.slice(1).toLowerCase();
@@ -195,50 +221,81 @@ export async function readInput(
       if (cleaned) return;
       cleaned = true;
       if (pendingEscapeTimer) clearTimeout(pendingEscapeTimer);
+      disableBracketedPaste(stdout);
       if (!opts?.onRender && showComps) { stdout.write("\n\x1b[J"); showComps = false; }
       stdin.removeListener("data", onData);
       restoreTTYInput(stdin, wasRaw);
     };
 
-    const finish = (result: InputResult) => {
+    const finish = (result: InputResult): boolean => {
+      if (settled) return false;
       settled = true;
       cleanup();
       resolve(result);
+      return true;
     };
 
-    const handleKey = (s: string) => {
-      if (settled) return;
+    const insertText = (text: string) => {
+      if (!text) return;
+      buf = buf.slice(0, pos) + text + buf.slice(pos);
+      pos += text.length;
+      if (buf.startsWith("/")) redraw(matches(buf));
+      else redraw();
+    };
+
+    const handleKey = (s: string, context?: { index: number; sequenceCount: number; now: number }): boolean => {
+      if (settled) return false;
+
+      const now = context?.now ?? Date.now();
+
+      if (isBracketedPasteStart(s)) {
+        inBracketedPaste = true;
+        pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+        return false;
+      }
+
+      if (isBracketedPasteEnd(s)) {
+        inBracketedPaste = false;
+        pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+        redraw();
+        return false;
+      }
 
       if (isShiftTabSequence(s)) {
+        if (inBracketedPaste) {
+          insertText(s);
+          pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+          return false;
+        }
         const nextPrompt = opts?.onModeCycle?.();
         if (typeof nextPrompt === "string") currentPrompt = nextPrompt;
         redraw();
-        return;
+        return false;
       }
 
       const scrollAction = scrollActionForSequence(s);
-      if (scrollAction) {
+      if (scrollAction && !inBracketedPaste) {
         opts?.onScroll?.(scrollAction.direction, scrollAction.amount);
         redraw();
-        return;
+        return false;
       }
 
       // Escape sequences (arrows)
-      if (s.startsWith("\x1b") && s.length > 1) {
-        if (s === "\x1b[A" || s === "\x1bOA") return; // up — ignore
-        if (s === "\x1b[B" || s === "\x1bOB") return; // down — ignore
-        if (s === "\x1b[D" || s === "\x1bOD") { if (pos > 0) pos = previousGraphemeIndex(buf, pos); redraw(); return; }
-        if (s === "\x1b[C" || s === "\x1bOC") { if (pos < buf.length) pos = nextGraphemeIndex(buf, pos); redraw(); return; }
-        if (s === "\x1b[H" || s === "\x1bOH") { pos = 0; redraw(); return; }
-        if (s === "\x1b[F" || s === "\x1bOF") { pos = buf.length; redraw(); return; }
-        return;
+      if (s.startsWith("\x1b") && s.length > 1 && !inBracketedPaste) {
+        if (s === "\x1b[A" || s === "\x1bOA") return false; // up — ignore
+        if (s === "\x1b[B" || s === "\x1bOB") return false; // down — ignore
+        if (s === "\x1b[D" || s === "\x1bOD") { if (pos > 0) pos = previousGraphemeIndex(buf, pos); redraw(); return false; }
+        if (s === "\x1b[C" || s === "\x1bOC") { if (pos < buf.length) pos = nextGraphemeIndex(buf, pos); redraw(); return false; }
+        if (s === "\x1b[H" || s === "\x1bOH") { pos = 0; redraw(); return false; }
+        if (s === "\x1b[F" || s === "\x1bOF") { pos = buf.length; redraw(); return false; }
+        return false;
       }
 
       // Lone Esc
-      if (s === "\x1b") { opts?.onInterrupt?.(); return; }
+      if (s === "\x1b" && !inBracketedPaste) { opts?.onInterrupt?.(); return false; }
 
       // Tab — complete
-      if (s === "\t") {
+      if (s === "\t" && !inBracketedPaste) {
         const m = matches(buf);
         if (m.length === 1) { buf = "/" + m[0][0] + " "; pos = buf.length; redraw(); }
         else if (m.length > 1) {
@@ -246,43 +303,61 @@ export async function readInput(
           if (pre.length > buf.length) { buf = pre; pos = buf.length; }
           redraw(m);
         }
-        return;
+        return false;
       }
 
       // Enter
       if (s === "\r" || s === "\n") {
+        if (inBracketedPaste || shouldTreatNewlineAsPaste(context?.index ?? 0, context?.sequenceCount ?? 1, now, pasteWindowUntil)) {
+          insertText("\n");
+          pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+          return false;
+        }
         if (!opts?.onRender) stdout.write("\n");
-        finish({ type: "line", value: buf });
-        return;
+        return finish({ type: "line", value: buf });
       }
 
       // Ctrl+D empty → EOF
-      if (s === "\x04" && !buf) { if (!opts?.onRender) stdout.write("\n"); finish({ type: "eof" }); return; }
+      if (s === "\x04" && !buf && !inBracketedPaste) { if (!opts?.onRender) stdout.write("\n"); return finish({ type: "eof" }); }
       // Ctrl+C → EOF
-      if (s === "\x03") { if (!opts?.onRender) stdout.write("\n"); finish({ type: "eof" }); return; }
+      if (s === "\x03" && !inBracketedPaste) { if (!opts?.onRender) stdout.write("\n"); return finish({ type: "eof" }); }
 
       // Backspace
-      if (s === "\x7f" || s === "\x08") {
+      if ((s === "\x7f" || s === "\x08") && !inBracketedPaste) {
         if (pos > 0) {
           const previous = previousGraphemeIndex(buf, pos);
           buf = buf.slice(0, previous) + buf.slice(pos);
           pos = previous;
           redraw();
         }
-        return;
+        return false;
       }
 
       // Home / End
-      if (s === "\x01") { pos = 0; redraw(); return; }
-      if (s === "\x05") { pos = buf.length; redraw(); return; }
+      if (s === "\x01" && !inBracketedPaste) { pos = 0; redraw(); return false; }
+      if (s === "\x05" && !inBracketedPaste) { pos = buf.length; redraw(); return false; }
 
       // Printable
       const codePoint = s.codePointAt(0) ?? 0;
       if (Array.from(s).length === 1 && codePoint >= 32 && codePoint !== 0x7f) {
-        buf = buf.slice(0, pos) + s + buf.slice(pos); pos = nextGraphemeIndex(buf, pos);
-        if (buf.startsWith("/")) redraw(matches(buf));
-        else redraw();
-        return;
+        insertText(s);
+        if (inBracketedPaste || (context?.sequenceCount ?? 1) >= 3) {
+          pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+        }
+        return false;
+      }
+
+      if (inBracketedPaste) {
+        insertText(s);
+        pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+      }
+      return false;
+    };
+
+    const handleKeys = (keys: string[]) => {
+      const now = Date.now();
+      for (let index = 0; index < keys.length; index++) {
+        if (handleKey(keys[index]!, { index, sequenceCount: keys.length, now })) break;
       }
     };
 
@@ -297,16 +372,16 @@ export async function readInput(
       if (incompleteEscapeStart >= 0) {
         const complete = s.slice(0, incompleteEscapeStart);
         pendingEscape = s.slice(incompleteEscapeStart);
-        for (const key of splitInputSequences(complete)) handleKey(key);
+        handleKeys(splitInputSequences(complete));
         pendingEscapeTimer = setTimeout(() => {
           const pending = pendingEscape;
           pendingEscape = "";
           pendingEscapeTimer = null;
-          for (const key of splitInputSequences(pending)) handleKey(key);
+          handleKeys(splitInputSequences(pending));
         }, 25);
         return;
       }
-      for (const key of splitInputSequences(s)) handleKey(key);
+      handleKeys(splitInputSequences(s));
     };
 
     stdin.on("data", onData);

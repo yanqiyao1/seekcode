@@ -14,6 +14,7 @@ export interface TuiCallbacks {
 
 export async function runTui(callbacks: TuiCallbacks): Promise<void> {
   screen.setup();
+  screen.enableBracketedPaste();
   const transcript = new Transcript();
   let running = true;
 
@@ -44,39 +45,42 @@ export async function runTui(callbacks: TuiCallbacks): Promise<void> {
     process.stdout.write(`\x1b[2K${callbacks.getPrompt()}`);
   };
 
-  // Initial render
-  render();
-
-  // Input loop
-  while (running) {
-    const result = await readInput(callbacks.getPrompt(), {
-      onInterrupt: () => {
-        callbacks.onInterrupt();
-        render();
-      },
-    });
-
-    if (result.type === "eof") {
-      running = false;
-      break;
-    }
-    if (result.type !== "line" || !result.value.trim()) {
-      render();
-      continue;
-    }
-
-    const input = result.value.trim();
-
-    // Add user message to transcript
-    transcript.append(`\n${p.text(">")} ${input}`);
-
-    // Call submit
-    await callbacks.onSubmit(input);
-    transcript.scrollToBottom();
+  try {
+    // Initial render
     render();
-  }
 
-  screen.teardown();
+    // Input loop
+    while (running) {
+      const result = await readInput(callbacks.getPrompt(), {
+        onInterrupt: () => {
+          callbacks.onInterrupt();
+          render();
+        },
+      });
+
+      if (result.type === "eof") {
+        running = false;
+        break;
+      }
+      if (result.type !== "line" || !result.value.trim()) {
+        render();
+        continue;
+      }
+
+      const input = result.value.trim();
+
+      // Add user message to transcript
+      transcript.append(`\n${p.text(">")} ${input}`);
+
+      // Call submit
+      await callbacks.onSubmit(input);
+      transcript.scrollToBottom();
+      render();
+    }
+  } finally {
+    screen.disableBracketedPaste();
+    screen.teardown();
+  }
 }
 
 // Export for external use

@@ -2,7 +2,21 @@ import { describe, expect, it } from "vitest";
 
 import { nextModeName } from "../src/modes/base.js";
 import { fitAnsi, stripAnsi, truncateAnsi, visibleLength, wrapAnsi } from "../src/ui/ansi.js";
-import { COMMANDS, isShiftTabSequence, nextGraphemeIndex, previousGraphemeIndex, restoreTTYInput, scrollActionForSequence, splitInputSequences, trailingIncompleteEscapeStart } from "../src/ui/input.js";
+import {
+  COMMANDS,
+  disableBracketedPaste,
+  enableBracketedPaste,
+  isBracketedPasteEnd,
+  isBracketedPasteStart,
+  isShiftTabSequence,
+  nextGraphemeIndex,
+  previousGraphemeIndex,
+  restoreTTYInput,
+  scrollActionForSequence,
+  shouldTreatNewlineAsPaste,
+  splitInputSequences,
+  trailingIncompleteEscapeStart,
+} from "../src/ui/input.js";
 import { renderMarkdown } from "../src/ui/markdown.js";
 import { movePickerIndex, pickerActionForSequence, pickerWindow } from "../src/ui/picker.js";
 import { footerDivider, statusBar, statusBarFromItems, thinkingHeader, thinkingStatusLine, thinkingText, toolDiffPreview, welcomeBanner } from "../src/ui/renderer.js";
@@ -245,6 +259,25 @@ describe("Renderer", () => {
     }
   });
 
+  it("hides the tools status item when no tools are active", () => {
+    const originalColumns = process.stdout.columns;
+    process.stdout.columns = 100;
+    try {
+      const rendered = stripAnsi(statusBarFromItems(["mode", "tools", "hints"], {
+        mode: "agent",
+        model: "deepseek-v4-pro",
+        activeTools: 0,
+        keyHints: "Tab complete",
+      }));
+
+      expect(rendered).toContain("AGENT");
+      expect(rendered).not.toContain("tools 0");
+      expect(rendered).toContain("Tab complete");
+    } finally {
+      process.stdout.columns = originalColumns;
+    }
+  });
+
   it("keeps the default footer focused without context budget or elapsed time", () => {
     const originalColumns = process.stdout.columns;
     process.stdout.columns = 120;
@@ -265,6 +298,7 @@ describe("Renderer", () => {
       expect(rendered).toContain("Shift+Tab switch mode");
       expect(rendered).not.toContain("ctx ");
       expect(rendered).not.toContain("elapsed ");
+      expect(rendered).not.toContain("tools ");
     } finally {
       process.stdout.columns = originalColumns;
     }
@@ -362,6 +396,15 @@ describe("Renderer", () => {
     }
   });
 
+  it("lightly renders markdown inside thinking text", () => {
+    const rendered = stripAnsi(thinkingText(["- **Plan** with `code`", "> quote"].join("\n")));
+
+    expect(rendered).toContain("  • Plan with code");
+    expect(rendered).toContain("  │ quote");
+    expect(rendered).not.toContain("**");
+    expect(rendered).not.toContain("`");
+  });
+
   it("keeps footer divider valid on very narrow terminals", () => {
     const originalColumns = process.stdout.columns;
     process.stdout.columns = 5;
@@ -420,6 +463,31 @@ describe("Input shortcuts", () => {
     expect(splitInputSequences("a\x1b[<64;10;5Mb")).toEqual(["a", "\x1b[<64;10;5M", "b"]);
     expect(splitInputSequences("\x1b[5~hello")).toEqual(["\x1b[5~", "h", "e", "l", "l", "o"]);
     expect(splitInputSequences("qwq")).toEqual(["q", "w", "q"]);
+  });
+
+  it("recognizes bracketed paste delimiters", () => {
+    const keys = splitInputSequences("\x1b[200~hello\nworld\x1b[201~");
+
+    expect(isBracketedPasteStart(keys[0]!)).toBe(true);
+    expect(isBracketedPasteEnd(keys.at(-1)!)).toBe(true);
+    expect(keys).toContain("\n");
+  });
+
+  it("treats newlines in paste-like bursts as input text", () => {
+    expect(shouldTreatNewlineAsPaste(5, 12, 1000, 0)).toBe(true);
+    expect(shouldTreatNewlineAsPaste(0, 1, 1000, 1001)).toBe(true);
+    expect(shouldTreatNewlineAsPaste(1, 2, 1000, 0)).toBe(false);
+    expect(shouldTreatNewlineAsPaste(0, 1, 1000, 999)).toBe(false);
+  });
+
+  it("emits terminal bracketed paste mode sequences", () => {
+    const chunks: string[] = [];
+    const out = { write(chunk: string) { chunks.push(chunk); return true; } };
+
+    enableBracketedPaste(out as any);
+    disableBracketedPaste(out as any);
+
+    expect(chunks).toEqual(["\x1b[?2004h", "\x1b[?2004l"]);
   });
 
   it("includes session deletion in command completion data", () => {
@@ -529,6 +597,14 @@ describe("TuiLayout", () => {
     expect(cursor.row).toBeLessThanOrEqual(inputAreaBottomRow);
     expect(cursor.col).toBeGreaterThanOrEqual(1);
     expect(cursor.col).toBeLessThanOrEqual(10);
+  });
+
+  it("places cursor on the last visible row for multiline input", () => {
+    const layout = new TuiLayout(new Transcript());
+    const cursor = layout.cursorPosition("● ", "alpha\nbeta", "alpha\nbeta".length, 20, 5);
+
+    expect(cursor.row).toBe(5);
+    expect(cursor.col).toBe(7);
   });
 
   it("honors explicit completion limits for pickers", () => {

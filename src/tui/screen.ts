@@ -31,6 +31,14 @@ export function disableMouse(): void {
   process.stdout.write(`${CSI}?1006l${CSI}?1000l`);
 }
 
+export function enableBracketedPaste(): void {
+  process.stdout.write(`${CSI}?2004h`);
+}
+
+export function disableBracketedPaste(): void {
+  process.stdout.write(`${CSI}?2004l`);
+}
+
 export function moveTo(row: number, col: number): void {
   process.stdout.write(`${CSI}${row};${col}H`);
 }

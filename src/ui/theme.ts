@@ -11,8 +11,8 @@ export const theme = {
   assistant: chalk.hex("#00afff"),
   system: chalk.gray,
   tool: chalk.hex("#8fbc8f"),           // dark sea green
-  thinking: chalk.hex("#b0c4de"),       // light steel blue
-  thinkingDim: chalk.hex("#b0c4de").dim,
+  thinking: chalk.hex("#9ab5d1"),       // readable steel blue
+  thinkingDim: chalk.hex("#9ab5d1"),
 
   modePlan: chalk.cyan,
   modeAgent: chalk.green,
@@ -25,8 +25,8 @@ export const theme = {
   warning: chalk.hex("#ffd700"),        // gold
   success: chalk.hex("#76ee00"),
   info: chalk.hex("#00afff"),
-  dim: chalk.gray,
-  muted: chalk.dim,
+  dim: chalk.hex("#a8a8a8"),
+  muted: chalk.hex("#8a8a8a"),
 
   prompt: chalk.whiteBright.bold,
   banner: chalk.hex("#00afff").bold,

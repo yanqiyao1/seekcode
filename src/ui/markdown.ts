@@ -3,8 +3,39 @@
 import { p, box } from "./palette.js";
 
 type InlineSegment = { text: string; bold: boolean; code: boolean };
+type MarkdownStyle = {
+  text: (text: string) => string;
+  bold: (text: string) => string;
+  code: (text: string) => string;
+  heading: (text: string) => string;
+  marker: (text: string) => string;
+  fence: (text: string) => string;
+};
 
-export function renderMarkdown(markdown: string): string {
+export interface MarkdownRenderOptions {
+  style?: Partial<MarkdownStyle>;
+}
+
+const defaultStyle: MarkdownStyle = {
+  text: p.text,
+  bold: p.blueBold,
+  code: p.warning,
+  heading: p.blueBold,
+  marker: p.blue,
+  fence: p.dim,
+};
+
+export const thinkingMarkdownStyle: MarkdownStyle = {
+  text: p.thinking,
+  bold: p.info,
+  code: p.warning,
+  heading: p.info,
+  marker: p.info,
+  fence: p.thinking,
+};
+
+export function renderMarkdown(markdown: string, options: MarkdownRenderOptions = {}): string {
+  const style = { ...defaultStyle, ...options.style };
   const lines = markdown.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
   const rendered: string[] = [];
   let inFence = false;
@@ -15,52 +46,52 @@ export function renderMarkdown(markdown: string): string {
     if (fence) {
       inFence = !inFence;
       fenceLang = inFence ? fence[1] || "" : "";
-      rendered.push(p.dim(`  ${box.v}${fenceLang ? ` ${fenceLang}` : ""}`));
+      rendered.push(style.fence(`  ${box.v}${fenceLang ? ` ${fenceLang}` : ""}`));
       continue;
     }
 
     if (inFence) {
-      rendered.push(`${p.dim(`  ${box.v} `)}${p.text(rawLine)}`);
+      rendered.push(`${style.fence(`  ${box.v} `)}${style.text(rawLine)}`);
       continue;
     }
 
-    rendered.push(renderMarkdownLine(rawLine));
+    rendered.push(renderMarkdownLine(rawLine, style));
   }
 
   return rendered.join("\n");
 }
 
-function renderMarkdownLine(line: string): string {
+function renderMarkdownLine(line: string, style: MarkdownStyle): string {
   if (!line.trim()) return "";
 
   const heading = line.match(/^(#{1,6})\s+(.+)$/);
   if (heading) {
-    return p.blueBold(heading[2].trim());
+    return style.heading(heading[2].trim());
   }
 
   const quote = line.match(/^>\s?(.*)$/);
   if (quote) {
-    return p.dim(`${box.v} ${renderInline(quote[1])}`);
+    return `${style.fence(box.v)} ${renderInline(quote[1], style)}`;
   }
 
   const unordered = line.match(/^(\s*)[-*+]\s+(.+)$/);
   if (unordered) {
-    return `${unordered[1]}${p.blue("•")} ${renderInline(unordered[2])}`;
+    return `${unordered[1]}${style.marker("•")} ${renderInline(unordered[2], style)}`;
   }
 
   const ordered = line.match(/^(\s*)\d+[.)]\s+(.+)$/);
   if (ordered) {
-    return `${ordered[1]}${p.blue("•")} ${renderInline(ordered[2])}`;
+    return `${ordered[1]}${style.marker("•")} ${renderInline(ordered[2], style)}`;
   }
 
-  return renderInline(line);
+  return renderInline(line, style);
 }
 
-function renderInline(text: string): string {
+function renderInline(text: string, style: MarkdownStyle): string {
   return parseInline(text).map(segment => {
-    if (segment.code) return p.warning(segment.text);
-    if (segment.bold) return p.blueBold(segment.text);
-    return p.text(segment.text);
+    if (segment.code) return style.code(segment.text);
+    if (segment.bold) return style.bold(segment.text);
+    return style.text(segment.text);
   }).join("");
 }
 

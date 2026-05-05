@@ -9,6 +9,7 @@
 
 import { p, box } from "./palette.js";
 import { fitAnsi, stripAnsi, truncateAnsi, visibleLength, wrapAnsi } from "./ansi.js";
+import { renderMarkdown, thinkingMarkdownStyle } from "./markdown.js";
 
 const w = () => process.stdout.columns || 80;
 
@@ -63,13 +64,9 @@ export function thinkingHeader(elapsedMs?: number, interruptHint = false): strin
 export function thinkingText(text: string): string {
   const prefix = "  ";
   const contentWidth = Math.max(1, w() - visibleLength(prefix));
-  const lines = text
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .trimEnd()
-    .split("\n")
-    .flatMap(line => wrapAnsi(line, contentWidth));
-  return lines.map(line => p.thinking(prefix + line)).join("\n");
+  const rendered = renderMarkdown(text.trimEnd(), { style: thinkingMarkdownStyle });
+  const lines = rendered.split("\n").flatMap(line => wrapAnsi(line, contentWidth));
+  return lines.map(line => prefix + line).join("\n");
 }
 
 // ── Tool Calls ───────────────────────────────────────────────
@@ -166,7 +163,7 @@ export type StatusItemName =
 
 export function statusBarFromItems(items: string[], state: StatusBarState): string {
   const width = w();
-  const normalized = items.length ? items : ["mode", "model", "workspace", "cache", "tools", "cost", "hints"];
+  const normalized = items.length ? items : ["mode", "model", "workspace", "cache", "cost", "hints"];
   const leftParts: string[] = [];
   let right = "";
   for (const item of normalized) {
@@ -209,7 +206,7 @@ function renderStatusItem(item: StatusItemName, state: StatusBarState): string {
     case "cache":
       return state.cacheTokens ? p.dim(`cache ${compactNumber(state.cacheTokens)}`) : "";
     case "tools":
-      return state.activeTools !== undefined ? p.dim(`tools ${state.activeTools}`) : "";
+      return state.activeTools && state.activeTools > 0 ? p.dim(`tools ${state.activeTools}`) : "";
     case "elapsed":
       return state.elapsedMs ? p.dim(`elapsed ${formatElapsed(state.elapsedMs)}`) : "";
     case "cost":
