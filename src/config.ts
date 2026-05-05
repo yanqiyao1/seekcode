@@ -6,6 +6,7 @@ import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { z } from "zod";
 import { DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS, defaultBaseUrlForProvider, parseProvider, providerCapability } from "./client/capabilities.js";
 import { DEFAULT_SKILL_INSTALL_SIZE_BYTES, DEFAULT_SKILLS_REGISTRY_URL, defaultSkillsDir } from "./engine/skills.js";
+import { LEGACY_DEEPSEEK_DIR, SEEKCODE_DIR, homeDir } from "./paths.js";
 
 const MCPConfigSchema = z.object({
   name: z.string(),
@@ -147,15 +148,26 @@ function readTomlFile(path: string): { data: Record<string, unknown>; exists: bo
 }
 
 export function userConfigPath(): string {
-  return resolve(process.env.HOME || "~", ".config", "deepseek", "config.toml");
+  return resolve(homeDir(), SEEKCODE_DIR, "config.toml");
+}
+
+export function legacyUserConfigPath(): string {
+  return resolve(homeDir(), ".config", "deepseek", "config.toml");
 }
 
 export function projectConfigPath(): string {
-  return resolve(process.cwd(), ".deepseek", "config.toml");
+  return resolve(process.cwd(), SEEKCODE_DIR, "config.toml");
+}
+
+export function legacyProjectConfigPath(): string {
+  return resolve(process.cwd(), LEGACY_DEEPSEEK_DIR, "config.toml");
 }
 
 export function loadUserConfigRaw(): Record<string, unknown> {
-  return loadTomlFile(userConfigPath());
+  const merged: Record<string, unknown> = {};
+  mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(legacyUserConfigPath())).config);
+  mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(userConfigPath())).config);
+  return merged;
 }
 
 export function writeUserConfigRaw(config: Record<string, unknown>): void {
@@ -298,11 +310,17 @@ function getNested(target: Record<string, unknown>, key: string): unknown {
 }
 
 export function loadConfig(cliOverrides: Record<string, unknown> = {}): Config {
-  // Layered loading: defaults < user config < project config < env < CLI
+  // Layered loading: defaults < legacy user < user < legacy project < project < env < CLI
   const merged: Record<string, unknown> = {};
+
+  // Legacy user config
+  mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(legacyUserConfigPath())).config);
 
   // User config
   mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(userConfigPath())).config);
+
+  // Legacy project-local config
+  mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(legacyProjectConfigPath())).config);
 
   // Project-local config
   mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(projectConfigPath())).config);
@@ -367,23 +385,36 @@ export function validateConfig(cliOverrides: Record<string, unknown> = {}): Conf
 }
 
 export function migrateUserConfig(options: { dryRun?: boolean } = {}): ConfigMigrationReport {
+  if (!existsSync(userConfigPath()) && existsSync(legacyUserConfigPath())) {
+    return migrateConfigFileFrom(legacyUserConfigPath(), userConfigPath(), options);
+  }
   return migrateConfigFile(userConfigPath(), options);
 }
 
 export function migrateProjectConfig(options: { dryRun?: boolean } = {}): ConfigMigrationReport {
+  if (!existsSync(projectConfigPath()) && existsSync(legacyProjectConfigPath())) {
+    return migrateConfigFileFrom(legacyProjectConfigPath(), projectConfigPath(), options);
+  }
   return migrateConfigFile(projectConfigPath(), options);
 }
 
 export function migrateConfigFile(path: string, options: { dryRun?: boolean } = {}): ConfigMigrationReport {
-  const loaded = readTomlFile(path);
-  if (!loaded.exists && !loaded.error) return { changed: false, path, actions: [], warnings: [`Config file does not exist: ${path}`] };
-  if (loaded.error) return { changed: false, path, actions: [], warnings: [loaded.error] };
+  return migrateConfigFileFrom(path, path, options);
+}
+
+function migrateConfigFileFrom(sourcePath: string, outputPath: string, options: { dryRun?: boolean } = {}): ConfigMigrationReport {
+  const loaded = readTomlFile(sourcePath);
+  if (!loaded.exists && !loaded.error) return { changed: false, path: outputPath, actions: [], warnings: [`Config file does not exist: ${outputPath}`] };
+  if (loaded.error) return { changed: false, path: outputPath, actions: [], warnings: [loaded.error] };
   const migrated = migrateConfigObject(loaded.data);
-  if (migrated.changed && !options.dryRun) {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, stringifyToml(migrated.config as any), "utf-8");
+  const copiedFromLegacy = sourcePath !== outputPath;
+  const actions = copiedFromLegacy ? [`copied legacy config ${sourcePath} → ${outputPath}`, ...migrated.actions] : migrated.actions;
+  const changed = copiedFromLegacy || migrated.changed;
+  if (changed && !options.dryRun) {
+    mkdirSync(dirname(outputPath), { recursive: true });
+    writeFileSync(outputPath, stringifyToml(migrated.config as any), "utf-8");
   }
-  return { changed: migrated.changed, path, actions: migrated.actions, warnings: migrated.warnings };
+  return { changed, path: outputPath, actions, warnings: migrated.warnings };
 }
 
 export function explainConfig(cliOverrides: Record<string, unknown> = {}): ConfigExplainReport {
@@ -414,10 +445,14 @@ export function explainConfig(cliOverrides: Record<string, unknown> = {}): Confi
 }
 
 function configSources(cliOverrides: Record<string, unknown>): Array<{ source: string; path?: string; exists?: boolean; values: Record<string, unknown>; error?: string }> {
+  const legacyUser = readTomlFile(legacyUserConfigPath());
   const user = readTomlFile(userConfigPath());
+  const legacyProject = readTomlFile(legacyProjectConfigPath());
   const project = readTomlFile(projectConfigPath());
   return [
+    { source: "legacy_user", path: legacyUserConfigPath(), exists: legacyUser.exists, values: legacyUser.data, error: legacyUser.error },
     { source: "user", path: userConfigPath(), exists: user.exists, values: user.data, error: user.error },
+    { source: "legacy_project", path: legacyProjectConfigPath(), exists: legacyProject.exists, values: legacyProject.data, error: legacyProject.error },
     { source: "project", path: projectConfigPath(), exists: project.exists, values: project.data, error: project.error },
     { source: "env", values: loadEnv() },
     { source: "cli", values: normalizeCliOverrides(cliOverrides) },

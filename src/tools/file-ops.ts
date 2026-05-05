@@ -139,7 +139,7 @@ async function search(args: Record<string, unknown>): Promise<string> {
     const root = resolveExistingPathInsideRoot(path, boundary);
     const grepArgs = ["-rnF"];
     if (!caseSensitive) grepArgs.push("-i");
-    grepArgs.push("--directories=recurse", "--exclude-dir=node_modules", "--exclude-dir=.git", "--exclude-dir=.deepseek");
+    grepArgs.push("--directories=recurse", "--exclude-dir=node_modules", "--exclude-dir=.git", "--exclude-dir=.seekcode", "--exclude-dir=.deepseek");
     if (include) grepArgs.push(`--include=${include}`);
     grepArgs.push(pattern, root);
     const result = spawnSync("grep", grepArgs, { encoding: "utf-8", timeout: 10000, maxBuffer: 10 * 1024 * 1024 });

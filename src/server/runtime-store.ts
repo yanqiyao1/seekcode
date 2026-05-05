@@ -7,6 +7,7 @@ import { ConversationHistory } from "../session/history.js";
 import type { Config } from "../config.js";
 import type { Engine } from "../engine/loop.js";
 import { linkArtifact } from "../artifacts/store.js";
+import { seekcodeDataPath } from "../paths.js";
 
 export type TurnStatus = "queued" | "in_progress" | "completed" | "failed" | "interrupted" | "canceled";
 
@@ -76,10 +77,10 @@ let seq = 0;
 let loaded = false;
 
 function dataRoot(): string {
+  if (process.env.SEEKCODE_RUNTIME_DIR) return resolve(process.env.SEEKCODE_RUNTIME_DIR);
   if (process.env.DEEPCODE_RUNTIME_DIR) return resolve(process.env.DEEPCODE_RUNTIME_DIR);
   if (process.env.DEEPSEEK_RUNTIME_DIR) return resolve(process.env.DEEPSEEK_RUNTIME_DIR);
-  const xdg = process.env.XDG_DATA_HOME || resolve(process.env.HOME || "~", ".local", "share");
-  return join(xdg, "deepseek", "runtime");
+  return seekcodeDataPath("runtime");
 }
 
 function threadDir(): string {

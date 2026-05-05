@@ -11,6 +11,7 @@ import { clearJobManagerForTests, getJobManager, reloadJobManagerForTests } from
 import { getRegistry } from "../src/tools/registry.js";
 import { registerShellTool } from "../src/tools/shell.js";
 import { registerTaskTools } from "../src/tools/tasks.js";
+import { clearPlanState, registerPlanTools } from "../src/tools/plan.js";
 
 let tmp: string;
 let oldTasksDir: string | undefined;
@@ -25,11 +26,13 @@ beforeEach(() => {
   clearJobManagerForTests();
   getRegistry().clear();
   clearPersistentTaskStateForTests();
+  clearPlanState();
   clearHooks();
 });
 
 afterEach(() => {
   clearHooks();
+  clearPlanState();
   getRegistry().clear();
   clearJobManagerForTests();
   if (oldTasksDir === undefined) delete process.env.DEEPCODE_TASKS_DIR;
@@ -209,6 +212,25 @@ describe("task tools", () => {
     expect(read).toContain("Investigate bug");
     expect(completed).toContain("Completed");
     expect(reloaded?.status).toBe("completed");
+  });
+
+  it("includes checklist_write state in task_list output", async () => {
+    registerPlanTools();
+    registerTaskTools();
+
+    await getRegistry().lookup("checklist_write")!.execute({
+      items: [
+        { content: "Draft experiment plan", status: "in_progress" },
+        { content: "Define core method", status: "pending" },
+      ],
+    });
+    const listed = JSON.parse(await getRegistry().lookup("task_list")!.execute({}));
+
+    expect(listed.checklist).toMatchObject([
+      { id: 1, content: "Draft experiment plan", status: "in_progress" },
+      { id: 2, content: "Define core method", status: "pending" },
+    ]);
+    expect(listed.stats.total).toBe(0);
   });
 
   it("executes queued shell tasks and keeps completed artifacts", async () => {

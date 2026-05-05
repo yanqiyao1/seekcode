@@ -71,8 +71,8 @@ describe("session store", () => {
     mkdirSync(workspace);
     process.chdir(workspace);
 
-    const primary = join(tmp, "deepseek", "sessions");
-    const fallback = join(workspace, ".deepseek", "sessions");
+    const primary = join(tmp, "seekcode", "sessions");
+    const fallback = join(workspace, ".seekcode", "sessions");
     mkdirSync(primary, { recursive: true });
     mkdirSync(fallback, { recursive: true });
     writeFileSync(join(primary, "dup.json"), JSON.stringify(createSession({
@@ -92,11 +92,35 @@ describe("session store", () => {
     expect(listSessions().find(session => session.id === "dup")?.workspace_path).toBe("/tmp/new");
   });
 
+  it("loads legacy deepseek session directories as compatibility fallbacks", () => {
+    const workspace = join(tmp, "workspace");
+    mkdirSync(workspace);
+    process.chdir(workspace);
+
+    const legacyPrimary = join(tmp, "deepseek", "sessions");
+    const legacyFallback = join(workspace, ".deepseek", "sessions");
+    mkdirSync(legacyPrimary, { recursive: true });
+    mkdirSync(legacyFallback, { recursive: true });
+    writeFileSync(join(legacyPrimary, "legacy-primary.json"), JSON.stringify(createSession({
+      id: "legacy-primary",
+      title: "Legacy primary",
+      workspace_path: "/tmp/legacy-primary",
+    })));
+    writeFileSync(join(legacyFallback, "legacy-fallback.json"), JSON.stringify(createSession({
+      id: "legacy-fallback",
+      title: "Legacy fallback",
+      workspace_path: "/tmp/legacy-fallback",
+    })));
+
+    expect(loadSession("legacy-primary")?.workspace_path).toBe("/tmp/legacy-primary");
+    expect(loadSession("legacy-fallback")?.workspace_path).toBe("/tmp/legacy-fallback");
+  });
+
   it("falls back to project-local storage when the primary dir cannot be written", () => {
     const workspace = join(tmp, "workspace");
     mkdirSync(workspace);
     process.chdir(workspace);
-    writeFileSync(join(tmp, "deepseek"), "not a directory");
+    writeFileSync(join(tmp, "seekcode"), "not a directory");
 
     const session = createSession({ id: "fallback" });
     session.messages.push({ role: "user", content: "Save somewhere writable" });
@@ -131,7 +155,7 @@ describe("session store", () => {
       title: "Invalid",
       updated_at: "not-a-date",
     });
-    const sessionsDir = join(tmp, "deepseek", "sessions");
+    const sessionsDir = join(tmp, "seekcode", "sessions");
     mkdirSync(sessionsDir, { recursive: true });
 
     writeFileSync(join(sessionsDir, "old.json"), JSON.stringify(oldSession));
@@ -200,7 +224,7 @@ describe("session store", () => {
   });
 
   it("normalizes legacy OpenAI-shaped tool calls during load", () => {
-    const sessionsDir = join(tmp, "deepseek", "sessions");
+    const sessionsDir = join(tmp, "seekcode", "sessions");
     mkdirSync(sessionsDir, { recursive: true });
     writeFileSync(join(sessionsDir, "legacy-tools.json"), JSON.stringify({
       ...createSession({ id: "legacy-tools" }),

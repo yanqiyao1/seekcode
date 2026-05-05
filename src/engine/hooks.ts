@@ -3,7 +3,7 @@
  * Adopted from OpenAI Codex: script-based hooks that fire at lifecycle events.
  * Hooks are shell commands that receive JSON on stdin and can approve/deny/modify.
  *
- * Config format (~/.config/deepseek/hooks.toml or .deepseek/hooks.toml):
+ * Config format (~/.seekcode/hooks.toml or .seekcode/hooks.toml):
  *   [[hooks]]
  *   event = "PreToolUse"
  *   command = "node ~/hooks/audit-tool.js"

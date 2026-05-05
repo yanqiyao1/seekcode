@@ -2,6 +2,7 @@
 
 import { getTaskManager, type TaskType } from "../engine/task-lifecycle.js";
 import { PermissionLevel } from "./base.js";
+import { getTodoState } from "./plan.js";
 import { getRegistry } from "./registry.js";
 
 function parseType(value: unknown): TaskType {
@@ -35,8 +36,10 @@ async function taskList(): Promise<string> {
   const manager = getTaskManager();
   const active = manager.getActiveTasks();
   const history = manager.getHistory();
-  if (!active.length && !history.length) return "No tasks.";
+  const checklist = getTodoState();
+  if (!active.length && !history.length && !checklist.length) return "No tasks.";
   return JSON.stringify({
+    checklist,
     active,
     history: history.slice(-20),
     stats: manager.getTaskStats(),

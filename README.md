@@ -346,10 +346,20 @@ Seek Code uses layered configuration. Later sources override earlier sources.
 | Priority | Source | Location |
 |---|---|---|
 | 1 | Built-in defaults | Code defaults |
-| 2 | User config | `~/.config/deepseek/config.toml` |
-| 3 | Project config | `.deepseek/config.toml` |
+| 2 | User config | `~/.seekcode/config.toml` |
+| 3 | Project config | `.seekcode/config.toml` |
 | 4 | Environment variables | `DEEPSEEK_*` |
 | 5 | CLI flags | `--model`, `--mode`, `--api-key`, etc. |
+
+Current path behavior:
+
+- The user config path is hard-coded from `HOME` as `~/.seekcode/config.toml`.
+- The project config path is `.seekcode/config.toml` under the current working directory.
+- `XDG_CONFIG_HOME` is not used for config files.
+- Legacy config files are still read from `~/.config/deepseek/config.toml` and `.deepseek/config.toml`; values in the new `.seekcode` locations take precedence.
+- Loading config, `seek config validate`, and `seek config explain` do not create a missing config file.
+- `seek config migrate --target user|project` migrates an existing `.seekcode` file. If only the legacy DeepSeek file exists, it writes the migrated result to the new `.seekcode` path. If neither file exists, it reports a warning.
+- Persistent MCP changes, such as `/mcp add`, write to the user config file and create its parent directory if needed.
 
 ### Minimal Setup
 
@@ -374,7 +384,7 @@ export DEEPSEEK_TUI_ALTERNATE_SCREEN="never"
 ### TOML Example
 
 ```toml
-# ~/.config/deepseek/config.toml
+# ~/.seekcode/config.toml
 
 api_key = "sk-your-api-key"
 provider = "deepseek"
@@ -435,12 +445,13 @@ max_bytes = 1000000
 
 ### Config Commands
 
-```bash
-seek config validate
-seek config explain
-seek config migrate --target user --dry-run
-seek config migrate --target project
-```
+| Command | Behavior |
+|---|---|
+| `seek config validate` | Reads configured sources and reports schema/semantic issues. Does not create files. |
+| `seek config explain` | Shows sources, precedence, conflicts, and resolved values. Does not create files. |
+| `seek config migrate --target user --dry-run` | Reports legacy-key migrations for the user config without writing. |
+| `seek config migrate --target user` | Rewrites the existing user config, or copies/migrates legacy `~/.config/deepseek/config.toml` to `~/.seekcode/config.toml`. |
+| `seek config migrate --target project` | Rewrites the existing project config, or copies/migrates legacy `.deepseek/config.toml` to `.seekcode/config.toml`. |
 
 Interactive equivalents:
 
@@ -450,6 +461,27 @@ Interactive equivalents:
 /config migrate user --dry-run
 /config migrate project
 ```
+
+### Persistent Data Locations
+
+Most runtime data files use `${XDG_DATA_HOME:-~/.local/share}/seekcode/...` unless an override is listed. Config, skills, and workspace-local state have separate locations.
+
+| Data | Default location | Override |
+|---|---|---|
+| User config | `~/.seekcode/config.toml` | None |
+| Project config | `<workspace>/.seekcode/config.toml` | None |
+| CLI sessions | `${XDG_DATA_HOME:-~/.local/share}/seekcode/sessions` | `SEEKCODE_SESSIONS_DIR`, `DEEPSEEK_SESSIONS_DIR` |
+| Session fallback | `<workspace>/.seekcode/sessions` | None |
+| Server runtime threads/events/items | `${XDG_DATA_HOME:-~/.local/share}/seekcode/runtime` | `SEEKCODE_RUNTIME_DIR`, `DEEPCODE_RUNTIME_DIR`, `DEEPSEEK_RUNTIME_DIR` |
+| Durable tasks | `${XDG_DATA_HOME:-~/.local/share}/seekcode/tasks/tasks.json` | `SEEKCODE_TASKS_DIR`, `DEEPCODE_TASKS_DIR`, `DEEPSEEK_TASKS_DIR` |
+| Background jobs | `${XDG_DATA_HOME:-~/.local/share}/seekcode/jobs` | `SEEKCODE_JOBS_DIR`, `DEEPCODE_JOBS_DIR`, `DEEPSEEK_JOBS_DIR` |
+| Artifacts | `${XDG_DATA_HOME:-~/.local/share}/seekcode/artifacts` | `SEEKCODE_ARTIFACTS_DIR`, `DEEPCODE_ARTIFACTS_DIR`, `DEEPSEEK_ARTIFACTS_DIR` |
+| Default installed skills | `~/.seekcode/skills` | `DEEPSEEK_SKILLS_DIR` or `skills_dir` |
+| Workspace skill roots | `<workspace>/.agents/skills`, `<workspace>/skills`, `<workspace>/.seekcode/skills` | None |
+| Compatibility skill roots | `<workspace>/.deepseek/skills`, `~/.deepseek/skills`, `~/.agents/skills`, `~/.claude/skills` | None |
+| Rollback snapshots | `<workspace>/.seekcode/side-git` | None |
+
+Session save tries the primary session directory first, then the workspace fallback. Session load, list, and delete inspect both locations plus legacy `deepseek/sessions` and `.deepseek/sessions` directories. Permission "always allow" and "always deny" choices are session memory only; they are not written to these directories.
 
 ---
 
@@ -519,7 +551,7 @@ mcp_<server_name>_<tool_name>
 ### Example
 
 ```toml
-# .deepseek/config.toml
+# .seekcode/config.toml
 
 [[mcp_servers]]
 name = "filesystem"
@@ -614,12 +646,19 @@ Seek Code injects these instructions into the system prompt, so the agent can fo
 Default session location:
 
 ```text
-~/.local/share/deepseek/sessions
+${XDG_DATA_HOME:-~/.local/share}/seekcode/sessions
+```
+
+Seek Code also reads and may fall back to the workspace-local session directory:
+
+```text
+.seekcode/sessions
 ```
 
 Override:
 
 ```bash
+export SEEKCODE_SESSIONS_DIR="/path/to/sessions"
 export DEEPSEEK_SESSIONS_DIR="/path/to/sessions"
 ```
 
@@ -628,7 +667,7 @@ export DEEPSEEK_SESSIONS_DIR="/path/to/sessions"
 Seek Code uses side-git snapshots for turn-level workspace recovery without modifying your project Git history:
 
 ```text
-.deepseek/side-git
+.seekcode/side-git
 ```
 
 List snapshots:
@@ -667,12 +706,13 @@ artifact_links
 Default artifact location:
 
 ```text
-~/.local/share/deepseek/artifacts
+${XDG_DATA_HOME:-~/.local/share}/seekcode/artifacts
 ```
 
 Override:
 
 ```bash
+export SEEKCODE_ARTIFACTS_DIR="/path/to/artifacts"
 export DEEPSEEK_ARTIFACTS_DIR="/path/to/artifacts"
 export DEEPCODE_ARTIFACTS_DIR="/path/to/artifacts"
 ```
@@ -943,6 +983,7 @@ dist/
 .env
 .env.*
 api.txt
+.seekcode/
 .deepseek/
 .codex
 .agents/
@@ -997,10 +1038,10 @@ Commands:
 | `/restore revert` | Revert the latest turn |
 | `/cost` | Show cost breakdown |
 | `/tokens` | Show context token usage |
-| `/tasks` | Show task status |
-| `/tasks read <id>` | Read task details |
-| `/tasks cancel <id>` | Cancel a task |
-| `/tasks complete <id>` | Mark a task complete |
+| `/tasks` | Show current checklist and durable task status |
+| `/tasks read <id>` | Read durable task details |
+| `/tasks cancel <id>` | Cancel a durable task |
+| `/tasks complete <id>` | Mark a durable task complete |
 | `/jobs` | Show background shell jobs |
 | `/jobs show <id>` | Show job output |
 | `/jobs cancel <id>` | Cancel a job |

@@ -1,8 +1,9 @@
-/** Side-git workspace snapshots — separate bare repo in .deepseek/side-git/. */
+/** Side-git workspace snapshots — separate bare repo in .seekcode/side-git/. */
 
 import { mkdirSync, existsSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { SEEKCODE_DIR } from "../paths.js";
 
 export class SideGit {
   private workspace: string;
@@ -11,7 +12,7 @@ export class SideGit {
 
   constructor(workspace = ".") {
     this.workspace = resolve(workspace);
-    this.gitDir = join(this.workspace, ".deepseek", "side-git");
+    this.gitDir = join(this.workspace, SEEKCODE_DIR, "side-git");
   }
 
   async init(): Promise<boolean> {
@@ -51,8 +52,8 @@ export class SideGit {
   async restoreTo(commitHash: string): Promise<boolean> {
     if (!this.initialized) return false;
     try {
-      this.run("restore", "--source", commitHash, "--worktree", "--staged", "--", ".", ":(exclude).deepseek/side-git");
-      this.run("clean", "-fd", "-e", ".deepseek/side-git", "--", ".");
+      this.run("restore", "--source", commitHash, "--worktree", "--staged", "--", ".", ":(exclude).seekcode/side-git", ":(exclude).deepseek/side-git");
+      this.run("clean", "-fd", "-e", ".seekcode/side-git", "-e", ".deepseek/side-git", "--", ".");
       return true;
     }
     catch { return false; }
@@ -60,8 +61,8 @@ export class SideGit {
 
   private async snapshot(message: string): Promise<string | null> {
     try {
-      this.run("add", "-A", "--", ".", ":(exclude).deepseek/side-git");
-      const status = this.run("status", "--porcelain", "--", ".", ":(exclude).deepseek/side-git");
+      this.run("add", "-A", "--", ".", ":(exclude).seekcode/side-git", ":(exclude).deepseek/side-git");
+      const status = this.run("status", "--porcelain", "--", ".", ":(exclude).seekcode/side-git", ":(exclude).deepseek/side-git");
       if (!status.trim()) return null;
       return this.run("commit", "-m", message, "--allow-empty").trim();
     } catch { return null; }

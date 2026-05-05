@@ -105,7 +105,7 @@ Seek Code 从默认模型、请求格式、能力矩阵、缓存统计、thinkin
 | 分解优先 | 系统提示强调 preview、checklist、plan、map-reduce | 复杂需求、跨模块改造 |
 | 子代理并行 | `spawn_agent`、`sub_agent` 支持并行探索和执行 | 多模块调查、并行实现 |
 | 会话持久化 | `/save`、`/load`、`/sessions` 管理历史会话 | 中断后继续工作 |
-| 工作区回滚 | side-git 在 `.deepseek/side-git` 记录 turn 快照 | 防止误改和快速恢复 |
+| 工作区回滚 | side-git 在 `.seekcode/side-git` 记录 turn 快照 | 防止误改和快速恢复 |
 | HTTP/SSE 服务 | 以 server 模式暴露会话、线程、工具和流式聊天 API | 集成到上层产品或自动化系统 |
 
 ---
@@ -304,10 +304,20 @@ Seek Code 使用分层配置，后面的来源覆盖前面的来源：
 | 优先级 | 来源 | 位置 |
 |---|---|---|
 | 1 | 默认值 | 代码内默认配置 |
-| 2 | 用户配置 | `~/.config/deepseek/config.toml` |
-| 3 | 项目配置 | `.deepseek/config.toml` |
+| 2 | 用户配置 | `~/.seekcode/config.toml` |
+| 3 | 项目配置 | `.seekcode/config.toml` |
 | 4 | 环境变量 | `DEEPSEEK_*` |
 | 5 | CLI 参数 | `--model`、`--mode`、`--api-key` 等 |
+
+当前路径行为：
+
+- 用户配置主路径是 `~/.seekcode/config.toml`。
+- 项目配置主路径是当前工作目录下的 `.seekcode/config.toml`。
+- 配置文件不使用 `XDG_CONFIG_HOME`。
+- 旧配置 `~/.config/deepseek/config.toml` 和 `.deepseek/config.toml` 仍会被读取；新 `.seekcode` 路径中的值优先级更高。
+- `seek config validate`、`seek config explain` 和普通启动不会自动创建缺失的配置文件。
+- `seek config migrate --target user|project` 会迁移已有的 `.seekcode` 配置；如果只存在旧 DeepSeek 配置，会把迁移结果写入新的 `.seekcode` 路径；如果两者都不存在，则只报告警告。
+- `/mcp add` 等持久化 MCP 修改会写入用户配置，并自动创建父目录。
 
 ### 最小配置
 
@@ -332,7 +342,7 @@ export DEEPSEEK_TUI_ALTERNATE_SCREEN="never"
 ### 完整配置示例
 
 ```toml
-# ~/.config/deepseek/config.toml
+# ~/.seekcode/config.toml
 
 api_key = "sk-your-api-key"
 provider = "deepseek"
@@ -475,7 +485,7 @@ mcp_<server_name>_<tool_name>
 ### 配置示例
 
 ```toml
-# .deepseek/config.toml
+# .seekcode/config.toml
 
 [[mcp_servers]]
 name = "filesystem"
@@ -570,21 +580,24 @@ description: TypeScript conventions for this repository
 会话默认保存到：
 
 ```text
-~/.local/share/deepseek/sessions
+${XDG_DATA_HOME:-~/.local/share}/seekcode/sessions
 ```
 
 也可以通过环境变量指定：
 
 ```bash
+export SEEKCODE_SESSIONS_DIR="/path/to/sessions"
 export DEEPSEEK_SESSIONS_DIR="/path/to/sessions"
 ```
+
+读取、列出和删除会话时也会检查旧的 `deepseek/sessions` 和 `.deepseek/sessions` 目录，便于从旧版本平滑迁移。
 
 ### 工作区回滚
 
 Seek Code 使用 side-git 保存 turn 前后的工作区快照，不污染你的项目 Git 仓库：
 
 ```text
-.deepseek/side-git
+.seekcode/side-git
 ```
 
 查看快照：
@@ -623,12 +636,13 @@ artifact_links
 默认位置：
 
 ```text
-~/.local/share/deepseek/artifacts
+${XDG_DATA_HOME:-~/.local/share}/seekcode/artifacts
 ```
 
 可通过环境变量覆盖：
 
 ```bash
+export SEEKCODE_ARTIFACTS_DIR="/path/to/artifacts"
 export DEEPSEEK_ARTIFACTS_DIR="/path/to/artifacts"
 export DEEPCODE_ARTIFACTS_DIR="/path/to/artifacts"
 ```
@@ -903,6 +917,7 @@ dist/
 .env
 .env.*
 api.txt
+.seekcode/
 .deepseek/
 .codex
 .agents/
@@ -957,10 +972,10 @@ Commands:
 | `/restore revert` | 回滚最近一次 turn |
 | `/cost` | 查看成本明细 |
 | `/tokens` | 查看上下文 token 使用 |
-| `/tasks` | 查看任务状态 |
-| `/tasks read <id>` | 查看任务详情 |
-| `/tasks cancel <id>` | 取消任务 |
-| `/tasks complete <id>` | 标记任务完成 |
+| `/tasks` | 查看当前 checklist 和 durable task 状态 |
+| `/tasks read <id>` | 查看 durable task 详情 |
+| `/tasks cancel <id>` | 取消 durable task |
+| `/tasks complete <id>` | 标记 durable task 完成 |
 | `/jobs` | 查看后台 shell jobs |
 | `/jobs show <id>` | 查看 job 输出 |
 | `/jobs cancel <id>` | 取消 job |

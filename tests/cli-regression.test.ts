@@ -90,6 +90,28 @@ describe("CLI and packaging", () => {
     }
   });
 
+  it("reads the API key and base URL from ~/.seekcode/config.toml", async () => {
+    const requests: any[] = [];
+    await startFakeOpenAIServer(requests);
+    writeUserConfig([
+      'api_key = "config-key"',
+      `base_url = "${serverUrl}"`,
+      'reasoning_effort = "off"',
+      "",
+    ].join("\n"));
+
+    const result = await runCliAsync(srcCli, ["hello", "from", "config"], {
+      env: { DEEPSEEK_API_KEY: "" },
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(stripAnsi(result.stdout)).toContain("one-shot ok");
+    expect(requests).toHaveLength(1);
+    expect(requests[0].authorization).toBe("Bearer config-key");
+    expect(requests[0].messages.at(-1)).toMatchObject({ role: "user", content: "hello from config" });
+  });
+
   it("starts interactive UI and exits cleanly from stdin", () => {
     const result = runCli(srcCli, ["--no-alt-screen"], {
       input: "/exit\n",
@@ -189,7 +211,7 @@ function runCliAsync(
 }
 
 function writeUserConfig(content: string): void {
-  const configDir = join(tmp, "home", ".config", "deepseek");
+  const configDir = join(tmp, "home", ".seekcode");
   mkdirSync(configDir, { recursive: true });
   writeFileSync(join(configDir, "config.toml"), content);
 }
@@ -204,7 +226,7 @@ async function startFakeOpenAIServer(requests: any[]): Promise<void> {
         res.writeHead(404).end("not found");
         return;
       }
-      requests.push(JSON.parse(body));
+      requests.push({ ...JSON.parse(body), authorization: req.headers.authorization });
       res.writeHead(200, {
         "content-type": "text/event-stream; charset=utf-8",
         "cache-control": "no-cache",

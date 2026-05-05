@@ -28,6 +28,7 @@ import {
   sep,
 } from "node:path";
 import { gunzipSync } from "node:zlib";
+import { LEGACY_DEEPSEEK_DIR, SEEKCODE_DIR } from "../paths.js";
 
 export const DEFAULT_SKILLS_REGISTRY_URL =
   "https://raw.githubusercontent.com/Hmbown/deepseek-skills/main/index.json";
@@ -64,7 +65,7 @@ description: Use this skill when ...
 
 Keep the SKILL.md body concise and procedural. Move long examples, schemas, or reference material into files under references/ and mention exactly when to read them. Prefer one clear workflow over a grab bag of tips.
 
-Before creating files, ask where the user wants the skill placed if they did not specify a location. If they have no preference, use \`~/.deepseek/skills\` so Seek Code can discover it globally, or \`./skills\` for a project-local skill.
+Before creating files, ask where the user wants the skill placed if they did not specify a location. If they have no preference, use \`~/.seekcode/skills\` so Seek Code can discover it globally, or \`./skills\` for a project-local skill.
 `;
 
 export type SkillScope = "workspace" | "project" | "global" | "compat" | "system";
@@ -161,7 +162,7 @@ export class SkillRegistry {
 }
 
 export function defaultSkillsDir(homeDir = process.env.HOME || "~"): string {
-  return resolveHome("~/.deepseek/skills", homeDir);
+  return resolveHome("~/.seekcode/skills", homeDir);
 }
 
 export function resolveSkillPath(path: string, homeDir = process.env.HOME || "~"): string {
@@ -190,9 +191,11 @@ export function scanSkills(
 
   addRoot(join(workspace, ".agents", "skills"), "workspace", "workspace .agents/skills");
   addRoot(join(workspace, "skills"), "workspace", "workspace ./skills");
-  addRoot(join(workspace, ".deepseek", "skills"), "project", "workspace .deepseek/skills");
+  addRoot(join(workspace, SEEKCODE_DIR, "skills"), "project", "workspace .seekcode/skills");
+  addRoot(join(workspace, LEGACY_DEEPSEEK_DIR, "skills"), "compat", "legacy workspace .deepseek/skills");
   addRoot(configuredSkillsDir, "global", "configured skills_dir");
-  addRoot(join(home, ".deepseek", "skills"), "global", "global ~/.deepseek/skills");
+  addRoot(join(home, SEEKCODE_DIR, "skills"), "global", "global ~/.seekcode/skills");
+  addRoot(join(home, LEGACY_DEEPSEEK_DIR, "skills"), "compat", "legacy global ~/.deepseek/skills");
   addRoot(join(home, ".agents", "skills"), "compat", "global ~/.agents/skills");
   addRoot(join(home, ".claude", "skills"), "compat", "global ~/.claude/skills");
 

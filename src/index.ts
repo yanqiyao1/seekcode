@@ -46,7 +46,7 @@ import { CostTracker } from "./cost/tracker.js";
 import { saveSession, loadSession, listSessions, deleteSession } from "./session/store.js";
 import { refreshSessionTitle } from "./session/title.js";
 import { revertLastTurn, restoreWorkspace } from "./rollback/restore.js";
-import { clearPlanState } from "./tools/plan.js";
+import { clearPlanState, formatTodoState } from "./tools/plan.js";
 import { clearGoalState } from "./tools/goal.js";
 import { clearAgentState } from "./tools/sub-agent.js";
 import { getApprovalCache, clearApprovalCache, DenialReason } from "./tools/approval-cache.js";
@@ -1422,8 +1422,10 @@ ${p.blueBold("Commands")}
         console.log(tm.completeTask(id, parts.slice(3).join(" ") || undefined) ? p.success(`Completed task ${id}.`) : p.error(`Task not active: ${id}`));
         break;
       }
+      const checklist = formatTodoState();
+      if (checklist) console.log(checklist);
       const stats = tm.getTaskStats();
-      console.log(p.blueBold(`Tasks: ${stats.active} active, ${stats.total} total`));
+      console.log(p.blueBold(`Durable tasks: ${stats.active} active, ${stats.total} total`));
       console.log(`  Completed: ${stats.completed} | Failed: ${stats.failed} | Killed: ${stats.killed}`);
       if (Object.keys(stats.byType).length) {
         console.log("  By type: " + Object.entries(stats.byType).map(([k, v]) => `${k}:${v}`).join(" "));

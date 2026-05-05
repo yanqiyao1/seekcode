@@ -163,8 +163,8 @@ describe("interaction modes", () => {
 
 describe("config precedence and migration", () => {
   it("deep-merges user, project, env, and CLI config layers", () => {
-    const userDir = join(process.env.HOME!, ".config", "deepseek");
-    const projectDir = join(tmp, ".deepseek");
+    const userDir = join(process.env.HOME!, ".seekcode");
+    const projectDir = join(tmp, ".seekcode");
     mkdirSync(userDir, { recursive: true });
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(userDir, "config.toml"), [
@@ -216,7 +216,7 @@ describe("config precedence and migration", () => {
   });
 
   it("migrates sandbox and web config keys and validates invalid policies", () => {
-    const projectDir = join(tmp, ".deepseek");
+    const projectDir = join(tmp, ".seekcode");
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(projectDir, "config.toml"), [
       'approvalPolicy = "never"',

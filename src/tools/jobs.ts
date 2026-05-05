@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import { join, resolve } from "node:path";
 import { checkCommand } from "./exec-policy.js";
 import { createArtifact, linkArtifact } from "../artifacts/store.js";
+import { seekcodeDataPath } from "../paths.js";
 
 export type JobStatus = "running" | "completed" | "failed" | "killed" | "stale";
 
@@ -318,10 +319,10 @@ export function formatJob(job: ShellJob, tailChars = 4000): string {
 }
 
 export function defaultJobsDir(): string {
+  if (process.env.SEEKCODE_JOBS_DIR) return resolve(process.env.SEEKCODE_JOBS_DIR);
   if (process.env.DEEPCODE_JOBS_DIR) return resolve(process.env.DEEPCODE_JOBS_DIR);
   if (process.env.DEEPSEEK_JOBS_DIR) return resolve(process.env.DEEPSEEK_JOBS_DIR);
-  const xdg = process.env.XDG_DATA_HOME || resolve(process.env.HOME || "~", ".local", "share");
-  return join(xdg, "deepseek", "jobs");
+  return seekcodeDataPath("jobs");
 }
 
 function appendOutput(existing: string | undefined, next: string): string {

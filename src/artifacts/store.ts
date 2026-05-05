@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, join, resolve } from "node:path";
+import { seekcodeDataPath } from "../paths.js";
 
 export interface ArtifactRecord {
   id: string;
@@ -135,10 +136,10 @@ export function listArtifactLinks(filter: Partial<Pick<ArtifactLink, "scope" | "
 }
 
 export function artifactRoot(): string {
+  if (process.env.SEEKCODE_ARTIFACTS_DIR) return resolve(process.env.SEEKCODE_ARTIFACTS_DIR);
   if (process.env.DEEPCODE_ARTIFACTS_DIR) return resolve(process.env.DEEPCODE_ARTIFACTS_DIR);
   if (process.env.DEEPSEEK_ARTIFACTS_DIR) return resolve(process.env.DEEPSEEK_ARTIFACTS_DIR);
-  const xdg = process.env.XDG_DATA_HOME || resolve(process.env.HOME || "~", ".local", "share");
-  return join(xdg, "deepseek", "artifacts");
+  return seekcodeDataPath("artifacts");
 }
 
 export function clearArtifactsForTests(): void {

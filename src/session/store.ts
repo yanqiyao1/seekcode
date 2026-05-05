@@ -5,19 +5,33 @@ import { basename, resolve, join } from "node:path";
 import type { Message, Session, ToolCall, Turn } from "./types.js";
 import { createSession } from "./types.js";
 import { deriveSessionTitle, refreshSessionTitle } from "./title.js";
+import { LEGACY_DEEPSEEK_DIR, SEEKCODE_DIR, legacyDeepseekDataPath, seekcodeDataPath } from "../paths.js";
 
 function primarySessionsDir(): string {
+  if (process.env.SEEKCODE_SESSIONS_DIR) return resolve(process.env.SEEKCODE_SESSIONS_DIR);
   if (process.env.DEEPSEEK_SESSIONS_DIR) return resolve(process.env.DEEPSEEK_SESSIONS_DIR);
-  const xdg = process.env.XDG_DATA_HOME || resolve(process.env.HOME || "~", ".local", "share");
-  return join(xdg, "deepseek", "sessions");
+  return seekcodeDataPath("sessions");
+}
+
+function legacyPrimarySessionsDir(): string | null {
+  if (process.env.SEEKCODE_SESSIONS_DIR || process.env.DEEPSEEK_SESSIONS_DIR) return null;
+  return legacyDeepseekDataPath("sessions");
 }
 
 function fallbackSessionsDir(): string {
-  return resolve(process.cwd(), ".deepseek", "sessions");
+  return resolve(process.cwd(), SEEKCODE_DIR, "sessions");
 }
 
-function candidateSessionDirs(): string[] {
+function legacyFallbackSessionsDir(): string {
+  return resolve(process.cwd(), LEGACY_DEEPSEEK_DIR, "sessions");
+}
+
+function writeSessionDirs(): string[] {
   return [...new Set([primarySessionsDir(), fallbackSessionsDir()])];
+}
+
+function readSessionDirs(): string[] {
+  return [...new Set([primarySessionsDir(), legacyPrimarySessionsDir(), fallbackSessionsDir(), legacyFallbackSessionsDir()].filter((dir): dir is string => !!dir))];
 }
 
 function safeSessionId(sessionId: unknown): string {
@@ -166,7 +180,7 @@ export function saveSession(session: Session): string {
 
   const payload = JSON.stringify(session, null, 2);
   const errors: string[] = [];
-  for (const dir of candidateSessionDirs()) {
+  for (const dir of writeSessionDirs()) {
     try {
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, `${id}.json`), payload, "utf-8");
@@ -183,7 +197,7 @@ export function loadSession(sessionId: string): Session | null {
   const safeId = safeSessionId(sessionId);
   if (!safeId) return null;
   const matches: Array<{ session: Session; time: number }> = [];
-  for (const dir of candidateSessionDirs()) {
+  for (const dir of readSessionDirs()) {
     try {
       const filepath = join(dir, `${safeId}.json`);
       const data = JSON.parse(readFileSync(filepath, "utf-8"));
@@ -217,7 +231,7 @@ export function listSessions(): Array<{
     workspace_path: string;
     message_count: number;
   }>();
-  for (const dir of candidateSessionDirs()) {
+  for (const dir of readSessionDirs()) {
     try {
       const files = readdirSync(dir).filter(f => f.endsWith(".json"));
       for (const f of files) {
@@ -252,7 +266,7 @@ export function deleteSession(sessionId: string): boolean {
   const safeId = safeSessionId(sessionId);
   if (!safeId) return false;
   let deleted = false;
-  for (const dir of candidateSessionDirs()) {
+  for (const dir of readSessionDirs()) {
     try {
       unlinkSync(join(dir, `${safeId}.json`));
       deleted = true;

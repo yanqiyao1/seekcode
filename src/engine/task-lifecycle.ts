@@ -11,6 +11,7 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "
 import { dirname, join, resolve } from "node:path";
 import { checkCommand } from "../tools/exec-policy.js";
 import { createArtifact, linkArtifact } from "../artifacts/store.js";
+import { seekcodeDataPath } from "../paths.js";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -436,10 +437,10 @@ export function clearTaskManager(): void {
 }
 
 export function defaultTaskStoreFile(): string {
+  if (process.env.SEEKCODE_TASKS_DIR) return join(resolve(process.env.SEEKCODE_TASKS_DIR), "tasks.json");
   if (process.env.DEEPCODE_TASKS_DIR) return join(resolve(process.env.DEEPCODE_TASKS_DIR), "tasks.json");
   if (process.env.DEEPSEEK_TASKS_DIR) return join(resolve(process.env.DEEPSEEK_TASKS_DIR), "tasks.json");
-  const xdg = process.env.XDG_DATA_HOME || resolve(process.env.HOME || "~", ".local", "share");
-  return join(xdg, "deepseek", "tasks", "tasks.json");
+  return seekcodeDataPath("tasks", "tasks.json");
 }
 
 export function clearPersistentTaskStateForTests(): void {

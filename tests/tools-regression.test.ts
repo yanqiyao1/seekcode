@@ -545,7 +545,7 @@ describe("side git rollback", () => {
     expect(await sideGit.restoreTo(snapshots.find(item => item.message === "pre-turn-1")!.hash)).toBe(true);
     expect(readFileSync(original, "utf-8")).toBe("before\n");
     expect(existsSync(later)).toBe(false);
-    expect(existsSync(join(workspace, ".deepseek", "side-git", "HEAD"))).toBe(true);
+    expect(existsSync(join(workspace, ".seekcode", "side-git", "HEAD"))).toBe(true);
     expect((await sideGit.listSnapshots()).map(item => item.message)).toEqual(["post-turn-1", "pre-turn-1"]);
   });
 });
@@ -985,13 +985,42 @@ describe("config and pricing", () => {
     expect(cfg.model).toBe("deepseek/deepseek-v4-pro");
   });
 
+  it("loads ~/.seekcode config and keeps legacy DeepSeek paths as lower-precedence fallbacks", () => {
+    const legacyUserDir = join(process.env.HOME!, ".config", "deepseek");
+    const userDir = join(process.env.HOME!, ".seekcode");
+    const legacyProjectDir = join(tmp, ".deepseek");
+    const projectDir = join(tmp, ".seekcode");
+    mkdirSync(legacyUserDir, { recursive: true });
+    mkdirSync(userDir, { recursive: true });
+    mkdirSync(legacyProjectDir, { recursive: true });
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(legacyUserDir, "config.toml"), 'api_key = "legacy-user-key"\nmodel = "deepseek-v4-flash"\n');
+    writeFileSync(join(userDir, "config.toml"), 'api_key = "seekcode-user-key"\n');
+    writeFileSync(join(legacyProjectDir, "config.toml"), 'mode = "plan"\n');
+    writeFileSync(join(projectDir, "config.toml"), 'mode = "agent"\n');
+    const cwd = process.cwd();
+    process.chdir(tmp);
+    try {
+      const cfg = loadConfig();
+      const explain = explainConfig();
+
+      expect(cfg.api_key).toBe("seekcode-user-key");
+      expect(cfg.model).toBe("deepseek-v4-flash");
+      expect(cfg.mode).toBe("agent");
+      expect(explain.conflicts.some(conflict => conflict.key === "api_key" && conflict.winner === "user")).toBe(true);
+      expect(explain.conflicts.some(conflict => conflict.key === "mode" && conflict.winner === "project")).toBe(true);
+    } finally {
+      process.chdir(cwd);
+    }
+  });
+
   it("does not produce negative input costs when cached tokens exceed input tokens", () => {
     expect(calculateCost("deepseek-v4-pro", 10, 0, 20)).toBeGreaterThanOrEqual(0);
   });
 
   it("migrates legacy config keys without changing conflicting canonical keys", () => {
-    const userConfig = join(process.env.HOME!, ".config", "deepseek", "config.toml");
-    mkdirSync(join(process.env.HOME!, ".config", "deepseek"), { recursive: true });
+    const userConfig = join(process.env.HOME!, ".seekcode", "config.toml");
+    mkdirSync(join(process.env.HOME!, ".seekcode"), { recursive: true });
     writeFileSync(userConfig, [
       'apiKey = "legacy"',
       'api_key = "canonical"',
@@ -1010,8 +1039,8 @@ describe("config and pricing", () => {
   });
 
   it("validates semantic config errors and explains source conflicts", () => {
-    const userDir = join(process.env.HOME!, ".config", "deepseek");
-    const projectDir = join(tmp, ".deepseek");
+    const userDir = join(process.env.HOME!, ".seekcode");
+    const projectDir = join(tmp, ".seekcode");
     mkdirSync(userDir, { recursive: true });
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(userDir, "config.toml"), 'model = "user-model"\n[[mcp_servers]]\nname = "bad"\ntransport = "stdio"\n');
@@ -1031,7 +1060,7 @@ describe("config and pricing", () => {
   });
 
   it("loads, migrates, and validates web configuration", () => {
-    const userDir = join(process.env.HOME!, ".config", "deepseek");
+    const userDir = join(process.env.HOME!, ".seekcode");
     mkdirSync(userDir, { recursive: true });
     writeFileSync(join(userDir, "config.toml"), [
       "[web]",
@@ -1074,7 +1103,7 @@ describe("config and pricing", () => {
   });
 
   it("rejects invalid web proxy config", () => {
-    const userDir = join(process.env.HOME!, ".config", "deepseek");
+    const userDir = join(process.env.HOME!, ".seekcode");
     mkdirSync(userDir, { recursive: true });
     writeFileSync(join(userDir, "config.toml"), [
       "[web]",
@@ -1093,7 +1122,7 @@ describe("skills system", () => {
   it("discovers workspace skills before global skills and injects metadata only", () => {
     const home = join(tmp, "home-skills");
     const workspaceSkill = join(tmp, ".agents", "skills", "demo");
-    const globalSkill = join(home, ".deepseek", "skills", "demo");
+    const globalSkill = join(home, ".seekcode", "skills", "demo");
     mkdirSync(workspaceSkill, { recursive: true });
     mkdirSync(globalSkill, { recursive: true });
     writeFileSync(join(workspaceSkill, "SKILL.md"), skillMd("demo", "workspace skill", "workspace body secret"));
@@ -1153,7 +1182,7 @@ describe("skills system", () => {
   it("applies skill precedence across workspace, project, configured, and compat roots", () => {
     const configured = join(tmp, "configured-skills");
     const workspaceSkill = join(tmp, ".agents", "skills", "same");
-    const projectSkill = join(tmp, ".deepseek", "skills", "project-only");
+    const projectSkill = join(tmp, ".seekcode", "skills", "project-only");
     const configuredSkill = join(configured, "configured-only");
     const configuredDuplicate = join(configured, "same");
     const compatSkill = join(process.env.HOME!, ".claude", "skills", "compat-only");
@@ -1195,14 +1224,14 @@ describe("skills system", () => {
 
   it("trusts the highest-precedence matching skill and activation uses trusted body", () => {
     const workspaceSkill = join(tmp, "skills", "trusted-demo");
-    const globalSkill = join(process.env.HOME!, ".deepseek", "skills", "trusted-demo");
+    const globalSkill = join(process.env.HOME!, ".seekcode", "skills", "trusted-demo");
     mkdirSync(workspaceSkill, { recursive: true });
     mkdirSync(globalSkill, { recursive: true });
     writeFileSync(join(workspaceSkill, "SKILL.md"), skillMd("trusted-demo", "workspace trusted", "workspace trusted body"));
     writeFileSync(join(globalSkill, "SKILL.md"), skillMd("trusted-demo", "global ignored", "global body"));
 
-    const trusted = trustSkill("trusted-demo", { workspaceDir: tmp, skillsDir: join(process.env.HOME!, ".deepseek", "skills") });
-    const activated = activateSkill("trusted-demo", { workspaceDir: tmp, skillsDir: join(process.env.HOME!, ".deepseek", "skills") });
+    const trusted = trustSkill("trusted-demo", { workspaceDir: tmp, skillsDir: join(process.env.HOME!, ".seekcode", "skills") });
+    const activated = activateSkill("trusted-demo", { workspaceDir: tmp, skillsDir: join(process.env.HOME!, ".seekcode", "skills") });
 
     expect(trusted).toContain("Trusted skill");
     expect(existsSync(join(workspaceSkill, ".trusted"))).toBe(true);
@@ -1230,7 +1259,7 @@ describe("P1 tool system", () => {
     const added = await getRegistry().lookup("mcp_manager")!.execute({ action: "add", name: "demo", command: process.execPath, args: ["server.js"] });
     const disabled = await getRegistry().lookup("mcp_manager")!.execute({ action: "disable", name: "demo" });
     const enabled = await getRegistry().lookup("mcp_manager")!.execute({ action: "enable", name: "demo" });
-    const config = readFileSync(join(process.env.HOME!, ".config", "deepseek", "config.toml"), "utf-8");
+    const config = readFileSync(join(process.env.HOME!, ".seekcode", "config.toml"), "utf-8");
 
     expect(added).toContain("demo");
     expect(disabled).toContain("\"enabled\": false");
@@ -1587,7 +1616,7 @@ function testConfig(): Config {
     thinking_visible: true,
     tui_alternate_screen: "never",
     mcp_servers: [],
-    skills_dir: join(tmp, "home", ".deepseek", "skills"),
+    skills_dir: join(tmp, "home", ".seekcode", "skills"),
     skills_registry_url: "https://example.com/skills.json",
     skills_max_install_size_bytes: 5 * 1024 * 1024,
     theme: "deepseek-dark",

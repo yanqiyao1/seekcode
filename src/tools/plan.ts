@@ -36,6 +36,18 @@ export function getTodoState() { return [...todoItems]; }
 export function getNoteState() { return [...notes]; }
 export function clearPlanState() { planSteps = []; todoItems = []; nextTodoId = 1; }
 
+export function formatTodoState(limit = 20): string {
+  if (!todoItems.length) return "";
+  const inProgress = todoItems.filter(item => item.status === "in_progress").length;
+  const completed = todoItems.filter(item => item.status === "completed").length;
+  const lines = [`Checklist: ${todoItems.length} tasks, ${inProgress} in progress, ${completed} completed`];
+  for (const item of todoItems.slice(0, Math.max(1, limit))) {
+    lines.push(`  ${STATUS_SYMBOLS[item.status]} [${item.id}] ${item.content}`);
+  }
+  if (todoItems.length > limit) lines.push(`  ... ${todoItems.length - limit} more`);
+  return lines.join("\n");
+}
+
 // ── checklist_write ──────────────────────────────────────────
 
 const STATUS_SYMBOLS: Record<string, string> = {
