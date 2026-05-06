@@ -1,4 +1,4 @@
-/** Tool discovery for deferred tools without sending every schema every turn. */
+/** Tool discovery and activation for tools that are present in the stable schema prefix. */
 
 import { PermissionLevel, isToolConcurrencySafe, isToolDestructive, isToolReadOnly } from "./base.js";
 import { getRegistry } from "./registry.js";
@@ -42,7 +42,7 @@ async function toolEnable(args: Record<string, unknown>): Promise<string> {
 export function registerToolSearchTool(): void {
   getRegistry().register({
     name: "tool_search",
-    description: "Search and activate deferred tool definitions by name, description, category, or schema.",
+    description: "Search and activate tool definitions by name, description, category, or schema.",
     parameters: {
       type: "object",
       properties: {

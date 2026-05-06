@@ -29,8 +29,9 @@ import { getMode, nextModeName, type UICallbacks } from "./modes/base.js";
 import { Engine } from "./engine/loop.js";
 import { ConversationHistory } from "./session/history.js";
 import { createSession } from "./session/types.js";
-import { buildSystemPrompt, buildToolsDescription } from "./engine/context.js";
 import { CapacityController, formatCapacityDecision } from "./engine/capacity.js";
+import { buildPinnedPrefix } from "./engine/prefix-builder.js";
+import { systemMessage } from "./engine/prefix.js";
 import { CostTracker } from "./cost/tracker.js";
 import { saveSession, loadSession, listSessions, deleteSession } from "./session/store.js";
 import { refreshSessionTitle } from "./session/title.js";
@@ -42,7 +43,6 @@ import { getApprovalCache, clearApprovalCache, DenialReason } from "./tools/appr
 import { getTaskManager, clearTaskManager } from "./engine/task-lifecycle.js";
 import {
   activateSkill,
-  injectSkills,
   installSkill,
   listRemoteSkills,
   listSkills,
@@ -68,12 +68,12 @@ import { registerTaskTools } from "./tools/tasks.js";
 import { registerDiagnosticsTools } from "./tools/diagnostics.js";
 import { registerArtifactTools } from "./tools/artifacts.js";
 import { formatJob, getJobManager } from "./tools/jobs.js";
-import { injectAgentsMd } from "./engine/agents-md.js";
 import { defaultBaseUrlForProvider, extractCachedInputTokens, parseProvider, providerCapability, type ApiProvider } from "./client/capabilities.js";
 import { addMCPServer, getMCPManager, reloadMCPManager, removeMCPServer, setMCPServerEnabled } from "./mcp/manager.js";
 import { linkArtifact } from "./artifacts/store.js";
 import { VERSION } from "./version.js";
 import { assertMinimumVersion, maybePromptForUpdate, runUpdateCommand } from "./update-check.js";
+import { estimateMessagesTokens, projectMessagesForRequest } from "./engine/compact.js";
 
 function parseOptionalInt(value: string | undefined): number | undefined {
   if (value === undefined || value === "") return undefined;
@@ -184,13 +184,11 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
   const history = new ConversationHistory(session);
   let client = new DeepSeekClient({ apiKey: cfg.api_key, baseUrl: cfg.base_url, model: cfg.model, provider: cfg.provider });
 
-  const toolDesc = buildToolsDescription(tools.listAll());
-  let sysPrompt = buildSystemPrompt(cfg, session.workspace_path, toolDesc);
-  sysPrompt = injectAgentsMd(sysPrompt, resolve("."));
-  sysPrompt = injectSkills(sysPrompt, resolve("."), cfg.skills_dir);
-  history.addSystem(sysPrompt);
+  let prefix = buildPinnedPrefix(cfg, session.workspace_path, tools);
+  session.prefix_hash = prefix.hash;
+  history.addSystem(prefix.systemPrompt);
 
-  let engine = new Engine(cfg, session, history, client, tools);
+  let engine = new Engine(cfg, session, history, client, tools, prefix);
 
   const initialRawMode = process.stdin.isRaw;
   const useAlternateScreen = shouldUseAlternateScreen(cfg.tui_alternate_screen);
@@ -302,6 +300,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       renderPicker,
       clearModal,
       write: appendUiOutput,
+      getRequestTokenCount: () => engine.requestTokenCount(),
       applyLoadedSession,
       rebuildRuntime,
       rebuildSystemPrompt,
@@ -361,7 +360,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       return false;
     },
     onCtrlC: () => {
-      abortActiveTurn();
+      liveInputController?.reset({ render: true });
       return false;
     },
     onModeCycle: () => {
@@ -425,25 +424,20 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     });
 
   const rebuildSystemPrompt = () => {
-    const systemPrompt = injectSkills(
-      injectAgentsMd(
-        buildSystemPrompt(cfg, session.workspace_path, buildToolsDescription(tools.listAll())),
-        session.workspace_path,
-      ),
-      session.workspace_path,
-      cfg.skills_dir,
-    );
+    prefix = buildPinnedPrefix(cfg, session.workspace_path, tools);
+    session.prefix_hash = prefix.hash;
     session.messages = [
-      { role: "system", content: systemPrompt, tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
-      ...session.messages.filter(message => message.role !== "system"),
+      systemMessage(prefix.systemPrompt),
+      ...session.messages.filter(message => !(message.role === "system" && message.name == null)),
     ];
+    if (engine) engine.prefix = prefix;
   };
 
   const rebuildRuntime = () => {
     modeObj = getMode(cfg.mode);
     costTracker.model = cfg.model;
     client = new DeepSeekClient({ apiKey: cfg.api_key, baseUrl: cfg.base_url, model: cfg.model, provider: cfg.provider });
-    engine = new Engine(cfg, session, history, client, tools);
+    engine = new Engine(cfg, session, history, client, tools, prefix);
   };
 
   const applyLoadedSession = (loaded: typeof session) => {
@@ -625,6 +619,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
           renderPicker,
           clearModal,
           write: appendUiOutput,
+          getRequestTokenCount: () => engine.requestTokenCount(),
           applyLoadedSession,
           rebuildRuntime,
           rebuildSystemPrompt,
@@ -641,7 +636,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       turnCount++;
 
       // Capacity preview. Engine owns the actual refresh/verify/replan intervention.
-      const capacityDecision = capacity.observe(history.approximateTokenCount(), cfg.context_limit);
+      const capacityDecision = capacity.observe(engine.requestTokenCount(), cfg.context_limit);
       if (capacityDecision.action !== "no_intervention") {
         transcript.append(p.dim(`\nContext pressure: ${capacityDecision.risk} (${capacityDecision.action}).\n`));
         renderScreen();
@@ -746,6 +741,7 @@ interface SlashCommandRuntime {
   renderPicker?: PickerRenderer;
   clearModal?: () => void;
   write?: (message: unknown, isError?: boolean) => void;
+  getRequestTokenCount?: () => number;
   applyLoadedSession: (loaded: ReturnType<typeof createSession>) => void;
   rebuildRuntime: () => void;
   rebuildSystemPrompt: () => void;
@@ -961,7 +957,7 @@ ${p.blueBold("Commands")}
   /skill <name>  Apply/install/update/uninstall/trust skills
   /permissions   Show permission rules
   /version       Show version
-  Ctrl+C         Exit
+  Ctrl+C         Clear current input
 `);
       break;
 
@@ -1165,12 +1161,17 @@ ${p.blueBold("Commands")}
       break;
     }
     case "/tokens": {
-      const tokens = history.approximateTokenCount();
+      const tokens = runtime.getRequestTokenCount?.() ?? history.approximateTokenCount();
       const limit = cfg.context_limit;
       const pct = limit ? (tokens / limit) * 100 : 0;
       const bar = "█".repeat(Math.floor(pct / 5)) + "░".repeat(20 - Math.floor(pct / 5));
       write(`Context: [${bar}] ${tokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct.toFixed(0)}%)`);
       write(formatCapacityDecision(new CapacityController().observe(tokens, limit)));
+      const rawTokens = estimateMessagesTokens(session.messages);
+      const projectedMessages = projectMessagesForRequest(session.messages);
+      if (projectedMessages.length !== session.messages.length || rawTokens !== tokens) {
+        write(p.dim(`Raw event log: ${rawTokens.toLocaleString()} tokens across ${session.messages.length} messages; request projection is compacted before API calls.`));
+      }
       break;
     }
     case "/tasks": {
@@ -1457,7 +1458,8 @@ program
     if (prompt) {
       await runOneShot(cfg, prompt);
     } else {
-      await maybePromptForUpdate();
+      const updateResult = await maybePromptForUpdate();
+      if (updateResult === "updated") return;
       await runInteractive(cfg);
     }
   });

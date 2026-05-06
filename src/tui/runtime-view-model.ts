@@ -229,6 +229,9 @@ export class TuiRuntimeViewModel {
       case "context_intervention":
         this.renderContextIntervention(event.data);
         break;
+      case "prefix_invalidated":
+        this.renderPrefixInvalidated(event.data);
+        break;
     }
   }
 
@@ -300,6 +303,23 @@ export class TuiRuntimeViewModel {
     const value = data as { risk?: string; action?: string; reason?: string; compaction?: { message?: string } };
     this.transcript.append(p.dim(`\nContext guard: ${value.risk || "unknown"} / ${value.action || "intervention"} — ${value.reason || "capacity intervention"}.\n`));
     if (value.compaction?.message) this.transcript.append(p.dim(value.compaction.message + "\n"));
+    this.options.renderNow?.();
+  }
+
+  private renderPrefixInvalidated(data: unknown): void {
+    const value = data as {
+      reason?: string;
+      boundary_id?: string;
+      compaction?: { finalTokens?: number; removed_messages?: number; preserved_messages?: number };
+    };
+    const parts = [
+      `Prompt cache reset: ${value.reason || "unknown"}`,
+      value.boundary_id ? `boundary ${value.boundary_id}` : null,
+      typeof value.compaction?.removed_messages === "number" ? `${value.compaction.removed_messages} summarized` : null,
+      typeof value.compaction?.preserved_messages === "number" ? `${value.compaction.preserved_messages} recent kept` : null,
+      typeof value.compaction?.finalTokens === "number" ? `${value.compaction.finalTokens.toLocaleString()} projected tokens` : null,
+    ].filter(Boolean);
+    this.transcript.append(p.dim(parts.join(" | ") + "\n"));
     this.options.renderNow?.();
   }
 

@@ -1,6 +1,11 @@
 /** Convert persisted runtime/session records into replayable EngineRuntimeEvent streams. */
 
-import type { EngineRuntimeEvent, ToolProgressRuntimeEvent, ToolResultRuntimeEvent } from "../engine/events.js";
+import type {
+  EngineRuntimeEvent,
+  PrefixInvalidatedEventData,
+  ToolProgressRuntimeEvent,
+  ToolResultRuntimeEvent,
+} from "../engine/events.js";
 import type { ContextIntervention } from "../engine/context-manager.js";
 import type { Message, ToolCall, ToolResult } from "../session/types.js";
 
@@ -15,10 +20,16 @@ export function sessionMessagesToRuntimeEvents(
   options: { maxMessages?: number } = {},
 ): EngineRuntimeEvent[] {
   const maxMessages = options.maxMessages ?? 80;
-  const replayMessages = messages.filter(message => message.role !== "system").slice(-maxMessages);
+  const replayMessages = messages.slice(-maxMessages);
   const events: EngineRuntimeEvent[] = [];
 
   for (const message of replayMessages) {
+    if (message.role === "system") {
+      const compactionEvent = compactionBoundaryToRuntimeEvent(message);
+      if (compactionEvent) events.push(compactionEvent);
+      continue;
+    }
+
     if (message.role === "user") {
       events.push({ type: "user_message", data: { text: message.content || "" } });
       continue;
@@ -95,7 +106,63 @@ export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRu
       };
     case "context_intervention":
       return { type: "context_intervention", data: data as unknown as ContextIntervention, artifact_ids: item.artifact_ids };
+    case "prefix_invalidated":
+      return {
+        type: "prefix_invalidated",
+        data: data as PrefixInvalidatedEventData,
+        artifact_ids: item.artifact_ids,
+      };
     default:
       return null;
   }
+}
+
+function compactionBoundaryToRuntimeEvent(message: Message): EngineRuntimeEvent | null {
+  if (message.name !== "context_compaction_boundary") return null;
+  const content = message.content || "";
+  return {
+    type: "prefix_invalidated",
+    data: {
+      reason: "context_compaction",
+      boundary_id: extractBoundaryField(content, "boundary_id"),
+      compaction: {
+        actions: extractBoundaryActions(content),
+        finalTokens: parseBoundaryNumber(content, "projected_tokens_after") ?? 0,
+        original_tokens: parseBoundaryNumber(content, "projected_tokens_before") ?? undefined,
+        removed_messages: parseBoundaryNumber(content, "removed_messages") ?? undefined,
+        preserved_messages: parseBoundaryNumber(content, "preserved_messages") ?? undefined,
+        summary_message_name: "context_summary",
+      },
+    },
+  };
+}
+
+function extractBoundaryField(content: string, key: string): string | undefined {
+  const match = content.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
+  return match?.[1]?.trim() || undefined;
+}
+
+function parseBoundaryNumber(content: string, key: string): number | undefined {
+  const value = extractBoundaryField(content, key);
+  if (!value) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function extractBoundaryActions(content: string): string[] {
+  const lines = content.split("\n");
+  const actions: string[] = [];
+  let collecting = false;
+  for (const line of lines) {
+    if (collecting && line.startsWith("- ")) {
+      actions.push(line.slice(2).trim());
+      continue;
+    }
+    if (line.trim() === "actions:") {
+      collecting = true;
+      continue;
+    }
+    if (collecting) break;
+  }
+  return actions;
 }

@@ -9,10 +9,11 @@ import type { StreamEvent } from "../src/client/base.js";
 import type { Config } from "../src/config.js";
 import { explainConfig, loadConfig, migrateProjectConfig, migrateUserConfig, validateConfig } from "../src/config.js";
 import { calculateCost } from "../src/cost/pricing.js";
-import { ContextCompactor } from "../src/engine/compact.js";
+import { ContextCompactor, projectMessagesForRequest } from "../src/engine/compact.js";
 import type { EngineRuntimeEvent } from "../src/engine/events.js";
 import { Engine } from "../src/engine/loop.js";
 import { clearHooks, registerHook } from "../src/engine/hooks.js";
+import { ImmutablePrefix } from "../src/engine/prefix.js";
 import { getMode } from "../src/modes/base.js";
 import { ConversationHistory } from "../src/session/history.js";
 import { createSession } from "../src/session/types.js";
@@ -132,6 +133,41 @@ describe("file tools", () => {
     expect(list).toContain("文件.txt");
     expect(search).toContain("文件.txt");
     expect(glob).toContain("目录/文件.txt");
+  });
+
+  it("accepts common path/content aliases for write validation", async () => {
+    registerFileTools();
+    const file = join(tmp, "alias-target.txt");
+    const writeTool = getRegistry().lookup("write")!;
+    const validation = await writeTool.validateInput?.(
+      { file_path: file, text: "alias body", root: tmp },
+      { tool_name: "write", workspace_path: tmp, tool_def: writeTool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: {
+        path: file,
+        content: "alias body",
+      },
+    });
+
+    const result = await writeTool.execute(validation!.args!, { workspacePath: tmp });
+
+    expect(result).toContain("Successfully wrote");
+    expect(readFileSync(file, "utf-8")).toBe("alias body");
+  });
+
+  it("truncates very large write diffs to keep tool results cheap", async () => {
+    registerFileTools();
+    const file = join(tmp, "huge.txt");
+    const content = Array.from({ length: 400 }, (_, index) => `line-${index}-${"x".repeat(80)}`).join("\n");
+
+    const result = await getRegistry().lookup("write")!.execute({ path: file, content, root: tmp });
+
+    expect(result).toContain("[diff]");
+    expect(result).toContain("more diff lines");
+    expect(result.length).toBeLessThan(20_000);
   });
 
   it("does not follow symlinks that escape the requested root", async () => {
@@ -455,6 +491,7 @@ describe("tool catalog", () => {
 
     expect(getRegistry().listAll().map(tool => tool.name)).toEqual(["a_active", "tool_enable", "tool_search", "tool_stats", "z_deferred"]);
     expect(getRegistry().listActive().map(tool => tool.name)).toEqual(["a_active", "tool_enable", "tool_search", "tool_stats"]);
+    expect(getRegistry().toOpenAISchemas().map((schema: any) => schema.function.name)).toEqual(["a_active", "tool_enable", "tool_search", "tool_stats", "z_deferred"]);
     await getRegistry().lookup("tool_search")!.execute({ query: "github" });
     expect(getRegistry().listActive().map(tool => tool.name)).toEqual(["a_active", "tool_enable", "tool_search", "tool_stats", "z_deferred"]);
   });
@@ -614,6 +651,113 @@ describe("side git rollback", () => {
 });
 
 describe("engine", () => {
+  it("computes deterministic immutable prefix hashes", () => {
+    const prefixA = new ImmutablePrefix({
+      systemPrompt: "system",
+      toolSchemas: [
+        { type: "function", function: { name: "b", parameters: { type: "object" } } },
+        { function: { parameters: { type: "object" }, name: "a" }, type: "function" },
+      ],
+      memoryIndex: "memory",
+    });
+    const prefixB = new ImmutablePrefix({
+      systemPrompt: "system",
+      toolSchemas: [
+        { function: { parameters: { type: "object" }, name: "b" }, type: "function" },
+        { type: "function", function: { name: "a", parameters: { type: "object" } } },
+      ],
+      memoryIndex: "memory",
+    });
+
+    expect(prefixA.hash).toBe(prefixB.hash);
+    expect(prefixA.metadata).toMatchObject({
+      hash: prefixA.hash,
+      tool_count: 2,
+      system_chars: 6,
+      memory_index_chars: 6,
+    });
+  });
+
+  it("uses a pinned tool schema prefix across turns even when deferred tools auto-activate", async () => {
+    getRegistry().register({
+      name: "a_active",
+      description: "always active",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      execute: async () => "active",
+    });
+    getRegistry().register({
+      name: "rare_reader",
+      description: "rare_reader deferred context trigger",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      deferLoading: true,
+      execute: async () => "rare",
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const pinnedSchemas = getRegistry().toOpenAISchemas();
+    const prefix = new ImmutablePrefix({ systemPrompt: "system", toolSchemas: pinnedSchemas });
+    const client = new FakeClient([
+      { type: "done", finish_reason: "stop", usage: null, content: "first", reasoning_content: null, tool_calls: [] },
+      { type: "done", finish_reason: "stop", usage: null, content: "second", reasoning_content: null, tool_calls: [] },
+    ]);
+    const events: EngineRuntimeEvent[] = [];
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry(), prefix);
+
+    await engine.runTurn("hello", getMode("agent"), { onRuntimeEvent: async event => { events.push(event); } });
+    await engine.runTurn("please use rare_reader", getMode("agent"), { onRuntimeEvent: async event => { events.push(event); } });
+
+    expect(getRegistry().listActive().map(tool => tool.name)).toContain("rare_reader");
+    expect(client.calls).toHaveLength(2);
+    expect(client.calls[0].tools).toEqual(pinnedSchemas);
+    expect(client.calls[1].tools).toEqual(pinnedSchemas);
+    expect(client.calls[1].tools.map((schema: any) => schema.function.name)).toContain("rare_reader");
+    const prefixEvents = events.filter(event => event.type === "prefix_pinned");
+    expect(prefixEvents.map(event => (event.data as any).hash)).toEqual([prefix.hash, prefix.hash]);
+    const apiEvents = events.filter(event => event.type === "api_call_start");
+    expect(apiEvents.every(event => (event.data as any).prefix_hash === prefix.hash)).toBe(true);
+  });
+
+  it("rejects inactive tools at dispatch even when they are present in the stable schema prefix", async () => {
+    getRegistry().register({
+      name: "rare_reader",
+      description: "rare_reader deferred context trigger",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      deferLoading: true,
+      execute: async () => "rare",
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const prefix = new ImmutablePrefix({
+      systemPrompt: "system",
+      toolSchemas: getRegistry().toOpenAISchemas(),
+    });
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "rare_reader", arguments: {} }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry(), prefix);
+
+    const result = await engine.runTurn("call hidden helper directly", getMode("agent"));
+
+    expect(client.calls[0].tools.map((schema: any) => schema.function.name)).toContain("rare_reader");
+    expect(result.tool_results[0]).toMatchObject({
+      name: "rare_reader",
+      is_error: true,
+    });
+    expect(result.tool_results[0].content).toContain("not active");
+  });
+
   it("records errored tool executions in the turn result", async () => {
     getRegistry().register({
       name: "fail_tool",
@@ -1194,14 +1338,75 @@ describe("engine", () => {
     const result = compactor.compact(history);
 
     const boundary = session.messages.find(message => message.name === "context_compaction_boundary");
+    const summary = session.messages.find(message => message.name === "context_summary");
+    const projectedMessages = projectMessagesForRequest(session.messages);
     expect(result.boundary_id).toBeTruthy();
     expect(result.removed_messages).toBeGreaterThan(0);
     expect(boundary?.role).toBe("system");
+    expect(summary?.role).toBe("system");
     expect(boundary?.content).toContain("[Context compaction boundary]");
     expect(boundary?.content).toContain(`boundary_id: ${result.boundary_id}`);
+    expect(boundary?.content).toContain("preserve_from_index:");
     expect(boundary?.content).toContain("removed_messages:");
     expect(boundary?.content).toContain("recovery:");
-    expect(result.actions.some(action => action.startsWith("summarizeOld:"))).toBe(true);
+    expect(summary?.content).toContain("[Earlier conversation summarized");
+    expect(result.actions.some(action => action.includes("summary boundary appended"))).toBe(true);
+    expect(projectedMessages.some(message => message.role === "user" && message.content?.includes("old user 0"))).toBe(false);
+    expect(projectedMessages.some(message => message.role === "user" && message.content?.includes("old user 15"))).toBe(true);
+  });
+
+  it("keeps historical tool results intact while compacting the request projection", () => {
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    history.addUser("inspect");
+    history.addAssistant("calling tool", [{ id: "call_1", name: "read", arguments: { path: "big.txt" } }], null);
+    const toolPayload = "A".repeat(1200);
+    history.addToolResult({ tool_call_id: "call_1", name: "read", content: toolPayload, is_error: false });
+    for (let i = 0; i < 8; i++) {
+      history.addUser(`follow up ${i}`);
+      history.addAssistant(`answer ${i}`);
+    }
+
+    const compactor = new ContextCompactor({ ...testConfig(), context_limit: 120 });
+    compactor.compact(history);
+
+    const toolMessage = session.messages.find(message => message.role === "tool" && message.tool_call_id === "call_1");
+    const summary = session.messages.find(message => message.name === "context_summary");
+    expect(toolMessage?.content).toBe(toolPayload);
+    expect(summary?.content).toContain("tool read [ok]");
+    expect(summary?.content).toContain("AAA");
+  });
+
+  it("emits prefix_invalidated after compaction and sends a projected request", async () => {
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    for (let i = 0; i < 16; i++) {
+      history.addUser(`old user ${i} ${"x".repeat(240)}`);
+      history.addAssistant(`old assistant ${i}`);
+    }
+    const client = new FakeClient([
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const events: EngineRuntimeEvent[] = [];
+    const engine = new Engine({ ...testConfig(), context_limit: 100 }, session, history, client as any, getRegistry());
+
+    await engine.runTurn("go", getMode("agent"), {
+      onRuntimeEvent: async (event) => { events.push(event); },
+    });
+
+    const invalidation = events.find(event => event.type === "prefix_invalidated");
+    const requestMessages = (client.calls[0]?.messages || []) as Array<{ role?: string; content?: string; name?: string }>;
+    expect(invalidation).toMatchObject({
+      type: "prefix_invalidated",
+      data: { reason: "context_compaction" },
+    });
+    expect(requestMessages.some(message => message.name === "context_compaction_boundary")).toBe(true);
+    expect(requestMessages.some(message => message.name === "context_summary")).toBe(true);
+    expect(requestMessages.some(message => message.role === "user" && message.content?.includes("old user 0"))).toBe(false);
+    expect(requestMessages.some(message => message.role === "user" && message.content?.includes("old user 15"))).toBe(true);
+    expect(requestMessages.some(message => message.role === "user" && message.content === "go")).toBe(true);
   });
 
   it("blocks tool paths that escape the workspace boundary", async () => {
@@ -1255,6 +1460,35 @@ describe("engine", () => {
 
     expect(approvalRequests).toBe(1);
     expect(result.tool_results[0].content).toContain("denied");
+  });
+
+  it("does not request approval for sandbox ask paths while running in yolo mode", async () => {
+    registerFileTools();
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "write", arguments: { path: "inside.txt", content: "x" } }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    let approvalRequests = 0;
+    const engine = new Engine({
+      ...testConfig(),
+      mode: "yolo",
+      approval_policy: "untrusted",
+      trusted_workspaces: [],
+    }, session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("yolo"), {
+      requestApproval: async () => {
+        approvalRequests++;
+        return false;
+      },
+    });
+
+    expect(approvalRequests).toBe(0);
+    expect(result.tool_results[0]).toMatchObject({ name: "write", is_error: false });
+    expect(readFileSync(join(tmp, "inside.txt"), "utf-8")).toBe("x");
   });
 
   it("blocks tool execution when a PreToolUse hook denies it", async () => {

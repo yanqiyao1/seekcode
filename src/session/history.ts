@@ -2,6 +2,7 @@
 
 import type { Message, Session, ToolCall, ToolResult } from "./types.js";
 import { createSession } from "./types.js";
+import { estimateMessagesTokens } from "../engine/compact.js";
 
 export class ConversationHistory {
   session: Session;
@@ -52,18 +53,7 @@ export class ConversationHistory {
   }
 
   approximateTokenCount(): number {
-    let total = 0;
-    for (const msg of this.session.messages) {
-      let text = msg.content || "";
-      if (msg.reasoning_content) text += msg.reasoning_content;
-      if (msg.tool_calls) {
-        for (const tc of msg.tool_calls) {
-          text += tc.name + JSON.stringify(tc.arguments);
-        }
-      }
-      total += text.length;
-    }
-    return Math.ceil(total / 4);
+    return estimateMessagesTokens(this.session.messages);
   }
 
   clear(): void {

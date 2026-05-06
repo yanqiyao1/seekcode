@@ -6,7 +6,7 @@ import type { Config } from "../config.js";
 import type { ConversationHistory } from "../session/history.js";
 import type { Message } from "../session/types.js";
 import type { CapacityDecision, GuardrailAction } from "./capacity.js";
-import { ContextCompactor, type CompactionResult } from "./compact.js";
+import { ContextCompactor, estimateMessagesTokens, projectMessagesForRequest, type CompactionResult } from "./compact.js";
 
 export type ContextLayerKind = "pinned" | "summary" | "recent" | "refresh" | "verification";
 
@@ -39,7 +39,7 @@ export class LayeredContextManager {
   }
 
   inspect(history: ConversationHistory): ContextLayer[] {
-    const messages = history.session.messages;
+    const messages = projectMessagesForRequest(history.session.messages);
     const refresh = messages.filter(message => isContextMarker(message, "refresh"));
     const verification = messages.filter(message => isContextMarker(message, "verification"));
     const summary = messages.filter(message => isContextMarker(message, "summary"));
@@ -56,7 +56,7 @@ export class LayeredContextManager {
 
   apply(history: ConversationHistory, decision: CapacityDecision, workspacePath: string): ContextIntervention | null {
     if (!this.config.context_refresh_enabled || decision.action === "no_intervention") return null;
-    const before = history.approximateTokenCount();
+    const before = estimateMessagesTokens(projectMessagesForRequest(history.session.messages));
     let injected: string | undefined;
     let compaction: CompactionResult | undefined;
 
@@ -74,7 +74,7 @@ export class LayeredContextManager {
       risk: decision.risk,
       reason: decision.reason,
       tokens_before: before,
-      tokens_after: history.approximateTokenCount(),
+      tokens_after: estimateMessagesTokens(projectMessagesForRequest(history.session.messages)),
       layers: this.inspect(history),
       injected_message: injected,
       compaction,

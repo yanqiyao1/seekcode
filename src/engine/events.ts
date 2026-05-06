@@ -4,6 +4,7 @@ import type { Message, ToolCall, ToolResult } from "../session/types.js";
 import type { ToolProgress, ToolRenderedResult } from "../tools/base.js";
 import type { ToolStats } from "../tools/registry.js";
 import type { ContextIntervention } from "./context-manager.js";
+import type { PrefixMetadata } from "./prefix.js";
 
 export interface ApprovalAuditEventData {
   tool: string;
@@ -20,6 +21,19 @@ export interface HookEventData {
   [key: string]: unknown;
 }
 
+export interface PrefixInvalidatedEventData {
+  reason: string;
+  boundary_id?: string;
+  compaction?: {
+    actions: string[];
+    finalTokens: number;
+    original_tokens?: number;
+    removed_messages?: number;
+    preserved_messages?: number;
+    summary_message_name?: string;
+  };
+}
+
 export interface ToolResultRuntimeEvent extends EngineRuntimeEventBase<"tool_result", ToolResult> {
   preview: string;
   rendered?: ToolRenderedResult;
@@ -34,7 +48,9 @@ export interface ToolProgressRuntimeEvent extends EngineRuntimeEventBase<"tool_p
 }
 
 export interface EngineRuntimeEventMap {
-  api_call_start: Record<string, never>;
+  api_call_start: { prefix_hash?: string; tool_schema_count?: number };
+  prefix_pinned: PrefixMetadata;
+  prefix_invalidated: PrefixInvalidatedEventData;
   thinking_delta: { text: string };
   content_delta: { text: string };
   tool_call_begin: { name: string; tool_call_id?: string; index?: number };

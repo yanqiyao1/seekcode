@@ -82,6 +82,7 @@ export interface Session {
   cumulative_cost: number;
   workspace_path: string;
   artifact_index: Record<string, string[]>;
+  prefix_hash?: string;
 }
 
 export function createSession(opts?: Partial<Session>): Session {
@@ -99,6 +100,7 @@ export function createSession(opts?: Partial<Session>): Session {
     cumulative_cost: 0,
     workspace_path: process.cwd(),
     artifact_index: {},
+    prefix_hash: undefined,
     ...opts,
   };
 }

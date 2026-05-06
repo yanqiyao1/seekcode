@@ -15,6 +15,8 @@ import { runAutoDiagnostics } from "../tools/diagnostics.js";
 import { fireHooks } from "./hooks.js";
 import { applyToolResultBudget } from "./tool-result-budget.js";
 import { emitRuntimeEvent } from "./events.js";
+import { ImmutablePrefix, PrefixManager, stripPinnedPrefixMessages } from "./prefix.js";
+import { estimateMessagesTokens, projectMessagesForRequest } from "./compact.js";
 
 export type { UICallbacks };
 
@@ -38,21 +40,34 @@ export class Engine {
   history: ConversationHistory;
   client: DeepSeekClient;
   tools: ToolRegistry;
+  readonly prefixManager: PrefixManager;
   interrupted = false;
   private capacity: CapacityController;
   private contextManager: LayeredContextManager;
 
   constructor(
     config: Config, session: Session, history: ConversationHistory,
-    client: DeepSeekClient, tools: ToolRegistry,
+    client: DeepSeekClient, tools: ToolRegistry, prefix?: ImmutablePrefix,
   ) {
     this.config = config;
     this.session = session;
     this.history = history;
     this.client = client;
     this.tools = tools;
+    this.prefixManager = new PrefixManager(prefix ?? new ImmutablePrefix({
+      systemPrompt: firstPlainSystemMessage(history.getMessages())?.content || "",
+      toolSchemas: tools.toOpenAISchemas({ activeOnly: false }),
+    }));
     this.capacity = new CapacityController();
     this.contextManager = new LayeredContextManager(config);
+  }
+
+  get prefix(): ImmutablePrefix {
+    return this.prefixManager.prefix;
+  }
+
+  set prefix(prefix: ImmutablePrefix) {
+    this.prefixManager.replace(prefix);
   }
 
   interrupt(): void { this.interrupted = true; }
@@ -87,13 +102,9 @@ export class Engine {
       if (autoActivatedTools.length) {
         await emitRuntimeEvent(callbacks, { type: "tool_catalog_auto_activate", data: { tools: autoActivatedTools, source: "user_input" } });
       }
-      const modeTools = mode.filterTools(this.tools.listActive());
-      const allowedToolNames = new Set(modeTools.map(tool => tool.name));
-      const schemas = this.tools.toOpenAISchemas({ activeOnly: true })
-        .filter(schema => {
-          const name = ((schema as any).function || {}).name;
-          return typeof name === "string" && allowedToolNames.has(name);
-        });
+      await emitRuntimeEvent(callbacks, { type: "prefix_pinned", data: this.prefix.metadata });
+      const schemas = this.prefix.toolSchemas();
+      const allowedToolNames = new Set(mode.filterTools(this.tools.listActive()).map(tool => tool.name));
 
       let iterations = 0;
       let lastUsage: UsageTelemetry | null = null;
@@ -123,14 +134,36 @@ export class Engine {
       while (iterations < this.config.max_turns) {
         if (this.interrupted) break;
         iterations++;
+        const approvalPolicy = effectiveApprovalPolicy(this.config);
 
-        const capacityDecision = this.capacity.observe(this.history.approximateTokenCount(), this.config.context_limit);
+        const projectedTokens = this.requestTokenCount();
+        const capacityDecision = this.capacity.observe(projectedTokens, this.config.context_limit);
         const intervention = this.contextManager.apply(this.history, capacityDecision, this.session.workspace_path);
         if (intervention) {
           await emitRuntimeEvent(callbacks, { type: "context_intervention", data: intervention });
+          if (intervention.compaction?.prefix_invalidated) {
+            await emitRuntimeEvent(callbacks, {
+              type: "prefix_invalidated",
+              data: {
+                reason: intervention.compaction.prefix_invalidation_reason || "context_compaction",
+                boundary_id: intervention.compaction.boundary_id,
+                compaction: {
+                  actions: intervention.compaction.actions,
+                  finalTokens: intervention.compaction.finalTokens,
+                  original_tokens: intervention.compaction.original_tokens,
+                  removed_messages: intervention.compaction.removed_messages,
+                  preserved_messages: intervention.compaction.preserved_messages,
+                  summary_message_name: intervention.compaction.summary_message_name,
+                },
+              },
+            });
+          }
         }
 
-        await emitRuntimeEvent(callbacks, { type: "api_call_start", data: {} });
+        await emitRuntimeEvent(callbacks, {
+          type: "api_call_start",
+          data: { prefix_hash: this.prefix.hash, tool_schema_count: schemas.length },
+        });
         const response = await this.callApi(schemas, callbacks, options.signal);
         lastUsage = response.usage;
         totalUsage = mergeUsage(totalUsage, response.usage);
@@ -167,6 +200,17 @@ export class Engine {
             await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: err.slice(0, 200) });
             continue;
           }
+          if (!this.prefix.hasTool(tc.name) || !allowedToolNames.has(tc.name)) {
+            const err = `Tool '${tc.name}' is not active in the current mode or prefix. Enable it explicitly if needed.`;
+            const tr: ToolResult = {
+              tool_call_id: tc.id, name: tc.name, content: err, is_error: true,
+            };
+            recordToolResult(tr);
+            turnToolCalls.push(tc);
+            turnToolResults.push(tr);
+            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: err.slice(0, 200) });
+            continue;
+          }
 
           const ctx: ApprovalContext = {
             tool_name: tc.name, tool_args: tc.arguments,
@@ -187,18 +231,18 @@ export class Engine {
           }
 
           let approved: boolean;
-          if (sandbox.decision === "ask" && this.config.approval_policy !== "never") {
+          if (sandbox.decision === "ask" && approvalPolicy !== "never") {
             approved = await callbacks?.requestApproval?.(
               tc.name,
               tc.arguments,
               `Sandbox approval required: ${sandbox.reason}\n\nArguments: ${JSON.stringify(tc.arguments)}`,
             ) ?? false;
           } else {
-            approved = sandbox.decision === "allow" && this.config.approval_policy === "never"
+            approved = sandbox.decision === "allow" && approvalPolicy === "never"
               ? true
               : await mode.checkPermission(ctx, callbacks);
           }
-          if (sandbox.decision === "ask" && this.config.approval_policy === "never") approved = true;
+          if (sandbox.decision === "ask" && approvalPolicy === "never") approved = true;
           await emitRuntimeEvent(callbacks, { type: "approval_audit", data: { tool: tc.name, decision: approved ? "allow" : "deny", reason: sandbox.reason } });
           if (!approved) {
             const deny = `Tool '${tc.name}' was denied.`;
@@ -387,7 +431,7 @@ export class Engine {
     let usage: UsageTelemetry | null = null;
 
     for await (const event of this.client.send(
-      this.history.getMessages(), schemas.length ? schemas : null,
+      this.requestMessages(), schemas.length ? schemas : null,
       { stream: true, reasoning_effort: this.config.reasoning_effort, max_tokens: this.config.max_tokens, signal },
     )) {
       if (this.interrupted) break;
@@ -428,6 +472,18 @@ export class Engine {
     return { content, reasoning_content: reasoning || null, tool_calls: toolCalls, finish_reason: finishReason, usage };
   }
 
+  private requestMessages(): Message[] {
+    const sessionMessages = projectMessagesForRequest(this.history.getMessages());
+    return [
+      ...this.prefix.toMessages(),
+      ...stripPinnedPrefixMessages(sessionMessages, this.prefix),
+    ];
+  }
+
+  requestTokenCount(): number {
+    return estimateMessagesTokens(this.requestMessages());
+  }
+
   private async maybeRunPostEditDiagnostics(toolName: string, args: Record<string, unknown>): Promise<string | null> {
     if (!this.config.lsp_auto_diagnostics) return null;
     if (!["write", "edit", "apply_patch"].includes(toolName)) return null;
@@ -442,6 +498,10 @@ export class Engine {
       return `Diagnostics failed: ${e.message}`;
     }
   }
+}
+
+function firstPlainSystemMessage(messages: Message[]): Message | null {
+  return messages.find(message => message.role === "system" && message.name == null) ?? null;
 }
 
 function extractArtifactIds(text: string): string[] {
@@ -481,6 +541,10 @@ function mergeUsage(
 
 function isUsageRecord(value: unknown): value is UsageTelemetry {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function effectiveApprovalPolicy(config: Config): Config["approval_policy"] {
+  return config.mode === "yolo" ? "never" : config.approval_policy;
 }
 
 function isAbortLikeError(error: unknown): boolean {

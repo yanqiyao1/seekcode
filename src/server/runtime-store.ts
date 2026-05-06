@@ -6,6 +6,7 @@ import { createSession, type Message, type Session, type ToolCall, type ToolResu
 import { ConversationHistory } from "../session/history.js";
 import type { Config } from "../config.js";
 import type { Engine } from "../engine/loop.js";
+import { ImmutablePrefix, type SerializedImmutablePrefix } from "../engine/prefix.js";
 import { linkArtifact } from "../artifacts/store.js";
 import { seekcodeDataPath } from "../paths.js";
 
@@ -65,6 +66,7 @@ export interface RuntimeRecord {
   turns: RuntimeTurn[];
   events: RuntimeEvent[];
   items: RuntimeItem[];
+  prefix?: ImmutablePrefix;
   abortController?: AbortController;
   activeEngine?: Engine;
 }
@@ -128,6 +130,7 @@ function ensureLoaded(): void {
           session: Session;
           thread: RuntimeThread;
           turns: RuntimeTurn[];
+          prefix?: SerializedImmutablePrefix;
         };
         const history = new ConversationHistory(raw.session);
         const interruptedTurns: RuntimeTurn[] = [];
@@ -153,6 +156,7 @@ function ensureLoaded(): void {
           turns: (raw.turns || []).map(turn => ({ ...turn, artifact_ids: turn.artifact_ids || [] })),
           events,
           items,
+          prefix: raw.prefix ? ImmutablePrefix.fromJSON(raw.prefix) : undefined,
         };
         records.set(raw.thread.id, record);
         if (interruptedTurns.length) {
@@ -232,6 +236,7 @@ function persistRecord(record: RuntimeRecord): void {
       session: record.session,
       thread: record.thread,
       turns: record.turns,
+      prefix: record.prefix?.toJSON(),
     }, null, 2), "utf-8");
   } catch {
     // keep memory state even if persistence fails
@@ -285,6 +290,12 @@ export function createRuntimeRecord(config: Config, session = createSession()): 
   return record;
 }
 
+export function setRuntimePrefix(record: RuntimeRecord, prefix: ImmutablePrefix): void {
+  record.prefix = prefix;
+  persistRecord(record);
+  appendEvent(record, "prefix.pinned", { prefix: prefix.metadata });
+}
+
 export function getRuntimeRecord(threadId: string): RuntimeRecord | undefined {
   ensureLoaded();
   return records.get(threadId);
@@ -332,6 +343,7 @@ export function forkRuntimeThread(threadId: string): RuntimeRecord | undefined {
     artifact_index: cloneJson(source.session.artifact_index || {}),
   });
   const fork = createRuntimeRecord(source.config, clonedSession);
+  if (source.prefix) fork.prefix = ImmutablePrefix.fromJSON(source.prefix.toJSON());
   fork.thread.model = source.thread.model;
   fork.thread.mode = source.thread.mode;
   fork.thread.workspace = source.thread.workspace;
@@ -346,8 +358,14 @@ export function updateRuntimeThread(threadId: string, patch: Partial<Pick<Runtim
   const record = records.get(threadId);
   if (!record) return undefined;
   Object.assign(record.thread, patch, { updated_at: new Date().toISOString() });
-  if (patch.mode) record.session.mode = patch.mode;
-  if (patch.model) record.session.model = patch.model;
+  if (patch.mode) {
+    record.session.mode = patch.mode;
+    record.config.mode = patch.mode as Config["mode"];
+  }
+  if (patch.model) {
+    record.session.model = patch.model;
+    record.config.model = patch.model;
+  }
   if (patch.workspace) record.session.workspace_path = patch.workspace;
   persistRecord(record);
   appendEvent(record, "thread.updated", { thread: record.thread });

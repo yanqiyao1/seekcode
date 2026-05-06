@@ -8,10 +8,9 @@ import type { EngineRuntimeEvent } from "../engine/events.js";
 import { getRegistry } from "../tools/registry.js";
 import { getMode } from "../modes/base.js";
 import { Engine } from "../engine/loop.js";
-import { ConversationHistory } from "../session/history.js";
 import { createSession } from "../session/types.js";
-import { buildSystemPrompt, buildToolsDescription } from "../engine/context.js";
-import { injectSkills, SkillRegistry } from "../engine/skills.js";
+import { SkillRegistry } from "../engine/skills.js";
+import { buildPinnedPrefix } from "../engine/prefix-builder.js";
 import {
   appendEvent,
   appendRuntimeItem,
@@ -24,6 +23,7 @@ import {
   listRuntimeRecords,
   replayRuntimeEvents,
   replayRuntimeItems,
+  setRuntimePrefix,
   subscribeRuntimeEvents,
   updateRuntimeThread,
   updateTurn,
@@ -81,19 +81,18 @@ export async function createSessionHandler(c: Context) {
   const session = createSession({ model: cfg.model, mode: cfg.mode });
   const record = createRuntimeRecord(cfg, session);
   ensureTools(cfg);
-  record.history.addSystem(injectSkills(
-    buildSystemPrompt(cfg, session.workspace_path || process.cwd(), buildToolsDescription(getRegistry().listAll())),
-    session.workspace_path || process.cwd(),
-    cfg.skills_dir,
-  ));
-  return c.json({ session_id: session.id, thread_id: record.thread.id });
+  const prefix = buildPinnedPrefix(cfg, session.workspace_path || process.cwd(), getRegistry());
+  session.prefix_hash = prefix.hash;
+  record.history.addSystem(prefix.systemPrompt);
+  setRuntimePrefix(record, prefix);
+  return c.json({ session_id: session.id, thread_id: record.thread.id, prefix_hash: prefix.hash });
 }
 
 export async function getSessionHandler(c: Context) {
   const id = c.req.param("session_id") || "";
   const record = getRuntimeRecordBySession(id);
   if (!record) return c.json({ error: "Session not found" }, 404);
-  return c.json({ id: record.session.id, thread_id: record.thread.id, mode: record.session.mode, model: record.session.model, message_count: record.session.messages.length });
+  return c.json({ id: record.session.id, thread_id: record.thread.id, mode: record.session.mode, model: record.session.model, message_count: record.session.messages.length, prefix_hash: record.prefix?.hash || record.session.prefix_hash });
 }
 
 export async function listSessionsHandler(c: Context) {
@@ -110,6 +109,7 @@ export async function listSessionsHandler(c: Context) {
       mode: record.session.mode,
       model: record.session.model,
       message_count: record.session.messages.length,
+      prefix_hash: record.prefix?.hash || record.session.prefix_hash,
     }));
   return c.json({ sessions });
 }
@@ -146,18 +146,17 @@ export async function createThreadHandler(c: Context) {
   });
   const record = createRuntimeRecord(cfg, session);
   ensureTools(cfg);
-  record.history.addSystem(injectSkills(
-    buildSystemPrompt(cfg, session.workspace_path, buildToolsDescription(getRegistry().listAll())),
-    session.workspace_path,
-    cfg.skills_dir,
-  ));
-  return c.json({ thread: record.thread });
+  const prefix = buildPinnedPrefix(cfg, session.workspace_path, getRegistry());
+  session.prefix_hash = prefix.hash;
+  record.history.addSystem(prefix.systemPrompt);
+  setRuntimePrefix(record, prefix);
+  return c.json({ thread: record.thread, prefix_hash: prefix.hash });
 }
 
 export async function getThreadHandler(c: Context) {
   const record = getRuntimeRecord(c.req.param("thread_id") || "");
   if (!record) return c.json({ error: "Thread not found" }, 404);
-  return c.json({ thread: record.thread, turns: record.turns, items: record.items, session: record.session });
+  return c.json({ thread: record.thread, turns: record.turns, items: record.items, session: record.session, prefix: record.prefix?.metadata });
 }
 
 export async function threadItemsHandler(c: Context) {
@@ -313,7 +312,15 @@ export async function chatHandler(c: Context) {
       appendRuntimeItem(record, "turn_input", { message }, { turnId: turn.id });
       updateTurn(record, turn, "in_progress");
       const tools = getRegistry();
-      const engine = new Engine(record.config, record.session, record.history, client, tools);
+      if (!record.prefix) {
+        const prefix = buildPinnedPrefix(record.config, record.session.workspace_path || process.cwd(), tools);
+        record.session.prefix_hash = prefix.hash;
+        if (!record.session.messages.some(item => item.role === "system" && item.content === prefix.systemPrompt)) {
+          record.history.addSystem(prefix.systemPrompt);
+        }
+        setRuntimePrefix(record, prefix);
+      }
+      const engine = new Engine(record.config, record.session, record.history, client, tools, record.prefix);
       record.activeEngine = engine;
       const mode = getMode(record.config.mode);
       const streamedToolCalls = new Set<string>();
@@ -382,6 +389,8 @@ function runtimeEventToSSE(
       return { event: "tool_progress", data: event.data };
     case "context_intervention":
       return { event: "context_intervention", data: event.data };
+    case "prefix_invalidated":
+      return { event: "prefix_invalidated", data: event.data };
     default:
       return null;
   }

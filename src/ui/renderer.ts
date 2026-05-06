@@ -270,20 +270,54 @@ export function promptSymbol(mode: string): string {
 
 // ── Diff ─────────────────────────────────────────────────────
 
-export function diffLines(oldStr: string, newStr: string, filePath?: string): string {
+export function diffLines(
+  oldStr: string,
+  newStr: string,
+  filePath?: string,
+  options: { maxLines?: number; maxChars?: number } = {},
+): string {
   const h = filePath ? p.info(`\n  ── ${filePath} ──`) : "";
   const oldLines = oldStr.split("\n");
   const newLines = newStr.split("\n");
   const max = Math.max(oldLines.length, newLines.length);
   const lines: string[] = [h];
+  const maxLines = Number.isFinite(options.maxLines) ? Math.max(1, Math.floor(options.maxLines!)) : Number.POSITIVE_INFINITY;
+  const maxChars = Number.isFinite(options.maxChars) ? Math.max(120, Math.floor(options.maxChars!)) : Number.POSITIVE_INFINITY;
+  let omittedLines = 0;
+  let visibleChars = stripAnsi(h).length;
+  const pushLine = (line: string) => {
+    lines.push(line);
+    visibleChars += stripAnsi(line).length + 1;
+  };
   for (let i = 0; i < max; i++) {
+    if (lines.length >= maxLines) {
+      omittedLines = max - i;
+      break;
+    }
     if (oldLines[i] === newLines[i]) {
-      if (oldLines[i] !== undefined) lines.push(`  ${oldLines[i]}`);
+      if (oldLines[i] !== undefined) pushLine(`  ${oldLines[i]}`);
     } else {
-      if (oldLines[i] !== undefined) lines.push(p.diffDel(`- ${oldLines[i]}`));
-      if (newLines[i] !== undefined) lines.push(p.diffAdd(`+ ${newLines[i]}`));
+      if (oldLines[i] !== undefined) {
+        if (lines.length >= maxLines) {
+          omittedLines = max - i;
+          break;
+        }
+        pushLine(p.diffDel(`- ${oldLines[i]}`));
+      }
+      if (newLines[i] !== undefined) {
+        if (lines.length >= maxLines) {
+          omittedLines = max - i;
+          break;
+        }
+        pushLine(p.diffAdd(`+ ${newLines[i]}`));
+      }
+    }
+    if (visibleChars >= maxChars) {
+      omittedLines = Math.max(0, max - i - 1);
+      break;
     }
   }
+  if (omittedLines > 0) pushLine(p.dim(`  ... (${omittedLines} more diff lines)`));
   return lines.join("\n");
 }
 

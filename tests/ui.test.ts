@@ -356,6 +356,48 @@ describe("TuiRuntimeViewModel", () => {
     expect(view.activeToolCount).toBe(0);
   });
 
+  it("replays compaction boundaries as prefix invalidation events", () => {
+    const events = sessionMessagesToRuntimeEvents([
+      {
+        role: "system",
+        content: [
+          "[Context compaction boundary]",
+          "boundary_id: compact_test",
+          "projected_tokens_before: 400",
+          "projected_tokens_after: 120",
+          "preserve_from_index: 6",
+          "removed_messages: 10",
+          "preserved_messages: 4",
+          "actions:",
+          "- summary boundary appended",
+        ].join("\n"),
+        tool_calls: null,
+        tool_call_id: null,
+        name: "context_compaction_boundary",
+        reasoning_content: null,
+      },
+      {
+        role: "system",
+        content: "[Earlier conversation summarized for boundary compact_test]\n- user: earlier",
+        tool_calls: null,
+        tool_call_id: null,
+        name: "context_summary",
+        reasoning_content: null,
+      },
+      { role: "user", content: "continue", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+    ]);
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+
+    expect(events.map(event => event.type)).toEqual(["prefix_invalidated", "user_message"]);
+    view.replayRuntimeEvents(events);
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+
+    expect(plain).toContain("Prompt cache reset");
+    expect(plain).toContain("compact_test");
+    expect(plain).toContain("continue");
+  });
+
   it("replays server runtime items without duplicating final assistant messages", () => {
     const transcript = new Transcript();
     const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
@@ -826,6 +868,26 @@ describe("InputController", () => {
     expect(mode).toBe("running");
     expect(controller.getState().prompt).toBe("b");
     expect(interrupted).toBe(1);
+  });
+
+  it("clears the current input on ctrl+c instead of treating it as exit", () => {
+    let ctrlCCount = 0;
+    const controller = new InputController({
+      mode: "idle",
+      onCtrlC: () => {
+        ctrlCCount++;
+        controller.reset({ render: false });
+        return false;
+      },
+    });
+
+    controller.handleData("hello");
+    expect(controller.getState()).toMatchObject({ value: "hello", cursor: 5 });
+
+    controller.handleData("\x03");
+
+    expect(ctrlCCount).toBe(1);
+    expect(controller.getState()).toMatchObject({ value: "", cursor: 0 });
   });
 
   it("passes picker and approval keys through the shared parser without editing text", () => {

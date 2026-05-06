@@ -8,6 +8,10 @@ import { getRegistry } from "./registry.js";
 import { diffLines } from "../ui/renderer.js";
 
 type FileToolExtras = Partial<Omit<ToolDef, "name" | "description" | "parameters" | "execute" | "permission" | "category" | "parallelOk">>;
+const FILE_DIFF_MAX_LINES = 160;
+const FILE_DIFF_MAX_CHARS = 12_000;
+const PATH_ALIASES = ["path", "file", "file_path", "filepath", "filename", "target_file", "target_path", "output_path"];
+const CONTENT_ALIASES = ["content", "text", "body", "contents", "data"];
 
 function resolvePath(path: string): string { return resolve(path); }
 
@@ -80,7 +84,7 @@ async function writeFile(args: Record<string, unknown>): Promise<string> {
       `Successfully wrote ${content.length} bytes to ${path}`,
       "",
       "[diff]",
-      diffLines(oldContent, content, path),
+      diffLines(oldContent, content, path, { maxLines: FILE_DIFF_MAX_LINES, maxChars: FILE_DIFF_MAX_CHARS }),
     ].join("\n");
   } catch (e: any) { return `Error writing file: ${e.message}`; }
 }
@@ -104,7 +108,7 @@ async function editFile(args: Record<string, unknown>): Promise<string> {
       `Successfully edited ${path}`,
       "",
       "[diff]",
-      diffLines(content, nextContent, path),
+      diffLines(content, nextContent, path, { maxLines: FILE_DIFF_MAX_LINES, maxChars: FILE_DIFF_MAX_CHARS }),
     ].join("\n");
   } catch (e: any) { return `Error editing file: ${e.message}`; }
 }
@@ -213,6 +217,39 @@ function requireString(args: Record<string, unknown>, key: string): string | nul
   return typeof value === "string" && value.trim() ? null : `${key} must be a non-empty string`;
 }
 
+function firstPresentString(args: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return undefined;
+}
+
+function firstPresentContent(args: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = args[key];
+    if (typeof value === "string") return value;
+  }
+  return undefined;
+}
+
+function normalizePathArg(args: Record<string, unknown>): Record<string, unknown> {
+  if (typeof args.path === "string" && args.path.trim()) return args;
+  const path = firstPresentString(args, PATH_ALIASES);
+  return path ? { ...args, path } : args;
+}
+
+function normalizeWriteArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const normalized = normalizePathArg(args);
+  if (typeof normalized.content === "string") return normalized;
+  const content = firstPresentContent(normalized, CONTENT_ALIASES);
+  return content !== undefined ? { ...normalized, content } : normalized;
+}
+
+function normalizeEditArgs(args: Record<string, unknown>): Record<string, unknown> {
+  return normalizePathArg(args);
+}
+
 function renderFileResult(kind: "text" | "diff") {
   return (result: string) => ({
     kind,
@@ -241,8 +278,9 @@ export function registerFileTools(): void {
     renderResult: renderFileResult("text"),
     isSearchOrReadCommand: () => ({ isSearch: false, isRead: true }),
     validateInput: (args) => {
-      const message = requireString(args, "path");
-      return message ? { ok: false, message } : { ok: true };
+      const normalized = normalizePathArg(args);
+      const message = requireString(normalized, "path");
+      return message ? { ok: false, message } : { ok: true, args: normalized };
     },
   });
   t("write", "Write content to a file.", { path: { type: "string" }, content: { type: "string" }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, ["path", "content"], writeFile, PermissionLevel.ASK, "file", false, {
@@ -250,10 +288,14 @@ export function registerFileTools(): void {
     destructive: true,
     resultKind: "diff",
     renderResult: renderFileResult("diff"),
+    maxResultSizeChars: FILE_DIFF_MAX_CHARS,
     validateInput: (args) => {
-      const pathError = requireString(args, "path");
+      const normalized = normalizeWriteArgs(args);
+      const pathError = requireString(normalized, "path");
       if (pathError) return { ok: false, message: pathError };
-      return typeof args.content === "string" ? { ok: true } : { ok: false, message: "content must be a string" };
+      return typeof normalized.content === "string"
+        ? { ok: true, args: normalized }
+        : { ok: false, message: "content must be a string" };
     },
   });
   t("edit", "Edit a file by replacing old_string with new_string.", { path: { type: "string" }, old_string: { type: "string" }, new_string: { type: "string" }, replace_all: { type: "boolean", default: false }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, ["path", "old_string", "new_string"], editFile, PermissionLevel.ASK, "file", false, {
@@ -261,12 +303,16 @@ export function registerFileTools(): void {
     destructive: true,
     resultKind: "diff",
     renderResult: renderFileResult("diff"),
+    maxResultSizeChars: FILE_DIFF_MAX_CHARS,
     validateInput: (args) => {
+      const normalized = normalizeEditArgs(args);
       for (const key of ["path", "old_string"]) {
-        const message = requireString(args, key);
+        const message = requireString(normalized, key);
         if (message) return { ok: false, message };
       }
-      return typeof args.new_string === "string" ? { ok: true } : { ok: false, message: "new_string must be a string" };
+      return typeof normalized.new_string === "string"
+        ? { ok: true, args: normalized }
+        : { ok: false, message: "new_string must be a string" };
     },
   });
   t("ls", "List directory contents.", { path: { type: "string", default: "." }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, [], ls, PermissionLevel.ALWAYS_ALLOW, "file", true, {
@@ -284,8 +330,9 @@ export function registerFileTools(): void {
     maxResultSizeChars: 80_000,
     isSearchOrReadCommand: () => ({ isSearch: true, isRead: false }),
     validateInput: (args) => {
+      const normalized = normalizePathArg(args);
       const message = requireString(args, "pattern");
-      return message ? { ok: false, message } : { ok: true };
+      return message ? { ok: false, message } : { ok: true, args: normalized };
     },
   });
   t("glob", "Find files matching a glob pattern.", { pattern: { type: "string" }, path: { type: "string", default: "." }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, ["pattern"], glob, PermissionLevel.ALWAYS_ALLOW, "file", true, {
@@ -296,8 +343,9 @@ export function registerFileTools(): void {
     maxResultSizeChars: 80_000,
     isSearchOrReadCommand: () => ({ isSearch: true, isRead: false, isList: true }),
     validateInput: (args) => {
+      const normalized = normalizePathArg(args);
       const message = requireString(args, "pattern");
-      return message ? { ok: false, message } : { ok: true };
+      return message ? { ok: false, message } : { ok: true, args: normalized };
     },
   });
 }

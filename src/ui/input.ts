@@ -680,6 +680,10 @@ export async function readInput(
       prompt,
       completionProvider: commandCompletionProvider,
       onRender: redraw,
+      onCtrlC: () => {
+        controller?.reset({ render: true });
+        return false;
+      },
       onInterrupt: () => {
         opts?.onInterrupt?.();
         return false;
