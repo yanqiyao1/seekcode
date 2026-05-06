@@ -77,7 +77,7 @@ describe("HTTP/SSE server", () => {
     );
     const app = createApp();
     const createResp = await app.request("/v1/session", { method: "POST" });
-    const { session_id } = await createResp.json();
+    const { session_id, thread_id } = await createResp.json() as { session_id: string; thread_id: string };
 
     const chatResp = await app.request(`/v1/session/${session_id}/chat`, {
       method: "POST",
@@ -85,11 +85,14 @@ describe("HTTP/SSE server", () => {
       body: JSON.stringify({ message: "read package" }),
     });
     const body = await chatResp.text();
+    const items = await (await app.request(`/v1/threads/${thread_id}/items?since_seq=0`)).json() as { items: Array<{ type: string; data: any }> };
 
     expect(body).toContain("event: tool_call");
     expect(body).toContain("event: tool_result");
     expect(body).toContain("event: content");
     expect(body).toContain("event: done");
+    expect(items.items.map(item => item.type)).toEqual(expect.arrayContaining(["user_message", "tool_call_begin", "tool_call", "tool_result", "content_delta"]));
+    expect(items.items.find(item => item.type === "tool_result")?.data).toMatchObject({ name: "read", is_error: false });
   });
 
   it("exposes session/thread runtime APIs including replay, fork, resume, and delete", async () => {

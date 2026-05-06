@@ -3,7 +3,8 @@
 import { isAbsolute, relative, resolve } from "node:path";
 import type { Config } from "../config.js";
 import type { ApprovalContext } from "./base.js";
-import { checkCommand } from "./exec-policy.js";
+import { isToolDestructive, isToolReadOnly } from "./base.js";
+import { checkCommand, isCommandReadOnly } from "./exec-policy.js";
 
 export type SandboxDecision = "allow" | "ask" | "deny";
 
@@ -14,6 +15,7 @@ export interface SandboxCheckResult {
 
 const WRITE_TOOLS = new Set(["write", "edit", "apply_patch", "github_comment", "github_close_issue", "mcp_manager"]);
 const FILE_PATH_ARGS = ["path", "target_file", "workdir", "root", "cwd", "workspace"];
+const SHELL_COMMAND_TOOLS = new Set(["bash", "task_shell_start", "task_gate_run", "task_create"]);
 const DANGEROUS_SHELL_PATTERNS = [
   /\brm\s+-rf\b/,
   /\bchmod\s+(?:-R\s+)?777\b/,
@@ -34,28 +36,31 @@ export function checkSandboxPolicy(config: Config, ctx: ApprovalContext): Sandbo
   }
 
   const trusted = isTrustedWorkspace(config, workspace);
-  if (config.sandbox_mode === "read-only" && isMutationTool(ctx.tool_name)) {
+  if (config.sandbox_mode === "read-only" && isMutationTool(ctx)) {
     return { decision: "deny", reason: "read-only sandbox blocks mutating tools" };
   }
 
-  if (ctx.tool_name === "bash") {
-    const command = String(ctx.tool_args.command || "");
-    if (config.sandbox_mode === "read-only" && !isReadOnlyShell(command)) {
+  const shellCommand = getShellCommand(ctx);
+  if (shellCommand !== null) {
+    if (config.sandbox_mode === "read-only" && !isCommandReadOnly(shellCommand)) {
       return { decision: "deny", reason: "read-only sandbox blocks shell mutations" };
     }
-    if (config.workspace_boundary && shellCommandEscapesWorkspace(command, workspace)) {
+    if (config.workspace_boundary && shellCommandEscapesWorkspace(shellCommand, workspace)) {
       return { decision: "deny", reason: `shell command escapes workspace boundary: ${workspace}` };
     }
-    const commandPolicy = checkCommand(command);
+    const commandPolicy = checkCommand(shellCommand);
     if (commandPolicy.decision === "deny") {
       return { decision: "deny", reason: `shell command blocked by policy: ${commandPolicy.justification}` };
     }
-    if (!trusted && DANGEROUS_SHELL_PATTERNS.some(pattern => pattern.test(command))) {
+    if (commandPolicy.decision === "ask") {
+      return { decision: "ask", reason: `shell command requires approval: ${commandPolicy.justification}` };
+    }
+    if (!trusted && DANGEROUS_SHELL_PATTERNS.some(pattern => pattern.test(shellCommand))) {
       return { decision: "deny", reason: "untrusted workspace blocks dangerous shell command" };
     }
   }
 
-  if (config.approval_policy === "untrusted" && !trusted && isMutationTool(ctx.tool_name)) {
+  if (config.approval_policy === "untrusted" && !trusted && isMutationTool(ctx)) {
     return { decision: "ask", reason: "mutation in untrusted workspace requires approval" };
   }
   if (config.approval_policy === "never") return { decision: "allow", reason: "approval policy never" };
@@ -70,8 +75,16 @@ export function isTrustedWorkspace(config: Config, workspacePath: string): boole
   });
 }
 
-function isMutationTool(toolName: string): boolean {
-  return WRITE_TOOLS.has(toolName);
+function isMutationTool(ctx: ApprovalContext): boolean {
+  if (isToolDestructive(ctx.tool_def, ctx.tool_args)) return true;
+  if (isToolReadOnly(ctx.tool_def, ctx.tool_args)) return false;
+  return WRITE_TOOLS.has(ctx.tool_name);
+}
+
+function getShellCommand(ctx: ApprovalContext): string | null {
+  if (!SHELL_COMMAND_TOOLS.has(ctx.tool_name)) return null;
+  const raw = ctx.tool_args.command;
+  return typeof raw === "string" && raw.trim() ? raw : null;
 }
 
 function escapesWorkspace(ctx: ApprovalContext, workspace: string): boolean {
@@ -92,14 +105,6 @@ function escapesWorkspace(ctx: ApprovalContext, workspace: string): boolean {
 function isInsideWorkspace(path: string, workspace: string): boolean {
   const rel = relative(workspace, path);
   return rel === "" || (!!rel && !rel.startsWith("..") && !rel.startsWith("/") && !/^[a-zA-Z]:/.test(rel));
-}
-
-function isReadOnlyShell(command: string): boolean {
-  const first = command.trim().split(/\s+/)[0] || "";
-  if (!["cat", "grep", "rg", "find", "ls", "pwd", "head", "tail", "wc", "git"].includes(first)) return false;
-  if (/[;&|`$()<>]/.test(command)) return false;
-  if (/\b(?:rm|mv|cp|touch|mkdir|rmdir|chmod|chown|dd|mkfs|tee|sed\s+-i)\b/.test(command)) return false;
-  return true;
 }
 
 function shellCommandEscapesWorkspace(command: string, workspace: string): boolean {

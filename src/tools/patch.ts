@@ -28,6 +28,18 @@ export function registerPatchTool(): void {
       },
       required: ["patch"],
     },
-    execute: applyPatch, permission: PermissionLevel.ASK, category: "file", parallelOk: false,
+    execute: applyPatch,
+    permission: PermissionLevel.ASK,
+    category: "file",
+    parallelOk: false,
+    destructive: true,
+    searchHint: "apply unified diff",
+    resultKind: "diff",
+    validateInput: (args) => {
+      const patch = args.patch;
+      return typeof patch === "string" && patch.trim()
+        ? { ok: true }
+        : { ok: false, message: "patch must be a non-empty string" };
+    },
   });
 }

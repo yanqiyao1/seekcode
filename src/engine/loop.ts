@@ -6,13 +6,15 @@ import type { StreamEvent, ContentDelta, ThinkingDelta, ToolCallBegin, StreamDon
 import type { BaseMode, UICallbacks } from "../modes/base.js";
 import type { ConversationHistory } from "../session/history.js";
 import type { Message, Session, ToolCall, ToolResult } from "../session/types.js";
+import { validateToolInput, type ApprovalContext } from "../tools/base.js";
 import { ToolRegistry } from "../tools/registry.js";
-import { ApprovalContext, PermissionLevel } from "../tools/base.js";
 import { CapacityController } from "./capacity.js";
 import { LayeredContextManager } from "./context-manager.js";
 import { checkSandboxPolicy } from "../tools/sandbox.js";
 import { runAutoDiagnostics } from "../tools/diagnostics.js";
 import { fireHooks } from "./hooks.js";
+import { applyToolResultBudget } from "./tool-result-budget.js";
+import { emitRuntimeEvent } from "./events.js";
 
 export type { UICallbacks };
 
@@ -80,10 +82,10 @@ export class Engine {
         this.session.messages.push(ephemeralMessage);
       }
       this.history.addUser(userInput);
-      await callbacks?.onRuntimeItem?.({ type: "user_message", data: { text: userInput } });
+      await emitRuntimeEvent(callbacks, { type: "user_message", data: { text: userInput } });
       const autoActivatedTools = this.tools.activateForContext(userInput);
       if (autoActivatedTools.length) {
-        await callbacks?.onRuntimeItem?.({ type: "tool_catalog_auto_activate", data: { tools: autoActivatedTools, source: "user_input" } });
+        await emitRuntimeEvent(callbacks, { type: "tool_catalog_auto_activate", data: { tools: autoActivatedTools, source: "user_input" } });
       }
       const modeTools = mode.filterTools(this.tools.listActive());
       const allowedToolNames = new Set(modeTools.map(tool => tool.name));
@@ -113,8 +115,7 @@ export class Engine {
           recordToolResult(tr);
           turnToolCalls.push(tc);
           turnToolResults.push(tr);
-          await callbacks?.onRuntimeItem?.({ type: "tool_result", data: tr });
-          await callbacks?.onToolExecuted?.(tc.name || "tool", tr.content);
+          await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: tr.content });
         }
       };
 
@@ -125,17 +126,16 @@ export class Engine {
         const capacityDecision = this.capacity.observe(this.history.approximateTokenCount(), this.config.context_limit);
         const intervention = this.contextManager.apply(this.history, capacityDecision, this.session.workspace_path);
         if (intervention) {
-          await callbacks?.onContextIntervention?.(intervention);
-          await callbacks?.onRuntimeItem?.({ type: "context_intervention", data: intervention });
+          await emitRuntimeEvent(callbacks, { type: "context_intervention", data: intervention });
         }
 
-        await callbacks?.onApiCallStart?.();
+        await emitRuntimeEvent(callbacks, { type: "api_call_start", data: {} });
         const response = await this.callApi(schemas, callbacks, options.signal);
         lastUsage = response.usage;
         totalUsage = mergeUsage(totalUsage, response.usage);
 
         const assistantMessage = this.history.addAssistant(response.content, response.tool_calls, response.reasoning_content);
-        await callbacks?.onRuntimeItem?.({ type: "assistant_message", data: assistantMessage });
+        await emitRuntimeEvent(callbacks, { type: "assistant_message", data: assistantMessage });
 
         if (!response.tool_calls.length) break;
 
@@ -147,13 +147,12 @@ export class Engine {
             recordToolResult(tr);
             turnToolCalls.push(tc);
             turnToolResults.push(tr);
-            await callbacks?.onRuntimeItem?.({ type: "tool_budget_exceeded", data: { tool: tc.name, budget: this.config.tool_call_budget_per_turn } });
-            await callbacks?.onRuntimeItem?.({ type: "tool_result", data: tr });
-            await callbacks?.onToolExecuted?.(tc.name, err.slice(0, 200));
+            await emitRuntimeEvent(callbacks, { type: "tool_budget_exceeded", data: { tool: tc.name, budget: this.config.tool_call_budget_per_turn } });
+            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: err.slice(0, 200) });
             this.interrupted = true;
             break;
           }
-          await callbacks?.onRuntimeItem?.({ type: "tool_call", data: tc });
+          await emitRuntimeEvent(callbacks, { type: "tool_call", data: tc });
 
           const toolDef = this.tools.lookup(tc.name);
           if (!toolDef) {
@@ -164,8 +163,7 @@ export class Engine {
             recordToolResult(tr);
             turnToolCalls.push(tc);
             turnToolResults.push(tr);
-            await callbacks?.onRuntimeItem?.({ type: "tool_result", data: tr });
-            await callbacks?.onToolExecuted?.(tc.name || "unknown_tool", err.slice(0, 200));
+            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: err.slice(0, 200) });
             continue;
           }
 
@@ -182,9 +180,8 @@ export class Engine {
             recordToolResult(tr);
             turnToolCalls.push(tc);
             turnToolResults.push(tr);
-            await callbacks?.onRuntimeItem?.({ type: "approval_audit", data: { tool: tc.name, decision: "deny", reason: sandbox.reason } });
-            await callbacks?.onRuntimeItem?.({ type: "tool_result", data: tr });
-            await callbacks?.onToolExecuted?.(tc.name, deny.slice(0, 200));
+            await emitRuntimeEvent(callbacks, { type: "approval_audit", data: { tool: tc.name, decision: "deny", reason: sandbox.reason } });
+            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: deny.slice(0, 200) });
             continue;
           }
 
@@ -201,7 +198,7 @@ export class Engine {
               : await mode.checkPermission(ctx, callbacks);
           }
           if (sandbox.decision === "ask" && this.config.approval_policy === "never") approved = true;
-          await callbacks?.onRuntimeItem?.({ type: "approval_audit", data: { tool: tc.name, decision: approved ? "allow" : "deny", reason: sandbox.reason } });
+          await emitRuntimeEvent(callbacks, { type: "approval_audit", data: { tool: tc.name, decision: approved ? "allow" : "deny", reason: sandbox.reason } });
           if (!approved) {
             const deny = `Tool '${tc.name}' was denied.`;
             const tr: ToolResult = {
@@ -210,8 +207,7 @@ export class Engine {
             recordToolResult(tr);
             turnToolCalls.push(tc);
             turnToolResults.push(tr);
-            await callbacks?.onRuntimeItem?.({ type: "tool_result", data: tr });
-            await callbacks?.onToolExecuted?.(tc.name, deny.slice(0, 200));
+            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: deny.slice(0, 200) });
             continue;
           }
 
@@ -224,7 +220,7 @@ export class Engine {
               session_id: this.session.id,
               cwd: this.session.workspace_path,
             });
-            await callbacks?.onRuntimeItem?.({ type: "hook", data: { event: "PreToolUse", tool: tc.name, ...preHook } });
+            await emitRuntimeEvent(callbacks, { type: "hook", data: { event: "PreToolUse", tool: tc.name, ...preHook } });
             if (preHook.decision === "deny") {
               const deny = `Tool '${tc.name}' was denied by hook: ${preHook.message || "no reason provided"}.`;
               const tr: ToolResult = {
@@ -233,8 +229,7 @@ export class Engine {
               recordToolResult(tr);
               turnToolResults.push(tr);
               turnToolCalls.push(tc);
-              await callbacks?.onRuntimeItem?.({ type: "tool_result", data: tr });
-              await callbacks?.onToolExecuted?.(tc.name, deny.slice(0, 200));
+              await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: deny.slice(0, 200) });
               continue;
             }
             if (preHook.modified_input) {
@@ -252,15 +247,43 @@ export class Engine {
                 recordToolResult(tr);
                 turnToolResults.push(tr);
                 turnToolCalls.push(tc);
-                await callbacks?.onRuntimeItem?.({ type: "approval_audit", data: { tool: tc.name, decision: "deny", reason: modifiedSandbox.reason } });
-                await callbacks?.onRuntimeItem?.({ type: "tool_result", data: tr });
-                await callbacks?.onToolExecuted?.(tc.name, deny.slice(0, 200));
+                await emitRuntimeEvent(callbacks, { type: "approval_audit", data: { tool: tc.name, decision: "deny", reason: modifiedSandbox.reason } });
+                await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: deny.slice(0, 200) });
                 continue;
               }
             }
+            const validation = await validateToolInput(toolDef, args, {
+              tool_name: tc.name,
+              workspace_path: this.session.workspace_path,
+            });
+            if (!validation.ok) {
+              const err = `Error: invalid input for tool '${tc.name}': ${validation.message || "validation failed"}`;
+              const tr: ToolResult = {
+                tool_call_id: tc.id, name: tc.name, content: err, is_error: true,
+              };
+              recordToolResult(tr);
+              turnToolResults.push(tr);
+              turnToolCalls.push(tc);
+              await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: err.slice(0, 200) });
+              continue;
+            }
+            if (validation.args) args = withWorkspaceDefaults(tc.name, validation.args, this.session.workspace_path);
             // Map argument names (Python snake_case → JS camelCase already handled by Zod/JSON parsing)
             const toolStart = Date.now();
-            resultContent = await toolDef.execute(args, { signal: options.signal });
+            resultContent = await toolDef.execute(args, {
+              signal: options.signal,
+              toolCallId: tc.id,
+              sessionId: this.session.id,
+              workspacePath: this.session.workspace_path,
+              onProgress: async (progress) => {
+                const rendered = toolDef.renderProgress?.(progress, args);
+                await emitRuntimeEvent(callbacks, {
+                  type: "tool_progress",
+                  data: { tool: tc.name, tool_call_id: tc.id, progress },
+                  rendered,
+                });
+              },
+            });
             let isError = resultContent.startsWith("Error:");
             if (!isError) {
               const diagnostics = await this.maybeRunPostEditDiagnostics(tc.name, args);
@@ -268,17 +291,34 @@ export class Engine {
               isError = resultContent.startsWith("Error:");
             }
 
+            const originalArtifactIds = extractArtifactIds(resultContent);
+            const budgeted = applyToolResultBudget({
+              toolName: tc.name,
+              toolCallId: tc.id,
+              content: resultContent,
+              isError,
+              sessionId: this.session.id,
+              maxChars: toolDef.maxResultSizeChars,
+            });
+            const artifactIds = [...new Set([...originalArtifactIds, ...budgeted.artifactIds])];
             const tr: ToolResult = {
-              tool_call_id: tc.id, name: tc.name, content: resultContent, is_error: isError,
+              tool_call_id: tc.id, name: tc.name, content: budgeted.content, is_error: isError,
             };
+            const rendered = toolDef.renderResult?.(budgeted.replaced ? budgeted.content : resultContent, args);
             recordToolResult(tr);
             turnToolResults.push(tr);
             turnToolCalls.push(tc);
             const stats = this.tools.recordCall(tc.name, !isError, Date.now() - toolStart);
             const degraded = isError ? this.tools.degradeIfUnhealthy(tc.name, this.config.tool_failure_degrade_threshold) : null;
-            await callbacks?.onRuntimeItem?.({ type: "tool_stats", data: { stats, degraded } });
-            await callbacks?.onRuntimeItem?.({ type: "tool_result", data: tr, artifact_ids: extractArtifactIds(resultContent) });
-            for (const id of extractArtifactIds(resultContent)) turnArtifactIds.add(id);
+            await emitRuntimeEvent(callbacks, { type: "tool_stats", data: { stats, degraded } });
+            await emitRuntimeEvent(callbacks, {
+              type: "tool_result",
+              data: tr,
+              artifact_ids: artifactIds,
+              preview: rendered?.preview ?? (budgeted.replaced ? budgeted.content : resultContent),
+              rendered,
+            });
+            for (const id of artifactIds) turnArtifactIds.add(id);
             const postHook = await fireHooks("PostToolUse", {
               tool_name: tc.name,
               tool_input: args,
@@ -286,8 +326,7 @@ export class Engine {
               session_id: this.session.id,
               cwd: this.session.workspace_path,
             });
-            await callbacks?.onRuntimeItem?.({ type: "hook", data: { event: "PostToolUse", tool: tc.name, ...postHook } });
-            await callbacks?.onToolExecuted?.(tc.name, resultContent);
+            await emitRuntimeEvent(callbacks, { type: "hook", data: { event: "PostToolUse", tool: tc.name, ...postHook } });
           } catch (e: any) {
             const err = `Error executing ${tc.name}: ${e.message}`;
             const tr: ToolResult = {
@@ -298,9 +337,8 @@ export class Engine {
             turnToolCalls.push(tc);
             const stats = this.tools.recordCall(tc.name, false, 0);
             const degraded = this.tools.degradeIfUnhealthy(tc.name, this.config.tool_failure_degrade_threshold);
-            await callbacks?.onRuntimeItem?.({ type: "tool_stats", data: { stats, degraded } });
-            await callbacks?.onRuntimeItem?.({ type: "tool_result", data: tr });
-            await callbacks?.onToolExecuted?.(tc.name, err.slice(0, 200));
+            await emitRuntimeEvent(callbacks, { type: "tool_stats", data: { stats, degraded } });
+            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: err.slice(0, 200) });
           }
         }
         if (this.interrupted) {
@@ -346,16 +384,21 @@ export class Engine {
       switch (event.type) {
         case "thinking":
           reasoning += (event as ThinkingDelta).text;
-          await callbacks?.onRuntimeItem?.({ type: "thinking_delta", data: { text: (event as ThinkingDelta).text } });
-          await callbacks?.onThinking?.((event as ThinkingDelta).text);
+          await emitRuntimeEvent(callbacks, { type: "thinking_delta", data: { text: (event as ThinkingDelta).text } });
           break;
         case "content":
           content += (event as ContentDelta).text;
-          await callbacks?.onRuntimeItem?.({ type: "content_delta", data: { text: (event as ContentDelta).text } });
-          await callbacks?.onContent?.((event as ContentDelta).text);
+          await emitRuntimeEvent(callbacks, { type: "content_delta", data: { text: (event as ContentDelta).text } });
           break;
         case "tool_call_begin":
-          await callbacks?.onToolCallStart?.((event as ToolCallBegin).name);
+          await emitRuntimeEvent(callbacks, {
+            type: "tool_call_begin",
+            data: {
+              name: (event as ToolCallBegin).name,
+              tool_call_id: (event as ToolCallBegin).tool_call_id,
+              index: (event as ToolCallBegin).index,
+            },
+          });
           break;
         case "done": {
           const done = event as StreamDone;

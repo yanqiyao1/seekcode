@@ -67,6 +67,9 @@ export function registerArtifactTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "artifact",
     parallelOk: true,
+    searchHint: "persist large evidence",
+    resultKind: "artifact",
+    concurrencySafe: true,
   });
   registry.register({
     name: "artifact_list",
@@ -76,6 +79,9 @@ export function registerArtifactTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "artifact",
     parallelOk: true,
+    readOnly: true,
+    searchHint: "list stored artifacts",
+    resultKind: "json",
   });
   registry.register({
     name: "artifact_read",
@@ -85,6 +91,11 @@ export function registerArtifactTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "artifact",
     parallelOk: true,
+    readOnly: true,
+    searchHint: "read stored artifact",
+    resultKind: "artifact",
+    maxResultSizeChars: 120_000,
+    isSearchOrReadCommand: () => ({ isSearch: false, isRead: true }),
   });
   registry.register({
     name: "artifact_link",
@@ -103,6 +114,8 @@ export function registerArtifactTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "artifact",
     parallelOk: true,
+    searchHint: "link artifact evidence",
+    resultKind: "json",
   });
   registry.register({
     name: "artifact_links",
@@ -112,5 +125,8 @@ export function registerArtifactTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "artifact",
     parallelOk: true,
+    readOnly: true,
+    searchHint: "list artifact links",
+    resultKind: "json",
   });
 }

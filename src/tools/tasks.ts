@@ -2,6 +2,7 @@
 
 import { getTaskManager, type TaskType } from "../engine/task-lifecycle.js";
 import { PermissionLevel } from "./base.js";
+import { checkCommand, isCommandReadOnly } from "./exec-policy.js";
 import { getTodoState } from "./plan.js";
 import { getRegistry } from "./registry.js";
 
@@ -11,6 +12,10 @@ function parseType(value: unknown): TaskType {
     return type as TaskType;
   }
   return "background";
+}
+
+function commandArg(args: Record<string, unknown>): string {
+  return typeof args.command === "string" ? args.command.trim() : "";
 }
 
 async function taskCreate(args: Record<string, unknown>): Promise<string> {
@@ -115,6 +120,9 @@ export function registerTaskTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "task",
     parallelOk: true,
+    searchHint: "create durable task",
+    resultKind: "task",
+    readOnly: false,
   });
   registry.register({
     name: "task_list",
@@ -124,6 +132,9 @@ export function registerTaskTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "task",
     parallelOk: true,
+    readOnly: true,
+    searchHint: "list durable tasks",
+    resultKind: "task",
   });
   registry.register({
     name: "task_read",
@@ -133,6 +144,9 @@ export function registerTaskTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "task",
     parallelOk: true,
+    readOnly: true,
+    searchHint: "read durable task",
+    resultKind: "task",
   });
   registry.register({
     name: "task_cancel",
@@ -142,6 +156,9 @@ export function registerTaskTools(): void {
     permission: PermissionLevel.ASK,
     category: "task",
     parallelOk: true,
+    destructive: true,
+    searchHint: "cancel durable task",
+    resultKind: "task",
   });
   registry.register({
     name: "task_complete",
@@ -151,6 +168,8 @@ export function registerTaskTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "task",
     parallelOk: true,
+    searchHint: "complete durable task",
+    resultKind: "task",
   });
   registry.register({
     name: "task_fail",
@@ -160,6 +179,8 @@ export function registerTaskTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "task",
     parallelOk: true,
+    searchHint: "mark task failed",
+    resultKind: "task",
   });
   registry.register({
     name: "task_gate_run",
@@ -177,5 +198,16 @@ export function registerTaskTools(): void {
     permission: PermissionLevel.ASK,
     category: "task",
     parallelOk: false,
+    checkPermissions: (ctx) => {
+      const policy = checkCommand(commandArg(ctx.tool_args));
+      if (policy.decision === "allow") return { decision: "allow" };
+      if (policy.decision === "deny") return { decision: "deny", reason: policy.justification };
+      return { decision: "ask", reason: policy.justification, description: `Gate command requires approval: ${policy.justification}` };
+    },
+    validateInput: (args) => commandArg(args) ? { ok: true } : { ok: false, message: "command must be a non-empty string" },
+    readOnly: (args) => isCommandReadOnly(commandArg(args)),
+    destructive: (args) => checkCommand(commandArg(args)).decision === "deny",
+    searchHint: "run verification gate",
+    resultKind: "task",
   });
 }

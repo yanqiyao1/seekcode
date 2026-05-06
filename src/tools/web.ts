@@ -1737,6 +1737,12 @@ export function registerWebTools(configInput?: Partial<WebConfig>): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "web",
     parallelOk: true,
+    readOnly: true,
+    searchHint: "search internet sources",
+    resultKind: "text",
+    maxResultSizeChars: 100_000,
+    isSearchOrReadCommand: () => ({ isSearch: true, isRead: false }),
+    validateInput: (args) => extractSearchQuery(args) ? { ok: true } : { ok: false, message: "query is required" },
   });
   r.register({
     name: "web_fetch",
@@ -1757,6 +1763,14 @@ export function registerWebTools(configInput?: Partial<WebConfig>): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "web",
     parallelOk: true,
+    readOnly: true,
+    searchHint: "fetch webpage content",
+    resultKind: "text",
+    maxResultSizeChars: 120_000,
+    isSearchOrReadCommand: () => ({ isSearch: false, isRead: true }),
+    validateInput: (args) => (typeof args.url === "string" && args.url.trim()) || (typeof args.ref_id === "string" && args.ref_id.trim())
+      ? { ok: true }
+      : { ok: false, message: "url or ref_id is required" },
   });
   r.register({
     name: "fetch_url",
@@ -1777,5 +1791,13 @@ export function registerWebTools(configInput?: Partial<WebConfig>): void {
     category: "web",
     parallelOk: true,
     deferLoading: true,
+    readOnly: true,
+    searchHint: "fetch url content",
+    resultKind: "text",
+    maxResultSizeChars: 120_000,
+    isSearchOrReadCommand: () => ({ isSearch: false, isRead: true }),
+    validateInput: (args) => (typeof args.url === "string" && args.url.trim()) || (typeof args.ref_id === "string" && args.ref_id.trim())
+      ? { ok: true }
+      : { ok: false, message: "url or ref_id is required" },
   });
 }

@@ -4,6 +4,7 @@ import type { Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import { loadConfig, type Config } from "../config.js";
 import { DeepSeekClient } from "../client/deepseek.js";
+import type { EngineRuntimeEvent } from "../engine/events.js";
 import { getRegistry } from "../tools/registry.js";
 import { getMode } from "../modes/base.js";
 import { Engine } from "../engine/loop.js";
@@ -315,29 +316,14 @@ export async function chatHandler(c: Context) {
       const engine = new Engine(record.config, record.session, record.history, client, tools);
       record.activeEngine = engine;
       const mode = getMode(record.config.mode);
+      const streamedToolCalls = new Set<string>();
       const result = await engine.runTurn(message, mode, {
-        onThinking: async (text) => {
-          appendEvent(record, "thinking", { text }, turn.id);
-          await stream.writeSSE({ event: "thinking", data: JSON.stringify({ text }) });
-        },
-        onContent: async (text) => {
-          appendEvent(record, "content", { text }, turn.id);
-          await stream.writeSSE({ event: "content", data: JSON.stringify({ text }) });
-        },
-        onToolCallStart: async (name) => {
-          appendEvent(record, "tool_call", { name }, turn.id);
-          await stream.writeSSE({ event: "tool_call", data: JSON.stringify({ name }) });
-        },
-        onToolExecuted: async (name, preview) => {
-          appendEvent(record, "tool_result", { name, preview }, turn.id);
-          await stream.writeSSE({ event: "tool_result", data: JSON.stringify({ name, preview }) });
-        },
-        onContextIntervention: async (intervention) => {
-          appendEvent(record, "context_intervention", intervention, turn.id);
-          await stream.writeSSE({ event: "context_intervention", data: JSON.stringify(intervention) });
-        },
-        onRuntimeItem: async (item) => {
-          appendRuntimeItem(record, item.type, item.data, { turnId: turn.id, artifactIds: item.artifact_ids });
+        onRuntimeEvent: async (event) => {
+          appendRuntimeItem(record, event.type, event.data, { turnId: turn.id, artifactIds: event.artifact_ids });
+          const sse = runtimeEventToSSE(event, streamedToolCalls);
+          if (!sse) return;
+          appendEvent(record, sse.event, sse.data, turn.id);
+          await stream.writeSSE({ event: sse.event, data: JSON.stringify(sse.data) });
         },
         requestApproval: async (toolName, args) => {
           await stream.writeSSE({ event: "approval_required", data: JSON.stringify({ tool: toolName, args }) });
@@ -371,6 +357,35 @@ export async function chatHandler(c: Context) {
   });
 }
 
+function runtimeEventToSSE(
+  event: EngineRuntimeEvent,
+  streamedToolCalls: Set<string>,
+): { event: string; data: unknown } | null {
+  switch (event.type) {
+    case "thinking_delta":
+      return { event: "thinking", data: event.data };
+    case "content_delta":
+      return { event: "content", data: event.data };
+    case "tool_call_begin": {
+      const key = event.data.tool_call_id || event.data.name;
+      streamedToolCalls.add(key);
+      return { event: "tool_call", data: { name: event.data.name, tool_call_id: event.data.tool_call_id } };
+    }
+    case "tool_call": {
+      if (streamedToolCalls.has(event.data.id) || streamedToolCalls.has(event.data.name)) return null;
+      streamedToolCalls.add(event.data.id || event.data.name);
+      return { event: "tool_call", data: { name: event.data.name, tool_call_id: event.data.id } };
+    }
+    case "tool_result":
+      return { event: "tool_result", data: { name: event.data.name, preview: event.preview, artifact_ids: event.artifact_ids || [] } };
+    case "tool_progress":
+      return { event: "tool_progress", data: event.data };
+    case "context_intervention":
+      return { event: "context_intervention", data: event.data };
+    default:
+      return null;
+  }
+}
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && (error.name === "AbortError" || /aborted|abort/i.test(error.message));
 }

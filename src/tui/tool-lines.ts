@@ -16,6 +16,10 @@ export class ActiveToolLines {
     return line;
   }
 
+  current(name: string): number | undefined {
+    return this.byName.get(name)?.[0];
+  }
+
   clear(): void {
     this.byName.clear();
   }

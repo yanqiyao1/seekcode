@@ -1,6 +1,6 @@
 /** Global tool registry singleton. */
 
-import type { ToolDef } from "./base.js";
+import { isToolConcurrencySafe, isToolDestructive, isToolReadOnly, type ToolDef } from "./base.js";
 import { toolToOpenAISchema } from "./base.js";
 
 const ALWAYS_ACTIVE_TOOLS = new Set([
@@ -39,6 +39,7 @@ const ALWAYS_ACTIVE_TOOLS = new Set([
 export class ToolRegistry {
   private static instance: ToolRegistry;
   private tools: Map<string, ToolDef> = new Map();
+  private aliases: Map<string, string> = new Map();
   private schemaCache: Record<string, unknown>[] | null = null;
   private activeToolNames: Set<string> = new Set();
   private stats: Map<string, ToolStats> = new Map();
@@ -50,23 +51,32 @@ export class ToolRegistry {
   }
 
   register(tool: ToolDef): void {
-    this.tools.set(tool.name, tool);
-    if (!tool.deferLoading || ALWAYS_ACTIVE_TOOLS.has(tool.name)) {
-      this.activeToolNames.add(tool.name);
+    const normalized = normalizeToolDef(tool);
+    this.aliases.delete(normalized.name);
+    this.deleteAliasesFor(normalized.name);
+    this.tools.set(normalized.name, normalized);
+    for (const alias of normalized.aliases || []) {
+      if (alias && alias !== normalized.name) this.aliases.set(alias, normalized.name);
+    }
+    if (normalized.alwaysLoad || (!normalized.deferLoading && !normalized.shouldDefer) || ALWAYS_ACTIVE_TOOLS.has(normalized.name)) {
+      this.activeToolNames.add(normalized.name);
     }
     this.schemaCache = null;
   }
 
   unregister(name: string): void {
-    this.tools.delete(name);
-    this.activeToolNames.delete(name);
-    this.stats.delete(name);
-    this.disabledReasons.delete(name);
+    const primary = this.aliases.get(name) || name;
+    const tool = this.tools.get(primary);
+    this.tools.delete(primary);
+    this.activeToolNames.delete(primary);
+    this.stats.delete(primary);
+    this.disabledReasons.delete(primary);
+    for (const alias of tool?.aliases || []) this.aliases.delete(alias);
     this.schemaCache = null;
   }
 
   lookup(name: string): ToolDef | undefined {
-    return this.tools.get(name);
+    return this.tools.get(this.aliases.get(name) || name);
   }
 
   listAll(): ToolDef[] {
@@ -78,16 +88,18 @@ export class ToolRegistry {
   }
 
   activate(name: string): boolean {
-    if (!this.tools.has(name)) return false;
-    if (this.disabledReasons.has(name)) return false;
+    const primary = this.aliases.get(name) || name;
+    if (!this.tools.has(primary)) return false;
+    if (this.disabledReasons.has(primary)) return false;
     const before = this.activeToolNames.size;
-    this.activeToolNames.add(name);
+    this.activeToolNames.add(primary);
     if (this.activeToolNames.size !== before) this.schemaCache = null;
     return true;
   }
 
   deactivate(name: string): boolean {
-    if (!this.activeToolNames.delete(name)) return false;
+    const primary = this.aliases.get(name) || name;
+    if (!this.activeToolNames.delete(primary)) return false;
     this.schemaCache = null;
     return true;
   }
@@ -97,7 +109,7 @@ export class ToolRegistry {
     const activated: string[] = [];
     for (const tool of this.listAll()) {
       if (this.activeToolNames.has(tool.name) || this.disabledReasons.has(tool.name)) continue;
-      const haystack = `${tool.name} ${tool.description} ${tool.category}`.toLowerCase();
+      const haystack = toolSearchText(tool);
       if (!haystack.split(/[_\s-]+/).some(term => term.length >= 4 && normalized.includes(term))) continue;
       if (this.activate(tool.name)) activated.push(tool.name);
     }
@@ -105,8 +117,9 @@ export class ToolRegistry {
   }
 
   recordCall(name: string, ok: boolean, durationMs: number): ToolStats {
-    const current = this.stats.get(name) || {
-      name,
+    const primary = this.aliases.get(name) || name;
+    const current = this.stats.get(primary) || {
+      name: primary,
       calls: 0,
       failures: 0,
       consecutive_failures: 0,
@@ -122,23 +135,25 @@ export class ToolRegistry {
       current.failures++;
       current.consecutive_failures++;
     }
-    this.stats.set(name, current);
+    this.stats.set(primary, current);
     return current;
   }
 
   degradeIfUnhealthy(name: string, threshold: number): string | null {
-    const stats = this.stats.get(name);
+    const primary = this.aliases.get(name) || name;
+    const stats = this.stats.get(primary);
     if (!stats || stats.consecutive_failures < Math.max(1, threshold)) return null;
     const reason = `disabled after ${stats.consecutive_failures} consecutive failures`;
-    this.disabledReasons.set(name, reason);
-    this.deactivate(name);
+    this.disabledReasons.set(primary, reason);
+    this.deactivate(primary);
     return reason;
   }
 
   enableDegraded(name: string): boolean {
-    if (!this.tools.has(name)) return false;
-    this.disabledReasons.delete(name);
-    return this.activate(name);
+    const primary = this.aliases.get(name) || name;
+    if (!this.tools.has(primary)) return false;
+    this.disabledReasons.delete(primary);
+    return this.activate(primary);
   }
 
   toolStats(): Array<ToolStats & { active: boolean; disabled_reason?: string }> {
@@ -153,7 +168,26 @@ export class ToolRegistry {
       }),
       active: this.activeToolNames.has(tool.name),
       disabled_reason: this.disabledReasons.get(tool.name),
+      read_only: isToolReadOnly(tool),
+      destructive: isToolDestructive(tool),
+      concurrency_safe: isToolConcurrencySafe(tool),
+      search_hint: tool.searchHint,
+      max_result_size_chars: tool.maxResultSizeChars,
     }));
+  }
+
+  search(query: string, limit = 12): Array<{ tool: ToolDef; score: number }> {
+    const terms = String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
+    if (!terms.length) return [];
+    return this.listAll()
+      .map(tool => {
+        const haystack = toolSearchText(tool);
+        const score = terms.reduce((sum, term) => sum + (haystack.includes(term) ? 1 : 0), 0);
+        return { tool, score };
+      })
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score || a.tool.name.localeCompare(b.tool.name))
+      .slice(0, Math.max(1, Math.min(limit, 50)));
   }
 
   toOpenAISchemas(options: { activeOnly?: boolean } = {}): Record<string, unknown>[] {
@@ -166,6 +200,7 @@ export class ToolRegistry {
 
   clear(): void {
     this.tools.clear();
+    this.aliases.clear();
     this.activeToolNames.clear();
     this.stats.clear();
     this.disabledReasons.clear();
@@ -178,6 +213,12 @@ export class ToolRegistry {
 
   get activeSize(): number {
     return this.activeToolNames.size;
+  }
+
+  private deleteAliasesFor(primary: string): void {
+    for (const [alias, target] of this.aliases.entries()) {
+      if (target === primary) this.aliases.delete(alias);
+    }
   }
 }
 
@@ -192,4 +233,42 @@ export interface ToolStats {
 
 export function getRegistry(): ToolRegistry {
   return ToolRegistry.get();
+}
+
+const KNOWN_READ_ONLY_TOOLS = new Set([
+  "read", "ls", "search", "glob",
+  "git_status", "git_diff", "git_log", "git_branch",
+  "web_search", "web_fetch", "fetch_url",
+  "diagnostics", "lsp_diagnostics", "tool_search", "tool_stats", "tool_enable",
+  "think", "get_goal", "plan_status",
+  "task_list", "task_read", "task_shell_wait", "exec_shell_wait",
+  "artifact_list", "artifact_read", "artifact_links",
+]);
+
+const KNOWN_DESTRUCTIVE_TOOLS = new Set([
+  "write", "edit", "apply_patch", "exec_shell_cancel", "task_cancel",
+]);
+
+function normalizeToolDef(tool: ToolDef): ToolDef {
+  return {
+    ...tool,
+    deferLoading: tool.deferLoading ?? tool.shouldDefer,
+    readOnly: tool.readOnly ?? KNOWN_READ_ONLY_TOOLS.has(tool.name),
+    destructive: tool.destructive ?? KNOWN_DESTRUCTIVE_TOOLS.has(tool.name),
+    concurrencySafe: tool.concurrencySafe ?? tool.parallelOk,
+  };
+}
+
+function toolSearchText(tool: ToolDef): string {
+  return [
+    tool.name,
+    ...(tool.aliases || []),
+    tool.searchHint || "",
+    tool.description,
+    tool.category,
+    tool.resultKind || "",
+    isToolReadOnly(tool) ? "read-only readonly safe" : "",
+    isToolDestructive(tool) ? "destructive mutating mutation" : "",
+    JSON.stringify(tool.parameters),
+  ].join(" ").toLowerCase();
 }

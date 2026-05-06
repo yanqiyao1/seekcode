@@ -8,6 +8,7 @@ import { explainConfig, loadConfig, migrateProjectConfig, validateConfig } from 
 import { getMode } from "../src/modes/base.js";
 import { checkApprovalCache, clearApprovalCache, DenialReason, getApprovalCache } from "../src/tools/approval-cache.js";
 import { PermissionLevel, type ApprovalContext, type ToolDef } from "../src/tools/base.js";
+import { checkCommand } from "../src/tools/exec-policy.js";
 import { checkSandboxPolicy, isTrustedWorkspace } from "../src/tools/sandbox.js";
 
 let tmp: string;
@@ -159,6 +160,33 @@ describe("interaction modes", () => {
 
     expect(mode.filterTools(tools).map(item => item.name)).toEqual(["web_search"]);
   });
+
+  it("lets statically read-only tools participate in plan mode", async () => {
+    const mode = getMode("plan");
+    const customRead = {
+      ...tool("custom_index", PermissionLevel.ALWAYS_ALLOW, "file"),
+      readOnly: true,
+      searchHint: "custom code index",
+    };
+    const dynamicRead = {
+      ...tool("dynamic_index", PermissionLevel.ALWAYS_ALLOW, "file"),
+      readOnly: () => true,
+    };
+
+    expect(mode.filterTools([customRead, dynamicRead]).map(item => item.name)).toEqual(["custom_index"]);
+    await expect(mode.checkPermission(ctx(customRead))).resolves.toBe(true);
+    await expect(mode.checkPermission(ctx(dynamicRead))).resolves.toBe(false);
+  });
+
+  it("honors tool-level permission checks in agent mode", async () => {
+    const mode = getMode("agent");
+    const readOnlyShell = {
+      ...tool("bash", PermissionLevel.ASK, "shell"),
+      checkPermissions: () => ({ decision: "allow" as const, description: "read-only shell command" }),
+    };
+
+    await expect(mode.checkPermission(ctx(readOnlyShell, "bash", { command: "cat README.md" }))).resolves.toBe(true);
+  });
 });
 
 describe("config precedence and migration", () => {
@@ -250,6 +278,24 @@ describe("config precedence and migration", () => {
 });
 
 describe("sandbox and approval policy", () => {
+  it("classifies shell commands conservatively with read-only allowlist and flag checks", () => {
+    expect(checkCommand("cat file | grep foo")).toMatchObject({ decision: "allow" });
+    expect(checkCommand("ls -la src")).toMatchObject({ decision: "allow" });
+    expect(checkCommand("git branch --list feature/*")).toMatchObject({ decision: "allow" });
+    expect(checkCommand("node --version")).toMatchObject({ decision: "allow" });
+
+    expect(checkCommand("node -e \"require('fs').writeFileSync('x','y')\"")).toMatchObject({ decision: "ask" });
+    expect(checkCommand("python -c 'print(1)'")).toMatchObject({ decision: "ask" });
+    expect(checkCommand("npm test")).toMatchObject({ decision: "ask" });
+    expect(checkCommand("cat file > out.txt")).toMatchObject({ decision: "ask" });
+    expect(checkCommand("cat $(touch owned)")).toMatchObject({ decision: "ask" });
+    expect(checkCommand("find . -exec rm {} ;")).toMatchObject({ decision: "ask" });
+    expect(checkCommand("git branch feature")).toMatchObject({ decision: "ask" });
+
+    expect(checkCommand("find . -delete")).toMatchObject({ decision: "deny" });
+    expect(checkCommand("rm -rf /")).toMatchObject({ decision: "deny" });
+  });
+
   it("enforces workspace boundaries across root, cwd, workdir, files, and shell paths", () => {
     const config = testConfig({ workspace_boundary: true, trusted_workspaces: [tmp] });
     const writeTool = tool("write", PermissionLevel.ASK, "file");
@@ -273,10 +319,27 @@ describe("sandbox and approval policy", () => {
     expect(checkSandboxPolicy(testConfig({ sandbox_mode: "read-only" }), ctx(writeTool, "write", { path: "x" }, tmp))).toMatchObject({ decision: "deny" });
     expect(checkSandboxPolicy(testConfig({ sandbox_mode: "read-only" }), ctx(bashTool, "bash", { command: "cat file", workdir: tmp }, tmp))).toMatchObject({ decision: "allow" });
     expect(checkSandboxPolicy(testConfig({ sandbox_mode: "read-only" }), ctx(bashTool, "bash", { command: "cat file; rm file", workdir: tmp }, tmp))).toMatchObject({ decision: "deny" });
+    expect(checkSandboxPolicy(testConfig({ sandbox_mode: "read-only" }), ctx(bashTool, "bash", { command: "node -e 'console.log(1)'", workdir: tmp }, tmp))).toMatchObject({ decision: "deny" });
+    expect(checkSandboxPolicy(testConfig(), ctx(bashTool, "bash", { command: "node -e 'console.log(1)'", workdir: tmp }, tmp))).toMatchObject({ decision: "ask" });
+    expect(checkSandboxPolicy(testConfig(), ctx(tool("task_create", PermissionLevel.ALWAYS_ALLOW, "task"), "task_create", { description: "run", command: "npm test", workdir: tmp }, tmp))).toMatchObject({ decision: "ask" });
     expect(checkSandboxPolicy(testConfig({ approval_policy: "untrusted", trusted_workspaces: [] }), ctx(writeTool, "write", { path: "x" }, tmp))).toMatchObject({ decision: "ask" });
     expect(checkSandboxPolicy(testConfig({ approval_policy: "untrusted", trusted_workspaces: [tmp] }), ctx(writeTool, "write", { path: "x" }, tmp))).toMatchObject({ decision: "allow" });
     expect(checkSandboxPolicy(testConfig({ approval_policy: "never", sandbox_mode: "danger-full-access" }), ctx(bashTool, "bash", { command: "rm -rf /" }, tmp))).toMatchObject({ decision: "allow" });
     expect(checkSandboxPolicy(testConfig({ approval_policy: "never", sandbox_mode: "workspace-write" }), ctx(bashTool, "bash", { command: "rm -rf /", workdir: tmp }, tmp))).toMatchObject({ decision: "deny" });
+  });
+
+  it("uses tool capability flags when classifying sandbox mutations", () => {
+    const customWrite = {
+      ...tool("custom_overwrite", PermissionLevel.ALWAYS_ALLOW, "custom"),
+      destructive: true,
+    };
+    const customRead = {
+      ...tool("custom_reader", PermissionLevel.ALWAYS_ALLOW, "custom"),
+      readOnly: true,
+    };
+
+    expect(checkSandboxPolicy(testConfig({ sandbox_mode: "read-only" }), ctx(customWrite, "custom_overwrite", {}, tmp))).toMatchObject({ decision: "deny" });
+    expect(checkSandboxPolicy(testConfig({ sandbox_mode: "read-only" }), ctx(customRead, "custom_reader", {}, tmp))).toMatchObject({ decision: "allow" });
   });
 
   it("scopes one-shot approval cache entries by arguments and keeps always approvals broad", () => {

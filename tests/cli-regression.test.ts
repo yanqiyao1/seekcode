@@ -49,6 +49,7 @@ describe("CLI and packaging", () => {
       expect(help.stdout).toContain("Seek Code");
       expect(help.stdout).toContain("serve [options]");
       expect(help.stdout).toContain("config [options]");
+      expect(help.stdout).toContain("update [options]");
       expect(version.status).toBe(0);
       expect(version.stdout.trim()).toBe(pkg.version);
     }
@@ -78,6 +79,17 @@ describe("CLI and packaging", () => {
     expect(result.status).toBe(0);
     expect(existsSync(configPath)).toBe(true);
     expect(readFileSync(configPath, "utf-8")).toContain('api_key = ""');
+  });
+
+  it("prints update diagnostics without requiring API configuration", () => {
+    const result = runCli(srcCli, ["update", "--diagnose"], {
+      env: { DEEPSEEK_API_KEY: "", SEEKCODE_SKIP_UPDATE_CHECK: "1" },
+    });
+
+    expect(result.status).toBe(0);
+    expect(stripAnsi(result.stdout)).toContain("Installation:");
+    expect(stripAnsi(result.stdout)).toContain("Update command:");
+    expect(existsSync(join(tmp, "home", ".seekcode", "config.toml"))).toBe(false);
   });
 
   it("runs one-shot prompts with multiple words against an OpenAI-compatible endpoint", async () => {

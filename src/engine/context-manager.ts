@@ -40,10 +40,10 @@ export class LayeredContextManager {
 
   inspect(history: ConversationHistory): ContextLayer[] {
     const messages = history.session.messages;
-    const system = messages.filter(message => message.role === "system");
     const refresh = messages.filter(message => isContextMarker(message, "refresh"));
     const verification = messages.filter(message => isContextMarker(message, "verification"));
     const summary = messages.filter(message => isContextMarker(message, "summary"));
+    const system = messages.filter(message => message.role === "system" && !refresh.includes(message) && !verification.includes(message) && !summary.includes(message));
     const recent = messages.filter(message => !system.includes(message) && !refresh.includes(message) && !verification.includes(message) && !summary.includes(message)).slice(-12);
     return [
       layer("pinned", "system/tool policy", system),
@@ -132,7 +132,12 @@ function markerMessage(kind: "refresh" | "verification", content: string): Messa
 
 function isContextMarker(message: Message, kind: "refresh" | "verification" | "summary"): boolean {
   if (message.name === `context_${kind}`) return true;
-  if (kind === "summary") return typeof message.content === "string" && message.content.startsWith("[Earlier conversation summarized");
+  if (kind === "summary") {
+    if (message.name === "context_compaction_boundary" || message.name === "context_summary") return true;
+    return typeof message.content === "string"
+      && (message.content.startsWith("[Earlier conversation summarized")
+        || message.content.startsWith("[Context compaction boundary]"));
+  }
   return false;
 }
 

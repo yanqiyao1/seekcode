@@ -39,6 +39,7 @@ import { DeepSeekClient } from "./client/deepseek.js";
 import { getRegistry } from "./tools/registry.js";
 import { getMode, nextModeName, type UICallbacks } from "./modes/base.js";
 import { Engine } from "./engine/loop.js";
+import type { EngineRuntimeEvent } from "./engine/events.js";
 import { ConversationHistory } from "./session/history.js";
 import { createSession } from "./session/types.js";
 import { buildSystemPrompt, buildToolsDescription } from "./engine/context.js";
@@ -85,7 +86,7 @@ import { defaultBaseUrlForProvider, extractCachedInputTokens, parseProvider, pro
 import { addMCPServer, getMCPManager, reloadMCPManager, removeMCPServer, setMCPServerEnabled } from "./mcp/manager.js";
 import { linkArtifact } from "./artifacts/store.js";
 import { VERSION } from "./version.js";
-import { maybePromptForUpdate } from "./update-check.js";
+import { assertMinimumVersion, maybePromptForUpdate, runUpdateCommand } from "./update-check.js";
 
 function parseOptionalInt(value: string | undefined): number | undefined {
   if (value === undefined || value === "") return undefined;
@@ -739,50 +740,83 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     transcript.append("");
     lastTranscriptEvent = "other";
   };
-  const ui: UICallbacks = {
-    onApiCallStart() {
+  const renderedToolCalls = new Set<string>();
+  const renderToolCallStart = (name: string, key?: string) => {
+    if (key && renderedToolCalls.has(key)) return;
+    if (key) renderedToolCalls.add(key);
+    flushThinkingBody();
+    assistantStream.reset();
+    transcript.append(r.toolCallStatus(name, "running"));
+    activeToolLines.start(name, transcript.lines.length - 1);
+    autoFollowBottom();
+    renderScreen();
+  };
+  const renderToolResult = (name: string, preview: string) => {
+    const line = r.toolCallStatus(name, preview.startsWith("Error:") ? "error" : "success", preview);
+    const activeToolLine = activeToolLines.finish(name);
+    if (activeToolLine !== undefined) transcript.replaceLine(activeToolLine, line);
+    else transcript.append(line);
+    const diffPreview = r.toolDiffPreview(preview);
+    if (diffPreview) transcript.append(diffPreview);
+    assistantStream.reset();
+    lastTranscriptEvent = "tool";
+    autoFollowBottom();
+    renderScreen();
+  };
+  const handleRuntimeEvent = (event: EngineRuntimeEvent) => {
+    switch (event.type) {
+    case "api_call_start":
       if (!cfg.thinking_visible) return;
       ensureThinkingHeader(activeTurnStartedAt || Date.now());
-    },
-    onThinking(text) {
+      break;
+    case "thinking_delta": {
       if (!cfg.thinking_visible) return;
       if (!inThinking) separateAfterTool();
       if (!inThinking) { thinkingBuf = ""; inThinking = true; thinkingBodyFlushed = false; ensureThinkingHeader(activeTurnStartedAt || Date.now()); }
-      thinkingBuf += text;
+      thinkingBuf += event.data.text;
       updateThinkingHeader(false);
-    },
-    onContent(text) {
+      break;
+    }
+    case "content_delta":
       flushThinkingBody();
-      assistantStream.append(transcript, text);
+      assistantStream.append(transcript, event.data.text);
       lastTranscriptEvent = "content";
       autoFollowBottom();
       requestRender();
-    },
-    onToolCallStart(name) {
-      flushThinkingBody();
-      assistantStream.reset();
-      transcript.append(r.toolCallStatus(name, "running"));
-      activeToolLines.start(name, transcript.lines.length - 1);
-      autoFollowBottom();
-      renderScreen();
-    },
-    onToolExecuted(name, preview) {
-      const line = r.toolCallStatus(name, preview.startsWith("Error:") ? "error" : "success", preview);
-      const activeToolLine = activeToolLines.finish(name);
+      break;
+    case "tool_call_begin":
+      renderToolCallStart(event.data.name, event.data.tool_call_id || event.data.name);
+      break;
+    case "tool_call":
+      if (!renderedToolCalls.has(event.data.id) && !renderedToolCalls.has(event.data.name)) {
+        renderToolCallStart(event.data.name, event.data.id || event.data.name);
+      }
+      break;
+    case "tool_result":
+      renderToolResult(event.data.name, event.preview);
+      break;
+    case "tool_progress": {
+      const message = event.rendered?.preview || event.data.progress.message;
+      const line = r.toolCallStatus(event.data.tool, "running", message);
+      const activeToolLine = activeToolLines.current(event.data.tool);
       if (activeToolLine !== undefined) transcript.replaceLine(activeToolLine, line);
       else transcript.append(line);
-      const diffPreview = r.toolDiffPreview(preview);
-      if (diffPreview) transcript.append(diffPreview);
-      assistantStream.reset();
-      lastTranscriptEvent = "tool";
       autoFollowBottom();
-      renderScreen();
-    },
-    onContextIntervention(intervention) {
-      const value = intervention as { risk?: string; action?: string; reason?: string; compaction?: { message?: string } };
+      requestRender();
+      break;
+    }
+    case "context_intervention": {
+      const value = event.data as { risk?: string; action?: string; reason?: string; compaction?: { message?: string } };
       transcript.append(p.dim(`\nContext guard: ${value.risk || "unknown"} / ${value.action || "intervention"} — ${value.reason || "capacity intervention"}.\n`));
       if (value.compaction?.message) transcript.append(p.dim(value.compaction.message + "\n"));
       renderScreen();
+      break;
+    }
+    }
+  };
+  const ui: UICallbacks = {
+    onRuntimeEvent(event) {
+      handleRuntimeEvent(event);
     },
     async requestApproval(toolName, args, _description) {
       // Check permission ruleset first
@@ -915,6 +949,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         engineRunning = true;
         activeTurnStartedAt = Date.now();
         activeAbortController = new AbortController();
+        renderedToolCalls.clear();
         startGlobalInput();
         const skillInstruction = activeSkillInstruction;
         activeSkillInstruction = null;
@@ -1713,6 +1748,28 @@ program
       await maybePromptForUpdate();
       await runInteractive(cfg);
     }
+  });
+
+program.hook("preAction", async (_thisCommand, actionCommand) => {
+  assertMinimumVersion({ commandName: actionCommand.name() });
+});
+
+program
+  .command("update")
+  .description("Check for and install the latest Seek Code version")
+  .option("--check", "Only check whether an update is available")
+  .option("--diagnose", "Print installation diagnostics without checking npm")
+  .option("-y, --yes", "Install without prompting")
+  .action(async (options) => {
+    const result = await runUpdateCommand({
+      yes: options.yes,
+      checkOnly: options.check,
+      diagnoseOnly: options.diagnose,
+      stdin: process.stdin,
+      stdout: process.stdout,
+      stderr: process.stderr,
+    });
+    if (["failed", "locked", "unsupported"].includes(result)) process.exitCode = 1;
   });
 
 program

@@ -30,8 +30,32 @@ async function gitBranch(a: Record<string, unknown>): Promise<string> { return r
 
 export function registerGitTools(): void {
   const r = getRegistry();
-  r.register({ name: "git_status", description: "Show git working tree status.", parameters: { type: "object", properties: { workdir: { type: "string", default: "." } } }, execute: gitStatus, permission: PermissionLevel.ALWAYS_ALLOW, category: "git", parallelOk: true });
-  r.register({ name: "git_diff", description: "Show git diff.", parameters: { type: "object", properties: { staged: { type: "boolean", default: false }, files: { type: "string", default: "" }, workdir: { type: "string", default: "." } } }, execute: gitDiff, permission: PermissionLevel.ALWAYS_ALLOW, category: "git", parallelOk: true });
-  r.register({ name: "git_log", description: "Show recent commit history.", parameters: { type: "object", properties: { n: { type: "integer", default: 10 }, workdir: { type: "string", default: "." } } }, execute: gitLog, permission: PermissionLevel.ALWAYS_ALLOW, category: "git", parallelOk: true });
-  r.register({ name: "git_branch", description: "List local branches.", parameters: { type: "object", properties: { workdir: { type: "string", default: "." } } }, execute: gitBranch, permission: PermissionLevel.ALWAYS_ALLOW, category: "git", parallelOk: true });
+  r.register({
+    name: "git_status", description: "Show git working tree status.",
+    parameters: { type: "object", properties: { workdir: { type: "string", default: "." } } },
+    execute: gitStatus, permission: PermissionLevel.ALWAYS_ALLOW, category: "git", parallelOk: true,
+    readOnly: true, searchHint: "working tree status", resultKind: "text",
+    isSearchOrReadCommand: () => ({ isSearch: false, isRead: true, isList: true }),
+  });
+  r.register({
+    name: "git_diff", description: "Show git diff.",
+    parameters: { type: "object", properties: { staged: { type: "boolean", default: false }, files: { type: "string", default: "" }, workdir: { type: "string", default: "." } } },
+    execute: gitDiff, permission: PermissionLevel.ALWAYS_ALLOW, category: "git", parallelOk: true,
+    readOnly: true, searchHint: "diff local changes", resultKind: "diff", maxResultSizeChars: 100_000,
+    isSearchOrReadCommand: () => ({ isSearch: false, isRead: true }),
+  });
+  r.register({
+    name: "git_log", description: "Show recent commit history.",
+    parameters: { type: "object", properties: { n: { type: "integer", default: 10 }, workdir: { type: "string", default: "." } } },
+    execute: gitLog, permission: PermissionLevel.ALWAYS_ALLOW, category: "git", parallelOk: true,
+    readOnly: true, searchHint: "commit history", resultKind: "text",
+    isSearchOrReadCommand: () => ({ isSearch: false, isRead: true, isList: true }),
+  });
+  r.register({
+    name: "git_branch", description: "List local branches.",
+    parameters: { type: "object", properties: { workdir: { type: "string", default: "." } } },
+    execute: gitBranch, permission: PermissionLevel.ALWAYS_ALLOW, category: "git", parallelOk: true,
+    readOnly: true, searchHint: "list branches", resultKind: "text",
+    isSearchOrReadCommand: () => ({ isSearch: false, isRead: false, isList: true }),
+  });
 }

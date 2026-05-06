@@ -1,6 +1,7 @@
 /** Interaction modes: Plan (read-only), Agent (approval), YOLO (auto-approved). */
 
-import { PermissionLevel, type ApprovalContext, type ToolDef } from "../tools/base.js";
+import type { EngineRuntimeEvent } from "../engine/events.js";
+import { PermissionLevel, isToolStaticallyReadOnly, resolveToolPermission, type ApprovalContext, type ToolDef } from "../tools/base.js";
 
 export const MODE_NAMES = ["plan", "agent", "yolo"] as const;
 export type ModeName = typeof MODE_NAMES[number];
@@ -12,13 +13,14 @@ export interface BaseMode {
 }
 
 export interface UICallbacks {
+  onRuntimeEvent?(event: EngineRuntimeEvent): void | Promise<void>;
   onThinking?(text: string): void | Promise<void>;
   onContent?(text: string): void | Promise<void>;
   onToolCallStart?(name: string): void | Promise<void>;
   onToolExecuted?(name: string, preview: string): void | Promise<void>;
   onApiCallStart?(): void | Promise<void>;
   onContextIntervention?(intervention: unknown): void | Promise<void>;
-  onRuntimeItem?(item: { type: string; data: unknown; artifact_ids?: string[] }): void | Promise<void>;
+  onRuntimeItem?(item: EngineRuntimeEvent): void | Promise<void>;
   requestApproval?(toolName: string, args: Record<string, unknown>, description: string): Promise<boolean>;
 }
 
@@ -44,7 +46,7 @@ const PLAN_ALLOWED_TOOLS = new Set([
 function isPlanAllowedTool(tool: ToolDef): boolean {
   if (tool.category === "shell") return false;
   if (tool.permission !== PermissionLevel.ALWAYS_ALLOW) return false;
-  return PLAN_ALLOWED_TOOLS.has(tool.name);
+  return PLAN_ALLOWED_TOOLS.has(tool.name) || isToolStaticallyReadOnly(tool);
 }
 
 export class PlanMode implements BaseMode {
@@ -66,11 +68,13 @@ export class AgentMode implements BaseMode {
   filterTools(tools: ToolDef[]): ToolDef[] { return tools; }
 
   async checkPermission(ctx: ApprovalContext, callbacks?: UICallbacks): Promise<boolean> {
-    if (ctx.tool_def.permission === "always_allow") return true;
+    const toolDecision = await resolveToolPermission(ctx, callbacks);
+    if (toolDecision.decision === "allow") return true;
+    if (toolDecision.decision === "deny") return false;
     if (callbacks?.requestApproval) {
       return callbacks.requestApproval(
         ctx.tool_name, ctx.tool_args,
-        `${ctx.tool_def.description}\n\nArguments: ${JSON.stringify(ctx.tool_args)}`,
+        `${toolDecision.description || ctx.tool_def.description}\n\nArguments: ${JSON.stringify(ctx.tool_args)}`,
       );
     }
     return false;
@@ -83,11 +87,13 @@ export class YoloMode implements BaseMode {
   filterTools(tools: ToolDef[]): ToolDef[] { return tools; }
 
   async checkPermission(ctx: ApprovalContext, callbacks?: UICallbacks): Promise<boolean> {
-    if (ctx.tool_def.permission === "dangerous") {
+    const toolDecision = await resolveToolPermission(ctx, callbacks);
+    if (toolDecision.decision === "deny") return false;
+    if (ctx.tool_def.permission === PermissionLevel.DANGEROUS) {
       if (callbacks?.requestApproval) {
         return callbacks.requestApproval(
           ctx.tool_name, ctx.tool_args,
-          `DANGEROUS: ${ctx.tool_def.description}`,
+          `DANGEROUS: ${toolDecision.description || toolDecision.reason || ctx.tool_def.description}`,
         );
       }
       return false;

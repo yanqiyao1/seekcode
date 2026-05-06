@@ -1,6 +1,6 @@
 /** Tool discovery for deferred tools without sending every schema every turn. */
 
-import { PermissionLevel } from "./base.js";
+import { PermissionLevel, isToolConcurrencySafe, isToolDestructive, isToolReadOnly } from "./base.js";
 import { getRegistry } from "./registry.js";
 
 function normalize(value: unknown): string {
@@ -10,23 +10,22 @@ function normalize(value: unknown): string {
 async function toolSearch(args: Record<string, unknown>): Promise<string> {
   const query = normalize(args.query || args.q);
   if (!query.trim()) return "Error: query is required.";
-  const terms = query.split(/\s+/).filter(Boolean);
   const registry = getRegistry();
-  const matches = registry.listAll()
-    .map(tool => {
-      const haystack = normalize(`${tool.name} ${tool.description} ${tool.category} ${JSON.stringify(tool.parameters)}`);
-      const score = terms.reduce((sum, term) => sum + (haystack.includes(term) ? 1 : 0), 0);
-      return { tool, score };
-    })
-    .filter(item => item.score > 0)
-    .sort((a, b) => b.score - a.score || a.tool.name.localeCompare(b.tool.name))
-    .slice(0, 12);
+  const matches = registry.search(query, 12);
 
   if (!matches.length) return `No tools matched '${query}'.`;
   for (const { tool } of matches) registry.activate(tool.name);
   return [
     `Activated ${matches.length} matching tool(s):`,
-    ...matches.map(({ tool }) => `- ${tool.name}: ${tool.description}`),
+    ...matches.map(({ tool }) => {
+      const tags = [
+        isToolReadOnly(tool) ? "read-only" : "",
+        isToolDestructive(tool) ? "destructive" : "",
+        isToolConcurrencySafe(tool) ? "concurrent" : "",
+        tool.searchHint ? `hint: ${tool.searchHint}` : "",
+      ].filter(Boolean).join(", ");
+      return `- ${tool.name}${tags ? ` [${tags}]` : ""}: ${tool.description}`;
+    }),
   ].join("\n");
 }
 
@@ -55,6 +54,9 @@ export function registerToolSearchTool(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: true,
+    readOnly: true,
+    searchHint: "discover deferred tools",
+    resultKind: "text",
   });
   getRegistry().register({
     name: "tool_stats",
@@ -64,6 +66,9 @@ export function registerToolSearchTool(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: true,
+    readOnly: true,
+    searchHint: "inspect tool health",
+    resultKind: "json",
   });
   getRegistry().register({
     name: "tool_enable",
@@ -73,5 +78,7 @@ export function registerToolSearchTool(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: true,
+    searchHint: "reenable tool",
+    resultKind: "text",
   });
 }

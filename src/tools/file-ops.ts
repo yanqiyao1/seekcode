@@ -7,6 +7,8 @@ import { PermissionLevel, type ToolDef } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { diffLines } from "../ui/renderer.js";
 
+type FileToolExtras = Partial<Omit<ToolDef, "name" | "description" | "parameters" | "execute" | "permission" | "category" | "parallelOk">>;
+
 function resolvePath(path: string): string { return resolve(path); }
 
 function resolveFromRoot(path: string, root: string): string {
@@ -206,20 +208,96 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(out);
 }
 
+function requireString(args: Record<string, unknown>, key: string): string | null {
+  const value = args[key];
+  return typeof value === "string" && value.trim() ? null : `${key} must be a non-empty string`;
+}
+
+function renderFileResult(kind: "text" | "diff") {
+  return (result: string) => ({
+    kind,
+    title: kind === "diff" ? "File change" : "File result",
+    preview: result,
+  });
+}
+
 export function registerFileTools(): void {
   const r = getRegistry();
   const t = (
     name: string, desc: string, props: Record<string, unknown>, required: string[],
     fn: (a: Record<string, unknown>) => Promise<string>, perm: PermissionLevel, cat: string, pok: boolean,
+    extra: FileToolExtras = {},
   ) => r.register({
     name, description: desc,
     parameters: { type: "object", properties: props, required },
     execute: fn, permission: perm, category: cat, parallelOk: pok,
+    ...extra,
   });
-  t("read", "Read a file from the filesystem.", { path: { type: "string" }, root: { type: "string", description: "Optional root boundary for symlink safety." }, offset: { type: "integer", default: 0 }, limit: { type: "integer", default: 2000 } }, ["path"], readFile, PermissionLevel.ALWAYS_ALLOW, "file", true);
-  t("write", "Write content to a file.", { path: { type: "string" }, content: { type: "string" }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, ["path", "content"], writeFile, PermissionLevel.ASK, "file", false);
-  t("edit", "Edit a file by replacing old_string with new_string.", { path: { type: "string" }, old_string: { type: "string" }, new_string: { type: "string" }, replace_all: { type: "boolean", default: false }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, ["path", "old_string", "new_string"], editFile, PermissionLevel.ASK, "file", false);
-  t("ls", "List directory contents.", { path: { type: "string", default: "." }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, [], ls, PermissionLevel.ALWAYS_ALLOW, "file", true);
-  t("search", "Search for text using grep.", { pattern: { type: "string" }, path: { type: "string", default: "." }, root: { type: "string", description: "Optional root boundary for symlink safety." }, include: { type: "string", default: "" }, case_sensitive: { type: "boolean", default: true } }, ["pattern"], search, PermissionLevel.ALWAYS_ALLOW, "file", true);
-  t("glob", "Find files matching a glob pattern.", { pattern: { type: "string" }, path: { type: "string", default: "." }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, ["pattern"], glob, PermissionLevel.ALWAYS_ALLOW, "file", true);
+  t("read", "Read a file from the filesystem.", { path: { type: "string" }, root: { type: "string", description: "Optional root boundary for symlink safety." }, offset: { type: "integer", default: 0 }, limit: { type: "integer", default: 2000 } }, ["path"], readFile, PermissionLevel.ALWAYS_ALLOW, "file", true, {
+    aliases: ["file_read"],
+    searchHint: "inspect file contents",
+    readOnly: true,
+    resultKind: "text",
+    renderResult: renderFileResult("text"),
+    isSearchOrReadCommand: () => ({ isSearch: false, isRead: true }),
+    validateInput: (args) => {
+      const message = requireString(args, "path");
+      return message ? { ok: false, message } : { ok: true };
+    },
+  });
+  t("write", "Write content to a file.", { path: { type: "string" }, content: { type: "string" }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, ["path", "content"], writeFile, PermissionLevel.ASK, "file", false, {
+    searchHint: "create overwrite file",
+    destructive: true,
+    resultKind: "diff",
+    renderResult: renderFileResult("diff"),
+    validateInput: (args) => {
+      const pathError = requireString(args, "path");
+      if (pathError) return { ok: false, message: pathError };
+      return typeof args.content === "string" ? { ok: true } : { ok: false, message: "content must be a string" };
+    },
+  });
+  t("edit", "Edit a file by replacing old_string with new_string.", { path: { type: "string" }, old_string: { type: "string" }, new_string: { type: "string" }, replace_all: { type: "boolean", default: false }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, ["path", "old_string", "new_string"], editFile, PermissionLevel.ASK, "file", false, {
+    searchHint: "replace text in file",
+    destructive: true,
+    resultKind: "diff",
+    renderResult: renderFileResult("diff"),
+    validateInput: (args) => {
+      for (const key of ["path", "old_string"]) {
+        const message = requireString(args, key);
+        if (message) return { ok: false, message };
+      }
+      return typeof args.new_string === "string" ? { ok: true } : { ok: false, message: "new_string must be a string" };
+    },
+  });
+  t("ls", "List directory contents.", { path: { type: "string", default: "." }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, [], ls, PermissionLevel.ALWAYS_ALLOW, "file", true, {
+    aliases: ["list"],
+    searchHint: "list directory entries",
+    readOnly: true,
+    resultKind: "text",
+    isSearchOrReadCommand: () => ({ isSearch: false, isRead: false, isList: true }),
+  });
+  t("search", "Search for text using grep.", { pattern: { type: "string" }, path: { type: "string", default: "." }, root: { type: "string", description: "Optional root boundary for symlink safety." }, include: { type: "string", default: "" }, case_sensitive: { type: "boolean", default: true } }, ["pattern"], search, PermissionLevel.ALWAYS_ALLOW, "file", true, {
+    aliases: ["grep"],
+    searchHint: "grep text across files",
+    readOnly: true,
+    resultKind: "text",
+    maxResultSizeChars: 80_000,
+    isSearchOrReadCommand: () => ({ isSearch: true, isRead: false }),
+    validateInput: (args) => {
+      const message = requireString(args, "pattern");
+      return message ? { ok: false, message } : { ok: true };
+    },
+  });
+  t("glob", "Find files matching a glob pattern.", { pattern: { type: "string" }, path: { type: "string", default: "." }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, ["pattern"], glob, PermissionLevel.ALWAYS_ALLOW, "file", true, {
+    aliases: ["find_files"],
+    searchHint: "find files by glob",
+    readOnly: true,
+    resultKind: "text",
+    maxResultSizeChars: 80_000,
+    isSearchOrReadCommand: () => ({ isSearch: true, isRead: false, isList: true }),
+    validateInput: (args) => {
+      const message = requireString(args, "pattern");
+      return message ? { ok: false, message } : { ok: true };
+    },
+  });
 }

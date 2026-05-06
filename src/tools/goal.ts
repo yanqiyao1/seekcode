@@ -167,6 +167,9 @@ export function registerGoalTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: true,
+    readOnly: true,
+    searchHint: "read session goal",
+    resultKind: "text",
   });
 
   r.register({
@@ -184,6 +187,8 @@ export function registerGoalTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: false,
+    searchHint: "create session goal",
+    resultKind: "text",
   });
 
   r.register({
@@ -201,5 +206,7 @@ export function registerGoalTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: false,
+    searchHint: "complete session goal",
+    resultKind: "text",
   });
 }

@@ -212,6 +212,8 @@ export function registerPlanTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: false,
+    searchHint: "write task checklist",
+    resultKind: "task",
   });
 
   r.register({
@@ -239,6 +241,8 @@ export function registerPlanTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: false,
+    searchHint: "update work plan",
+    resultKind: "task",
   });
 
   r.register({
@@ -257,6 +261,9 @@ export function registerPlanTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: false,
+    searchHint: "persistent notes",
+    resultKind: "text",
+    readOnly: (args) => ["list", "get"].includes(String(args.action || "").toLowerCase()),
   });
 
   // Also add a debug command
@@ -284,5 +291,8 @@ export function registerPlanTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: true,
+    readOnly: true,
+    searchHint: "show plan state",
+    resultKind: "task",
   });
 }

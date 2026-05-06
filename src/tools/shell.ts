@@ -3,7 +3,7 @@
 import { spawn } from "node:child_process";
 import { PermissionLevel } from "./base.js";
 import { getRegistry } from "./registry.js";
-import { checkCommand } from "./exec-policy.js";
+import { checkCommand, isCommandReadOnly } from "./exec-policy.js";
 import { formatJob, getJobManager } from "./jobs.js";
 
 async function bash(args: Record<string, unknown>): Promise<string> {
@@ -109,6 +109,36 @@ function killProcessGroup(pid?: number): void {
   }, 250).unref?.();
 }
 
+function commandArg(args: Record<string, unknown>): string {
+  return typeof args.command === "string" ? args.command.trim() : "";
+}
+
+function validateCommand(args: Record<string, unknown>) {
+  return commandArg(args) ? { ok: true } : { ok: false, message: "command must be a non-empty string" };
+}
+
+function shellPermissions(args: Record<string, unknown>) {
+  const command = commandArg(args);
+  const policy = checkCommand(command);
+  if (policy.decision === "allow") {
+    return { decision: "allow" as const, description: `Read-only shell command: ${command}` };
+  }
+  if (policy.decision === "deny") {
+    return { decision: "deny" as const, reason: policy.justification, description: `Blocked shell command: ${command}` };
+  }
+  return { decision: "ask" as const, reason: policy.justification, description: `Shell command requires approval: ${policy.justification}` };
+}
+
+function shellSearchOrRead(args: Record<string, unknown>) {
+  const command = commandArg(args);
+  const first = command.split(/\s+/)[0]?.split("/").pop() || "";
+  return {
+    isSearch: ["grep", "egrep", "fgrep", "rg", "find"].includes(first),
+    isRead: ["cat", "head", "tail", "wc", "stat", "file", "git"].includes(first),
+    isList: ["ls", "find", "du"].includes(first),
+  };
+}
+
 export function registerShellTool(): void {
   const r = getRegistry();
   r.register({
@@ -124,7 +154,18 @@ export function registerShellTool(): void {
       },
       required: ["command"],
     },
-    execute: bash, permission: PermissionLevel.ASK, category: "shell", parallelOk: false,
+    execute: bash,
+    permission: PermissionLevel.ASK,
+    checkPermissions: (ctx) => shellPermissions(ctx.tool_args),
+    validateInput: (args) => validateCommand(args),
+    readOnly: (args) => isCommandReadOnly(commandArg(args)),
+    destructive: (args) => checkCommand(commandArg(args)).decision === "deny",
+    concurrencySafe: (args) => isCommandReadOnly(commandArg(args)) && args.background !== true,
+    searchHint: "run shell command",
+    resultKind: "text",
+    isSearchOrReadCommand: shellSearchOrRead,
+    category: "shell",
+    parallelOk: false,
   });
   r.register({
     name: "exec_shell_wait",
@@ -132,6 +173,9 @@ export function registerShellTool(): void {
     parameters: { type: "object", properties: { id: { type: "string" }, tail_chars: { type: "integer", default: 4000 } }, required: ["id"] },
     execute: execShellWait,
     permission: PermissionLevel.ALWAYS_ALLOW,
+    readOnly: true,
+    searchHint: "poll background shell output",
+    resultKind: "task",
     category: "shell",
     parallelOk: true,
   });
@@ -141,6 +185,8 @@ export function registerShellTool(): void {
     parameters: { type: "object", properties: { id: { type: "string" }, input: { type: "string" } }, required: ["id", "input"] },
     execute: execShellInteract,
     permission: PermissionLevel.ASK,
+    searchHint: "send stdin to job",
+    resultKind: "task",
     category: "shell",
     parallelOk: false,
     deferLoading: true,
@@ -151,6 +197,9 @@ export function registerShellTool(): void {
     parameters: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
     execute: execShellCancel,
     permission: PermissionLevel.ASK,
+    destructive: true,
+    searchHint: "cancel shell job",
+    resultKind: "task",
     category: "shell",
     parallelOk: true,
   });
@@ -160,6 +209,12 @@ export function registerShellTool(): void {
     parameters: { type: "object", properties: { command: { type: "string" }, workdir: { type: "string", default: "." }, timeout: { type: "integer", default: 120000 }, pty: { type: "boolean", default: true } }, required: ["command"] },
     execute: taskShellStart,
     permission: PermissionLevel.ASK,
+    validateInput: (args) => validateCommand(args),
+    readOnly: (args) => isCommandReadOnly(commandArg(args)),
+    destructive: (args) => checkCommand(commandArg(args)).decision === "deny",
+    searchHint: "start background shell command",
+    resultKind: "task",
+    isSearchOrReadCommand: shellSearchOrRead,
     category: "shell",
     parallelOk: true,
   });
@@ -169,6 +224,9 @@ export function registerShellTool(): void {
     parameters: { type: "object", properties: { id: { type: "string" }, tail_chars: { type: "integer", default: 4000 } }, required: ["id"] },
     execute: execShellWait,
     permission: PermissionLevel.ALWAYS_ALLOW,
+    readOnly: true,
+    searchHint: "poll task shell output",
+    resultKind: "task",
     category: "shell",
     parallelOk: true,
   });

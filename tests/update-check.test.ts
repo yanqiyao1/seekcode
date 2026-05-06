@@ -1,6 +1,36 @@
 import { PassThrough } from "node:stream";
-import { describe, expect, it } from "vitest";
-import { compareVersions, maybePromptForUpdate, shouldCheckForUpdates } from "../src/update-check.js";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  assertMinimumVersion,
+  compareVersions,
+  detectInstallation,
+  getUpdateLockPath,
+  maybePromptForUpdate,
+  runUpdateCommand,
+  shouldCheckForUpdates,
+  type InstallationInfo,
+} from "../src/update-check.js";
+
+const repoRoot = resolve(".");
+
+let tmp: string;
+let oldHome: string | undefined;
+
+beforeEach(() => {
+  tmp = mkdtempSync(join(tmpdir(), "seek-code-update-"));
+  oldHome = process.env.HOME;
+  process.env.HOME = join(tmp, "home");
+  mkdirSync(process.env.HOME, { recursive: true });
+});
+
+afterEach(() => {
+  if (oldHome === undefined) delete process.env.HOME;
+  else process.env.HOME = oldHome;
+  rmSync(tmp, { recursive: true, force: true });
+});
 
 function ttyInput(text: string): NodeJS.ReadableStream & { isTTY?: boolean } {
   const stream = new PassThrough() as NodeJS.ReadableStream & { isTTY?: boolean };
@@ -67,5 +97,97 @@ describe("update checker", () => {
     });
 
     expect(result).toBe("skipped");
+  });
+
+  it("detects source checkout installs as dev installs", async () => {
+    const info = await detectInstallation({
+      modulePath: join(repoRoot, "src", "update-check.ts"),
+      executablePath: join(repoRoot, "src", "index.ts"),
+      npmPrefix: join(tmp, "npm-prefix"),
+    });
+
+    expect(info.kind).toBe("dev");
+    expect(info.canAutoUpdate).toBe(false);
+    expect(info.updateCommand).toContain("npm run build");
+  });
+
+  it("runs local npm updates from the owning project root", async () => {
+    const projectRoot = join(tmp, "consumer");
+    const info: InstallationInfo = {
+      kind: "local",
+      packageName: "seekcode",
+      packageRoot: join(projectRoot, "node_modules", "seekcode"),
+      executablePath: join(projectRoot, "node_modules", ".bin", "seek"),
+      npmPrefix: join(tmp, "prefix"),
+      localProjectRoot: projectRoot,
+      updateCommand: "npm install seekcode@latest",
+      canAutoUpdate: true,
+      reason: "test local install",
+    };
+    const installs: Array<{ command: string; args: string[]; cwd: string }> = [];
+
+    const result = await runUpdateCommand({
+      currentVersion: "0.1.3",
+      targetVersion: "0.1.4",
+      packageName: "seekcode",
+      yes: true,
+      stdout: ttyOutput(),
+      stderr: ttyOutput(),
+      detectInstallation: async () => info,
+      installPackage: async (command, args, cwd) => {
+        installs.push({ command, args, cwd });
+        return 0;
+      },
+    });
+
+    expect(result).toBe("updated");
+    expect(installs).toEqual([{ command: "npm", args: ["install", "seekcode@latest"], cwd: projectRoot }]);
+  });
+
+  it("uses ~/.seekcode/.update.lock to prevent concurrent updates", async () => {
+    const lockPath = getUpdateLockPath();
+    mkdirSync(join(process.env.HOME!, ".seekcode"), { recursive: true });
+    writeFileSync(lockPath, JSON.stringify({ pid: 12345, started_at: new Date().toISOString() }));
+    const installs: unknown[] = [];
+    const info: InstallationInfo = {
+      kind: "global",
+      packageName: "seekcode",
+      packageRoot: join(tmp, "prefix", "lib", "node_modules", "seekcode"),
+      executablePath: join(tmp, "prefix", "bin", "seek"),
+      npmPrefix: join(tmp, "prefix"),
+      localProjectRoot: null,
+      updateCommand: "npm install -g seekcode@latest",
+      canAutoUpdate: true,
+      reason: "test global install",
+    };
+
+    const result = await runUpdateCommand({
+      currentVersion: "0.1.3",
+      targetVersion: "0.1.4",
+      packageName: "seekcode",
+      yes: true,
+      stdout: ttyOutput(),
+      stderr: ttyOutput(),
+      detectInstallation: async () => info,
+      installPackage: async (...args) => {
+        installs.push(args);
+        return 0;
+      },
+    });
+
+    expect(result).toBe("locked");
+    expect(installs).toEqual([]);
+  });
+
+  it("enforces minimum version gates except for the update command", () => {
+    expect(() => assertMinimumVersion({
+      currentVersion: "0.1.0",
+      env: { SEEKCODE_MIN_VERSION: "0.2.0" } as any,
+    })).toThrow(/seek update/i);
+    expect(() => assertMinimumVersion({
+      currentVersion: "0.1.0",
+      commandName: "update",
+      env: { SEEKCODE_MIN_VERSION: "0.2.0" } as any,
+    })).not.toThrow();
   });
 });

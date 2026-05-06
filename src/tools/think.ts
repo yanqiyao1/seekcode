@@ -14,5 +14,8 @@ export function registerThinkTool(): void {
     name: "think", description: "Think through a complex problem step by step.",
     parameters: { type: "object", properties: { thought: { type: "string" } }, required: ["thought"] },
     execute: think, permission: PermissionLevel.ALWAYS_ALLOW, category: "meta", parallelOk: true,
+    readOnly: true,
+    searchHint: "scratch reasoning note",
+    resultKind: "text",
   });
 }

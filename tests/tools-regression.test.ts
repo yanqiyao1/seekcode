@@ -9,6 +9,8 @@ import type { StreamEvent } from "../src/client/base.js";
 import type { Config } from "../src/config.js";
 import { explainConfig, loadConfig, migrateProjectConfig, migrateUserConfig, validateConfig } from "../src/config.js";
 import { calculateCost } from "../src/cost/pricing.js";
+import { ContextCompactor } from "../src/engine/compact.js";
+import type { EngineRuntimeEvent } from "../src/engine/events.js";
 import { Engine } from "../src/engine/loop.js";
 import { clearHooks, registerHook } from "../src/engine/hooks.js";
 import { getMode } from "../src/modes/base.js";
@@ -24,8 +26,7 @@ import { SideGit } from "../src/rollback/side-git.js";
 import { registerToolSearchTool } from "../src/tools/tool-search.js";
 import { registerDiagnosticsTools } from "../src/tools/diagnostics.js";
 import { registerArtifactTools } from "../src/tools/artifacts.js";
-import { clearArtifactsForTests } from "../src/artifacts/store.js";
-import { listArtifactLinks } from "../src/artifacts/store.js";
+import { clearArtifactsForTests, listArtifactLinks, readArtifact } from "../src/artifacts/store.js";
 import { clearMCPManagerForTests, getMCPManager } from "../src/mcp/manager.js";
 import { activateSkill, applySkillToUserInput, installSkillFromArchive, scanSkills, trustSkill, uninstallSkill } from "../src/engine/skills.js";
 
@@ -478,6 +479,68 @@ describe("tool catalog", () => {
     expect(await getRegistry().lookup("tool_enable")!.execute({ name: "flaky" })).toContain("Enabled");
   });
 
+  it("normalizes capability metadata, aliases, and search hints", async () => {
+    getRegistry().register({
+      name: "read",
+      aliases: ["old_read"],
+      description: "custom read helper",
+      searchHint: "notebook context lookup",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      maxResultSizeChars: 1234,
+      execute: async () => "ok",
+    });
+
+    expect(getRegistry().lookup("old_read")?.name).toBe("read");
+    expect(getRegistry().search("notebook readonly")[0]?.tool.name).toBe("read");
+    expect(getRegistry().toolStats().find(item => item.name === "read")).toMatchObject({
+      read_only: true,
+      concurrency_safe: true,
+      search_hint: "notebook context lookup",
+      max_result_size_chars: 1234,
+    });
+
+    getRegistry().register({
+      name: "read",
+      aliases: ["new_read"],
+      description: "replacement read helper",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      execute: async () => "new",
+    });
+
+    expect(getRegistry().lookup("old_read")).toBeUndefined();
+    expect(getRegistry().lookup("new_read")?.name).toBe("read");
+  });
+
+  it("tool_search activates by searchHint and renders capability tags", async () => {
+    getRegistry().register({
+      name: "rare_reader",
+      description: "rare helper",
+      searchHint: "notebook context lookup",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      readOnly: true,
+      deferLoading: true,
+      execute: async () => "ok",
+    });
+    registerToolSearchTool();
+
+    const result = await getRegistry().lookup("tool_search")!.execute({ query: "notebook" });
+
+    expect(result).toContain("rare_reader");
+    expect(result).toContain("read-only");
+    expect(result).toContain("concurrent");
+    expect(result).toContain("hint: notebook context lookup");
+    expect(getRegistry().listActive().map(tool => tool.name)).toContain("rare_reader");
+  });
+
   it("registers diagnostics and deferred ecosystem tools", () => {
     registerDiagnosticsTools();
 
@@ -631,6 +694,215 @@ describe("engine", () => {
 
     expect(previews[0]).toContain("[diff]");
     expect(previews[0]).toContain("+ new");
+  });
+
+  it("emits stable runtime events while keeping legacy UI callbacks compatible", async () => {
+    getRegistry().register({
+      name: "event_tool",
+      description: "returns ok",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      execute: async () => "event tool ok",
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      [
+        { type: "thinking", text: "think" } as any,
+        { type: "content", text: "call tool" } as any,
+        { type: "tool_call_begin", index: 0, tool_call_id: "call_1", name: "event_tool" } as any,
+        { type: "done", finish_reason: "tool_calls", usage: null, content: "call tool", reasoning_content: "think", tool_calls: [{ id: "call_1", name: "event_tool", arguments: {} }] },
+      ],
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const events: EngineRuntimeEvent[] = [];
+    const legacy: string[] = [];
+    const engine = new Engine({ ...testConfig(), reasoning_effort: "high" }, session, history, client as any, getRegistry());
+
+    await engine.runTurn("go", getMode("agent"), {
+      onRuntimeEvent: async (event) => { events.push(event); },
+      onThinking: async (text) => { legacy.push(`thinking:${text}`); },
+      onContent: async (text) => { legacy.push(`content:${text}`); },
+      onToolCallStart: async (name) => { legacy.push(`tool_call:${name}`); },
+      onToolExecuted: async (name, preview) => { legacy.push(`tool_result:${name}:${preview}`); },
+    });
+
+    expect(events.map(event => event.type)).toEqual(expect.arrayContaining([
+      "user_message",
+      "api_call_start",
+      "thinking_delta",
+      "content_delta",
+      "tool_call_begin",
+      "assistant_message",
+      "tool_call",
+      "tool_result",
+    ]));
+    expect(events.find(event => event.type === "tool_result")).toMatchObject({
+      type: "tool_result",
+      data: { name: "event_tool", content: "event tool ok", is_error: false },
+      preview: "event tool ok",
+    });
+    expect(legacy).toEqual(expect.arrayContaining([
+      "thinking:think",
+      "content:call tool",
+      "tool_call:event_tool",
+      "tool_result:event_tool:event tool ok",
+    ]));
+  });
+
+  it("stores oversized tool results as artifacts and sends only a preview to the model", async () => {
+    const largeOutput = [
+      "head-marker",
+      "A".repeat(60_000),
+      "tail-marker",
+    ].join("\n");
+    getRegistry().register({
+      name: "large_tool",
+      description: "returns a large result",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      execute: async () => largeOutput,
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "large_tool", arguments: {} }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const previews: string[] = [];
+    const runtimeArtifactIds: string[][] = [];
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      onToolExecuted: async (_name, preview) => { previews.push(preview); },
+      onRuntimeItem: async (item) => {
+        if (item.type === "tool_result") runtimeArtifactIds.push(item.artifact_ids || []);
+      },
+    });
+
+    expect(result.artifact_ids).toHaveLength(1);
+    const artifactId = result.artifact_ids[0];
+    expect(previews[0]).toContain("[Tool result stored as artifact]");
+    expect(previews[0]).toContain(`artifact_id: ${artifactId}`);
+    expect(previews[0]).not.toContain("A".repeat(20_000));
+    expect(result.tool_results[0].content).toContain("[Tool result stored as artifact]");
+    expect(result.tool_results[0].content).toContain(`artifact_id: ${artifactId}`);
+    expect(result.tool_results[0].content).toContain("artifact_read");
+    expect(result.tool_results[0].content.length).toBeLessThan(10_000);
+    expect(result.tool_results[0].content).not.toContain("A".repeat(20_000));
+    expect(runtimeArtifactIds[0]).toContain(artifactId);
+
+    const toolMessage = session.messages.find(message => message.role === "tool" && message.tool_call_id === "call_1");
+    expect(toolMessage?.content).toBe(result.tool_results[0].content);
+    expect(client.calls[1].messages.find((message: any) => message.role === "tool")?.content).toBe(result.tool_results[0].content);
+    expect(readArtifact(artifactId)).toContain(largeOutput);
+  });
+
+  it("uses per-tool result budgets instead of only the global default", async () => {
+    const output = `small-head\n${"B".repeat(800)}\nsmall-tail`;
+    getRegistry().register({
+      name: "budget_tool",
+      description: "returns a result over its own budget",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      maxResultSizeChars: 100,
+      execute: async () => output,
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "budget_tool", arguments: {} }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+
+    expect(result.artifact_ids).toHaveLength(1);
+    expect(result.tool_results[0].content).toContain("[Tool result stored as artifact]");
+    expect(result.tool_results[0].content).not.toContain("B".repeat(500));
+    expect(readArtifact(result.artifact_ids[0])).toContain(output);
+  });
+
+  it("validates tool input before execution and returns a structured tool error", async () => {
+    let executed = false;
+    getRegistry().register({
+      name: "validated_tool",
+      description: "validates input",
+      parameters: { type: "object", properties: { required_value: { type: "string" } } },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      validateInput: (args) => typeof args.required_value === "string" && args.required_value
+        ? { ok: true }
+        : { ok: false, message: "required_value is required" },
+      execute: async () => { executed = true; return "should not run"; },
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "validated_tool", arguments: {} }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "handled", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+
+    expect(executed).toBe(false);
+    expect(result.tool_results[0]).toMatchObject({ is_error: true });
+    expect(result.tool_results[0].content).toContain("required_value is required");
+    expect(client.calls[1].messages.find((message: any) => message.role === "tool")?.content).toContain("invalid input");
+  });
+
+  it("emits tool progress events and rendered result metadata", async () => {
+    getRegistry().register({
+      name: "progress_tool",
+      description: "reports progress",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      renderProgress: (progress) => ({ kind: "task", preview: `rendered ${progress.message}` }),
+      renderResult: (result) => ({ kind: "json", preview: `rendered result ${result}` }),
+      execute: async (_args, context) => {
+        await context?.onProgress?.({ message: "halfway", percent: 50 });
+        return "ok";
+      },
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "progress_tool", arguments: {} }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const events: EngineRuntimeEvent[] = [];
+    const previews: string[] = [];
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    await engine.runTurn("go", getMode("agent"), {
+      onRuntimeEvent: async (event) => { events.push(event); },
+      onToolExecuted: async (_name, preview) => { previews.push(preview); },
+    });
+
+    const progress = events.find(event => event.type === "tool_progress");
+    const resultEvent = events.find(event => event.type === "tool_result");
+    expect(progress).toMatchObject({
+      data: { tool: "progress_tool", progress: { message: "halfway", percent: 50 } },
+      rendered: { preview: "rendered halfway" },
+    });
+    expect(resultEvent).toMatchObject({ rendered: { kind: "json", preview: "rendered result ok" } });
+    expect(previews[0]).toBe("rendered result ok");
   });
 
   it("records denied tool calls in the turn result", async () => {
@@ -869,6 +1141,29 @@ describe("engine", () => {
 
     expect(interventions.length).toBeGreaterThan(0);
     expect(session.messages.some(message => message.name === "context_verification")).toBe(true);
+  });
+
+  it("adds explicit compaction boundary messages when compacting context", () => {
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    for (let i = 0; i < 16; i++) {
+      history.addUser(`old user ${i} ${"x".repeat(400)}`);
+      history.addAssistant(`old assistant ${i}`, null, "reasoning".repeat(80));
+    }
+    const compactor = new ContextCompactor({ ...testConfig(), context_limit: 100 });
+
+    const result = compactor.compact(history);
+
+    const boundary = session.messages.find(message => message.name === "context_compaction_boundary");
+    expect(result.boundary_id).toBeTruthy();
+    expect(result.removed_messages).toBeGreaterThan(0);
+    expect(boundary?.role).toBe("system");
+    expect(boundary?.content).toContain("[Context compaction boundary]");
+    expect(boundary?.content).toContain(`boundary_id: ${result.boundary_id}`);
+    expect(boundary?.content).toContain("removed_messages:");
+    expect(boundary?.content).toContain("recovery:");
+    expect(result.actions.some(action => action.startsWith("summarizeOld:"))).toBe(true);
   });
 
   it("blocks tool paths that escape the workspace boundary", async () => {
