@@ -129,6 +129,59 @@ describe("HTTP/SSE server", () => {
     expect(deleted.deleted).toBe(true);
   });
 
+  it("creates threads with overridden mode/model reflected in runtime config and prefix", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+
+    const createResp = await app.request("/v1/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "yolo", model: "deepseek-v4-flash", workspace: tmp }),
+    });
+    const created = await createResp.json() as { thread: { id: string; mode: string; model: string }; prefix_hash: string };
+    const record = getRuntimeRecord(created.thread.id)!;
+
+    expect(created.thread.mode).toBe("yolo");
+    expect(created.thread.model).toBe("deepseek-v4-flash");
+    expect(record.config.mode).toBe("yolo");
+    expect(record.config.model).toBe("deepseek-v4-flash");
+    expect(record.prefix?.hash).toBe(created.prefix_hash);
+    expect(record.prefix?.systemPrompt).toContain("## YOLO Mode");
+  });
+
+  it("rebuilds prefix when thread mode changes so prompt behavior matches runtime mode", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const createResp = await app.request("/v1/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "agent", workspace: tmp }),
+    });
+    const created = await createResp.json() as { thread: { id: string }; prefix_hash: string };
+    const recordBefore = getRuntimeRecord(created.thread.id)!;
+    const oldPrefixHash = recordBefore.prefix?.hash;
+    const oldPrompt = recordBefore.prefix?.systemPrompt || "";
+
+    const patchResp = await app.request(`/v1/threads/${created.thread.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "plan" }),
+    });
+    const patched = await patchResp.json() as { thread: { mode: string }; prefix_hash: string };
+    const recordAfter = getRuntimeRecord(created.thread.id)!;
+
+    expect(patched.thread.mode).toBe("plan");
+    expect(recordAfter.config.mode).toBe("plan");
+    expect(recordAfter.session.mode).toBe("plan");
+    expect(recordAfter.prefix?.systemPrompt).toContain("## Plan Mode");
+    expect(recordAfter.prefix?.systemPrompt).not.toBe(oldPrompt);
+    expect(recordAfter.prefix?.hash).toBe(patched.prefix_hash);
+    expect(recordAfter.prefix?.hash).not.toBe(oldPrefixHash);
+    expect(recordAfter.session.messages[0]?.role).toBe("system");
+    expect(recordAfter.session.messages[0]?.content).toBe(recordAfter.prefix?.systemPrompt);
+    expect(recordAfter.events.some(event => event.event === "prefix.pinned")).toBe(true);
+  });
+
   it("persists event/item replay and marks active turns interrupted after runtime reload", async () => {
     process.env.DEEPSEEK_API_KEY = "test";
     const app = createApp();

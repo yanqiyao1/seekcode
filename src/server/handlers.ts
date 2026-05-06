@@ -11,6 +11,7 @@ import { Engine } from "../engine/loop.js";
 import { createSession } from "../session/types.js";
 import { SkillRegistry } from "../engine/skills.js";
 import { buildPinnedPrefix } from "../engine/prefix-builder.js";
+import { systemMessage } from "../engine/prefix.js";
 import {
   appendEvent,
   appendRuntimeItem,
@@ -144,9 +145,14 @@ export async function createThreadHandler(c: Context) {
     mode: body.mode || cfg.mode,
     workspace_path: body.workspace || process.cwd(),
   });
-  const record = createRuntimeRecord(cfg, session);
-  ensureTools(cfg);
-  const prefix = buildPinnedPrefix(cfg, session.workspace_path, getRegistry());
+  const threadConfig: Config = {
+    ...cfg,
+    model: session.model,
+    mode: session.mode as Config["mode"],
+  };
+  const record = createRuntimeRecord(threadConfig, session);
+  ensureTools(threadConfig);
+  const prefix = buildPinnedPrefix(threadConfig, session.workspace_path, getRegistry());
   session.prefix_hash = prefix.hash;
   record.history.addSystem(prefix.systemPrompt);
   setRuntimePrefix(record, prefix);
@@ -175,7 +181,19 @@ export async function updateThreadHandler(c: Context) {
   if (typeof body.workspace === "string") patch.workspace = body.workspace;
   const thread = updateRuntimeThread(c.req.param("thread_id") || "", patch as any);
   if (!thread) return c.json({ error: "Thread not found" }, 404);
-  return c.json({ thread });
+  const record = getRuntimeRecord(thread.id);
+  if (!record) return c.json({ error: "Thread not found" }, 404);
+  if (patch.mode || patch.workspace) {
+    ensureTools(record.config);
+    const prefix = buildPinnedPrefix(record.config, record.session.workspace_path || process.cwd(), getRegistry());
+    record.session.prefix_hash = prefix.hash;
+    record.session.messages = [
+      systemMessage(prefix.systemPrompt),
+      ...record.session.messages.filter(message => !(message.role === "system" && message.name == null)),
+    ];
+    setRuntimePrefix(record, prefix);
+  }
+  return c.json({ thread, prefix_hash: record.prefix?.hash || record.session.prefix_hash });
 }
 
 export async function forkThreadHandler(c: Context) {
