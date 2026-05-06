@@ -2,6 +2,7 @@
 
 import { fitAnsi, visibleLength, wrapAnsiLine } from "../ui/ansi.js";
 import * as screen from "./screen.js";
+import { FrameRenderer } from "./frame-renderer.js";
 import { Transcript } from "./transcript.js";
 
 export interface LayoutRenderOptions {
@@ -24,7 +25,11 @@ export class TuiLayout {
   private lastInlineWidth = 0;
   private lastInlineRenderedRows: string[] = [];
 
-  constructor(readonly transcript: Transcript, readonly mode: TuiLayoutMode = "fullscreen") {}
+  constructor(
+    readonly transcript: Transcript,
+    readonly mode: TuiLayoutMode = "fullscreen",
+    private readonly frameRenderer = new FrameRenderer(),
+  ) {}
 
   visibleTranscriptRows(options: LayoutRenderOptions, rows: number, cols: number): number {
     const size = { rows: Math.max(6, rows), cols: Math.max(20, cols) };
@@ -50,6 +55,7 @@ export class TuiLayout {
     this.lastInlineCursorRow = 1;
     this.lastInlineWidth = 0;
     this.lastInlineRenderedRows = [];
+    this.frameRenderer.reset();
   }
 
   finish(): void {
@@ -72,36 +78,16 @@ export class TuiLayout {
     const transcriptRows = this.visibleTranscriptRows(options, size.rows, size.cols);
     const fixedStatusLine = options.statusLine ? fitAnsi(options.statusLine, size.cols) : null;
 
-    screen.hideCursor();
-    screen.moveTo(1, 1);
-    process.stdout.write(this.transcript.render(transcriptRows, size.cols));
-
-    let row = transcriptRows + 1;
-    screen.moveTo(row++, 1);
-    process.stdout.write(fitAnsi(dividerLine, size.cols));
-
-    for (const line of completionLines) {
-      screen.moveTo(row++, 1);
-      process.stdout.write(fitAnsi(line, size.cols));
-    }
-
-    if (fixedStatusLine) {
-      screen.moveTo(row++, 1);
-      process.stdout.write(fixedStatusLine);
-    }
-
-    for (const line of inputLines) {
-      screen.moveTo(row++, 1);
-      process.stdout.write(fitAnsi(line, size.cols));
-    }
-    const inputBottomRow = row - 1;
-
-    screen.moveTo(row++, 1);
-    process.stdout.write(fitAnsi(statusLine, size.cols));
-    while (row <= size.rows) {
-      screen.moveTo(row++, 1);
-      process.stdout.write(" ".repeat(size.cols));
-    }
+    const frame: string[] = [];
+    if (transcriptRows > 0) frame.push(...this.transcript.render(transcriptRows, size.cols).split("\n"));
+    frame.push(fitAnsi(dividerLine, size.cols));
+    frame.push(...completionLines.map(line => fitAnsi(line, size.cols)));
+    if (fixedStatusLine) frame.push(fixedStatusLine);
+    frame.push(...inputLines.map(line => fitAnsi(line, size.cols)));
+    const inputBottomRow = frame.length;
+    frame.push(fitAnsi(statusLine, size.cols));
+    while (frame.length < size.rows) frame.push(" ".repeat(size.cols));
+    if (frame.length > size.rows) frame.length = size.rows;
 
     const cursor = this.cursorPosition(
       options.prompt,
@@ -110,8 +96,7 @@ export class TuiLayout {
       size.cols,
       inputBottomRow,
     );
-    screen.moveTo(cursor.row, cursor.col);
-    screen.showCursor();
+    this.frameRenderer.render(frame, { cursor, cols: size.cols });
   }
 
   private renderInline(options: LayoutRenderOptions): void {
@@ -128,11 +113,11 @@ export class TuiLayout {
     const completionLines = (options.completions ?? []).slice(0, this.completionLimit(options, size.rows));
     const inputLines = this.inputLines(options.prompt, options.input ?? "", size.cols);
     const transcriptRows = this.visibleTranscriptRows(options, size.rows, size.cols);
-    const wrappedRows = this.transcript.wrappedRows(size.cols);
+    const totalWrappedRows = this.transcript.desiredHeight(size.cols);
     const fixedStatusLine = options.statusLine ? fitAnsi(options.statusLine, size.cols) : null;
     const commitTarget = options.freezeHistory
-      ? Math.min(this.committedInlineRows, wrappedRows.length)
-      : Math.max(0, wrappedRows.length - transcriptRows);
+      ? Math.min(this.committedInlineRows, totalWrappedRows)
+      : Math.max(0, totalWrappedRows - transcriptRows);
 
     screen.hideCursor();
     if (this.lastInlineRows > 0) {
@@ -141,7 +126,7 @@ export class TuiLayout {
     }
 
     const historyRows = commitTarget > this.committedInlineRows
-      ? wrappedRows.slice(this.committedInlineRows, commitTarget)
+      ? this.transcript.wrappedRowsRange(size.cols, this.committedInlineRows, commitTarget)
       : [];
     if (commitTarget > this.committedInlineRows) {
       if (historyRows.length) {
@@ -165,15 +150,6 @@ export class TuiLayout {
     const previousRows = historyRows.length
       ? this.lastInlineRenderedRows.slice(historyRows.length)
       : this.lastInlineRenderedRows;
-    const rowsToPaint = Math.max(rows.length, previousRows.length);
-    for (let i = 0; i < rowsToPaint; i++) {
-      const next = rows[i] ?? "";
-      const prev = previousRows[i] ?? "";
-      if (next !== prev) {
-        process.stdout.write(`\r\x1b[2K${next}`);
-      }
-      if (i < rowsToPaint - 1) process.stdout.write("\n");
-    }
 
     const inputBottomRow = transcriptOutput.length + 1 + completionLines.length + (fixedStatusLine ? 1 : 0) + inputLines.length;
     const cursor = this.cursorPosition(
@@ -183,15 +159,14 @@ export class TuiLayout {
       size.cols,
       inputBottomRow,
     );
-    const rowsAfterCursor = Math.max(0, rowsToPaint - cursor.row);
-    process.stdout.write("\r");
-    if (rowsAfterCursor > 0) process.stdout.write(`\x1b[${rowsAfterCursor}A`);
-    if (cursor.col > 1) process.stdout.write(`\x1b[${cursor.col - 1}C`);
+    this.frameRenderer.renderAnchored(rows, {
+      previousFrame: previousRows,
+      cursor,
+    });
 
     this.lastInlineRows = rows.length;
     this.lastInlineCursorRow = cursor.row;
     this.lastInlineRenderedRows = rows;
-    screen.showCursor();
   }
 
   private clearInlineRows(): void {

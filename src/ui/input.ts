@@ -14,6 +14,7 @@ export const COMMANDS: [string, string][] = [
 ];
 
 export type InputResult = { type: "line"; value: string } | { type: "interrupt" } | { type: "eof" };
+export type InputControllerMode = "idle" | "running" | "picker" | "approval" | "modal";
 
 const SHIFT_TAB_SEQUENCES = new Set(["\x1b[Z", "\x1b[1;2Z"]);
 const BRACKETED_PASTE_START = "\x1b[200~";
@@ -44,6 +45,80 @@ function commonPrefix(strings: string[]): string {
   let pre = strings[0];
   for (const s of strings.slice(1)) { while (!s.startsWith(pre)) pre = pre.slice(0, -1); }
   return pre;
+}
+
+export interface InputCompletionItem {
+  value: string;
+  description?: string;
+  display?: string;
+  replacement?: string;
+  completeText?: string;
+}
+
+export type InputCompletionProvider = (value: string) => InputCompletionItem[];
+
+export interface InputControllerState {
+  mode: InputControllerMode;
+  prompt: string;
+  value: string;
+  cursor: number;
+  completions: string[];
+  inBracketedPaste: boolean;
+}
+
+export interface InputRenderMeta {
+  immediate: boolean;
+  reason: "reset" | "edit" | "submit" | "mode" | "scroll" | "paste" | "completion";
+}
+
+export interface InputControllerOptions {
+  mode?: InputControllerMode;
+  prompt?: string;
+  completionProvider?: InputCompletionProvider;
+  completionLimit?: number;
+  clearOnSubmit?: boolean;
+  editable?: boolean;
+  now?: () => number;
+  onRender?: (state: InputControllerState, meta: InputRenderMeta) => void;
+  onSubmit?: (value: string) => boolean | void;
+  onInterrupt?: () => boolean | void;
+  onCtrlC?: () => boolean | void;
+  onEof?: () => boolean | void;
+  onModeCycle?: () => string | void;
+  onScroll?: (direction: ScrollDirection, amount: number) => void;
+  onUnhandledSequence?: (sequence: string, context: InputKeyContext) => boolean | void;
+}
+
+export interface InputAttachOptions {
+  stdin?: NodeJS.ReadStream;
+  stdout?: Pick<NodeJS.WriteStream, "write">;
+  resizeTarget?: NodeJS.WriteStream;
+  rawMode?: boolean;
+  bracketedPaste?: boolean;
+  pauseOnStop?: boolean;
+  onResize?: () => void;
+}
+
+export interface InputKeyContext {
+  index: number;
+  sequenceCount: number;
+  now: number;
+}
+
+export function commandCompletionProvider(value: string): InputCompletionItem[] {
+  return matches(value).map(([name, desc]) => {
+    const partial = value.startsWith("/") ? value.slice(1).toLowerCase() : "";
+    const highlighted = partial
+      ? p.blue(name.slice(0, partial.length)) + p.text(name.slice(partial.length))
+      : p.text(name);
+    return {
+      value: name,
+      description: desc,
+      display: `  /${highlighted}  ${p.dim(desc)}`,
+      replacement: `/${name} `,
+      completeText: `/${name}`,
+    };
+  });
 }
 
 export interface ReadInputOptions {
@@ -198,6 +273,347 @@ export function shouldTreatNewlineAsPaste(_newlineIndex: number, sequenceCount: 
   return sequenceCount >= 3 || (pasteWindowUntil > 0 && now <= pasteWindowUntil);
 }
 
+export class InputController {
+  private mode: InputControllerMode;
+  private prompt: string;
+  private value = "";
+  private cursor = 0;
+  private completions: string[] = [];
+  private pendingEscape = "";
+  private pendingEscapeTimer: NodeJS.Timeout | null = null;
+  private inBracketedPaste = false;
+  private pasteWindowUntil = 0;
+  private suppressRender = false;
+  private needsRender = false;
+  private pendingImmediateRender = false;
+
+  constructor(private readonly options: InputControllerOptions = {}) {
+    this.mode = options.mode ?? "idle";
+    this.prompt = options.prompt ?? "";
+    this.refreshCompletions();
+  }
+
+  getState(): InputControllerState {
+    return {
+      mode: this.mode,
+      prompt: this.prompt,
+      value: this.value,
+      cursor: this.cursor,
+      completions: [...this.completions],
+      inBracketedPaste: this.inBracketedPaste,
+    };
+  }
+
+  setMode(mode: InputControllerMode, render = true): void {
+    this.mode = mode;
+    if (render) this.requestRender(true, "mode");
+  }
+
+  setPrompt(prompt: string, render = true): void {
+    this.prompt = prompt;
+    if (render) this.requestRender(true, "mode");
+  }
+
+  reset(options: { value?: string; cursor?: number; render?: boolean } = {}): void {
+    this.value = options.value ?? "";
+    this.cursor = Math.max(0, Math.min(options.cursor ?? this.value.length, this.value.length));
+    this.inBracketedPaste = false;
+    this.pasteWindowUntil = 0;
+    this.pendingEscape = "";
+    this.refreshCompletions();
+    if (options.render !== false) this.requestRender(true, "reset");
+  }
+
+  render(immediate = true): void {
+    this.requestRender(immediate, "edit");
+  }
+
+  dispose(): void {
+    if (this.pendingEscapeTimer) {
+      clearTimeout(this.pendingEscapeTimer);
+      this.pendingEscapeTimer = null;
+    }
+    this.pendingEscape = "";
+    this.inBracketedPaste = false;
+    this.pasteWindowUntil = 0;
+  }
+
+  attach(options: InputAttachOptions = {}): () => void {
+    const stdin = options.stdin ?? process.stdin;
+    const stdout = options.stdout ?? process.stdout;
+    const resizeTarget = options.resizeTarget ?? process.stdout;
+    const rawMode = options.rawMode !== false;
+    const bracketedPaste = options.bracketedPaste !== false;
+    const pauseOnStop = options.pauseOnStop !== false;
+    const wasRaw = stdin.isRaw;
+    let detached = false;
+
+    const onData = (data: Buffer) => this.handleData(data);
+    const onResize = () => options.onResize?.();
+
+    if (bracketedPaste) enableBracketedPaste(stdout);
+    if (rawMode) stdin.setRawMode?.(true);
+    stdin.resume();
+    stdin.on("data", onData);
+    if (options.onResize) resizeTarget.on?.("resize", onResize);
+
+    return () => {
+      if (detached) return;
+      detached = true;
+      stdin.removeListener("data", onData);
+      if (options.onResize) resizeTarget.removeListener?.("resize", onResize);
+      if (bracketedPaste) disableBracketedPaste(stdout);
+      this.dispose();
+      if (rawMode) restoreTTYInput(stdin, wasRaw, pauseOnStop);
+      else if (pauseOnStop) stdin.pause();
+    };
+  }
+
+  handleData(data: Buffer | string): void {
+    if (this.pendingEscapeTimer) {
+      clearTimeout(this.pendingEscapeTimer);
+      this.pendingEscapeTimer = null;
+    }
+    const value = this.pendingEscape + data.toString();
+    this.pendingEscape = "";
+    const incompleteEscapeStart = trailingIncompleteEscapeStart(value);
+    if (incompleteEscapeStart >= 0) {
+      const complete = value.slice(0, incompleteEscapeStart);
+      this.pendingEscape = value.slice(incompleteEscapeStart);
+      this.handleSequences(splitInputSequences(complete));
+      this.pendingEscapeTimer = setTimeout(() => {
+        const pending = this.pendingEscape;
+        this.pendingEscape = "";
+        this.pendingEscapeTimer = null;
+        this.handleSequences(splitInputSequences(pending));
+      }, 25);
+      return;
+    }
+    this.handleSequences(splitInputSequences(value));
+  }
+
+  handleSequences(sequences: string[]): void {
+    const now = this.options.now?.() ?? Date.now();
+    const sequenceCount = sequences.length;
+    const coalesced = coalesceInputSequences(sequences, { inBracketedPaste: this.inBracketedPaste });
+    const shouldBatchRender = sequenceCount >= 3 || coalesced.length < sequenceCount || this.inBracketedPaste;
+    const previousSuppressRender = this.suppressRender;
+    if (shouldBatchRender) this.suppressRender = true;
+    try {
+      for (let index = 0; index < coalesced.length; index++) {
+        const shouldStop = this.handleSequence(coalesced[index]!, { index, sequenceCount, now });
+        if (shouldStop) break;
+      }
+    } finally {
+      this.suppressRender = previousSuppressRender;
+      if (!this.suppressRender && this.needsRender) {
+        const immediate = this.pendingImmediateRender;
+        this.needsRender = false;
+        this.pendingImmediateRender = false;
+        this.requestRender(immediate, "edit");
+      }
+    }
+  }
+
+  private handleSequence(sequence: string, context: InputKeyContext): boolean {
+    const now = context.now;
+
+    if (isBracketedPasteStart(sequence)) {
+      this.inBracketedPaste = true;
+      this.pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+      return false;
+    }
+
+    if (isBracketedPasteEnd(sequence)) {
+      this.inBracketedPaste = false;
+      this.pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+      this.requestRender(true, "paste");
+      return false;
+    }
+
+    if (!this.isEditable()) {
+      if (sequence === "\x03" && !this.inBracketedPaste) {
+        const handler = this.options.onCtrlC ?? this.options.onInterrupt;
+        return handler?.() !== false;
+      }
+      return this.unhandled(sequence, context);
+    }
+
+    if (isShiftTabSequence(sequence)) {
+      if (this.inBracketedPaste) {
+        this.insertText(sequence, true);
+        this.pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+        return false;
+      }
+      const nextPrompt = this.options.onModeCycle?.();
+      if (typeof nextPrompt === "string") this.prompt = nextPrompt;
+      this.requestRender(true, "mode");
+      return false;
+    }
+
+    const scrollAction = scrollActionForSequence(sequence);
+    if (scrollAction && !this.inBracketedPaste) {
+      this.options.onScroll?.(scrollAction.direction, scrollAction.amount);
+      this.requestRender(true, "scroll");
+      return false;
+    }
+
+    if (sequence.startsWith("\x1b") && sequence.length > 1 && !this.inBracketedPaste) {
+      if (sequence === "\x1b[A" || sequence === "\x1bOA") return this.unhandled(sequence, context);
+      if (sequence === "\x1b[B" || sequence === "\x1bOB") return this.unhandled(sequence, context);
+      if (sequence === "\x1b[D" || sequence === "\x1bOD") {
+        if (this.cursor > 0) this.cursor = previousGraphemeIndex(this.value, this.cursor);
+        this.requestRender(true, "edit");
+        return false;
+      }
+      if (sequence === "\x1b[C" || sequence === "\x1bOC") {
+        if (this.cursor < this.value.length) this.cursor = nextGraphemeIndex(this.value, this.cursor);
+        this.requestRender(true, "edit");
+        return false;
+      }
+      if (sequence === "\x1b[H" || sequence === "\x1bOH") {
+        this.cursor = 0;
+        this.requestRender(true, "edit");
+        return false;
+      }
+      if (sequence === "\x1b[F" || sequence === "\x1bOF") {
+        this.cursor = this.value.length;
+        this.requestRender(true, "edit");
+        return false;
+      }
+      return this.unhandled(sequence, context);
+    }
+
+    if (sequence === "\x1b" && !this.inBracketedPaste) {
+      return this.options.onInterrupt?.() === true;
+    }
+
+    if (sequence === "\t" && !this.inBracketedPaste) {
+      this.applyCompletion();
+      return false;
+    }
+
+    if (sequence === "\r" || sequence === "\n") {
+      if (this.inBracketedPaste || shouldTreatNewlineAsPaste(context.index, context.sequenceCount, now, this.pasteWindowUntil)) {
+        this.insertText("\n", true);
+        this.pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+        return false;
+      }
+      const submitted = this.value;
+      const shouldStop = this.options.onSubmit?.(submitted) !== false;
+      if (this.options.clearOnSubmit) {
+        this.value = "";
+        this.cursor = 0;
+        this.refreshCompletions();
+        this.requestRender(true, "submit");
+      }
+      return shouldStop;
+    }
+
+    if (sequence === "\x04" && !this.value && !this.inBracketedPaste) {
+      return this.options.onEof?.() !== false;
+    }
+
+    if (sequence === "\x03" && !this.inBracketedPaste) {
+      const handler = this.options.onCtrlC ?? this.options.onEof;
+      return handler?.() !== false;
+    }
+
+    if ((sequence === "\x7f" || sequence === "\x08") && !this.inBracketedPaste) {
+      if (this.cursor > 0) {
+        const previous = previousGraphemeIndex(this.value, this.cursor);
+        this.value = this.value.slice(0, previous) + this.value.slice(this.cursor);
+        this.cursor = previous;
+        this.requestRender(true, "edit");
+      }
+      return false;
+    }
+
+    if ((sequence === "\x01" || sequence === "\x1b[H" || sequence === "\x1bOH") && !this.inBracketedPaste) {
+      this.cursor = 0;
+      this.requestRender(true, "edit");
+      return false;
+    }
+
+    if ((sequence === "\x05" || sequence === "\x1b[F" || sequence === "\x1bOF") && !this.inBracketedPaste) {
+      this.cursor = this.value.length;
+      this.requestRender(true, "edit");
+      return false;
+    }
+
+    if (isPlainTextInputSequence(sequence)) {
+      this.insertText(sequence);
+      if (this.inBracketedPaste || context.sequenceCount >= 3) {
+        this.pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+      }
+      return false;
+    }
+
+    if (this.inBracketedPaste) {
+      this.insertText(sequence, true);
+      this.pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+      return false;
+    }
+
+    return this.unhandled(sequence, context);
+  }
+
+  private applyCompletion(): void {
+    const items = this.completionItems();
+    if (items.length === 1) {
+      const replacement = items[0]!.replacement ?? items[0]!.completeText ?? items[0]!.value;
+      this.value = replacement;
+      this.cursor = this.value.length;
+      this.requestRender(true, "completion");
+      return;
+    }
+    if (items.length > 1) {
+      const prefix = commonPrefix(items.map(item => item.completeText ?? item.replacement ?? item.value));
+      if (prefix.length > this.value.length) {
+        this.value = prefix;
+        this.cursor = this.value.length;
+      }
+      this.requestRender(true, "completion");
+    }
+  }
+
+  private insertText(text: string, immediate = false): void {
+    if (!text) return;
+    this.value = this.value.slice(0, this.cursor) + text + this.value.slice(this.cursor);
+    this.cursor += text.length;
+    this.requestRender(immediate, "edit");
+  }
+
+  private requestRender(immediate: boolean, reason: InputRenderMeta["reason"]): void {
+    this.refreshCompletions();
+    if (this.suppressRender) {
+      this.needsRender = true;
+      this.pendingImmediateRender ||= immediate;
+      return;
+    }
+    this.options.onRender?.(this.getState(), { immediate, reason });
+  }
+
+  private refreshCompletions(): void {
+    this.completions = this.completionItems()
+      .slice(0, this.options.completionLimit ?? 9)
+      .map(item => item.display ?? item.value);
+  }
+
+  private completionItems(): InputCompletionItem[] {
+    return this.options.completionProvider?.(this.value) ?? [];
+  }
+
+  private isEditable(): boolean {
+    if (this.options.editable !== undefined) return this.options.editable;
+    return this.mode === "idle" || this.mode === "running";
+  }
+
+  private unhandled(sequence: string, context: InputKeyContext): boolean {
+    return this.options.onUnhandledSequence?.(sequence, context) === true;
+  }
+}
+
 export async function readInput(
   prompt: string,
   opts?: ReadInputOptions,
@@ -209,48 +625,28 @@ export async function readInput(
     return new Promise(r => rl.question("", (l) => { rl.close(); r({ type: "line", value: l }); }));
   }
 
-  const wasRaw = stdin.isRaw;
-  stdin.setRawMode?.(true);
-  stdin.resume();
-  enableBracketedPaste(stdout);
+  let showComps = false;
+  let detachInput: (() => void) | null = null;
+  let controller: InputController | null = null;
 
-  let buf = "", pos = 0, showComps = false;
-  let currentPrompt = prompt;
-  let pendingEscape = "";
-  let pendingEscapeTimer: NodeJS.Timeout | null = null;
-  let inBracketedPaste = false;
-  let pasteWindowUntil = 0;
-  let suppressRedraw = false;
-  let needsRedraw = false;
-
-  const formatCompletions = (comps: [string, string][]): string[] => comps.slice(0, 9).map(([name, desc]) => {
-    const partial = buf.slice(1).toLowerCase();
-    const hl = partial
-      ? p.blue(name.slice(0, partial.length)) + p.text(name.slice(partial.length))
-      : p.text(name);
-    return `  /${hl}  ${p.dim(desc)}`;
-  });
-
-  function redraw(comps?: [string, string][]) {
+  function redraw(state: InputControllerState) {
     if (opts?.onRender) {
-      opts.onRender({ prompt: currentPrompt, value: buf, cursor: pos, completions: comps?.length ? formatCompletions(comps) : [] });
-      showComps = !!comps?.length;
+      opts.onRender({ prompt: state.prompt, value: state.value, cursor: state.cursor, completions: state.completions });
+      showComps = state.completions.length > 0;
       return;
     }
 
     // Move to start of input line, clear it
-    stdout.write("\r\x1b[2K" + currentPrompt + buf);
+    stdout.write("\r\x1b[2K" + state.prompt + state.value);
     // Position cursor within buf
-    if (pos < buf.length) stdout.write(`\x1b[${pos - buf.length}D`);
+    if (state.cursor < state.value.length) stdout.write(`\x1b[${state.cursor - state.value.length}D`);
 
     // Show completions below
-    if (comps?.length) {
+    if (state.completions.length) {
       stdout.write("\n");
-      for (const line of formatCompletions(comps)) stdout.write(`\x1b[2K${line}\n`);
-      if (comps.length > 9) stdout.write(`\x1b[2K  ${p.dim(`... and ${comps.length - 9} more`)}\n`);
+      for (const line of state.completions) stdout.write(`\x1b[2K${line}\n`);
       // Move back up to input line
-      const rows = Math.min(comps.length, 9) + (comps.length > 9 ? 1 : 0);
-      stdout.write(`\x1b[${rows}A\x1b[${visibleLength(currentPrompt) + pos}C`);
+      stdout.write(`\x1b[${state.completions.length}A\x1b[${visibleLength(state.prompt) + state.cursor}C`);
       showComps = true;
     } else if (showComps) {
       // Clear previous completions
@@ -259,9 +655,6 @@ export async function readInput(
     }
   }
 
-  if (opts?.onRender) redraw();
-  else stdout.write("\n" + currentPrompt);
-
   return new Promise((resolve) => {
     let cleaned = false;
     let settled = false;
@@ -269,11 +662,9 @@ export async function readInput(
     const cleanup = () => {
       if (cleaned) return;
       cleaned = true;
-      if (pendingEscapeTimer) clearTimeout(pendingEscapeTimer);
-      disableBracketedPaste(stdout);
+      detachInput?.();
+      controller?.dispose();
       if (!opts?.onRender && showComps) { stdout.write("\n\x1b[J"); showComps = false; }
-      stdin.removeListener("data", onData);
-      restoreTTYInput(stdin, wasRaw);
     };
 
     const finish = (result: InputResult): boolean => {
@@ -284,178 +675,29 @@ export async function readInput(
       return true;
     };
 
-    const requestInputRedraw = (comps?: [string, string][]) => {
-      if (suppressRedraw) {
-        needsRedraw = true;
-        return;
-      }
-      redraw(comps);
-    };
-
-    const redrawForBuffer = () => {
-      requestInputRedraw(buf.startsWith("/") ? matches(buf) : undefined);
-    };
-
-    const insertText = (text: string) => {
-      if (!text) return;
-      buf = buf.slice(0, pos) + text + buf.slice(pos);
-      pos += text.length;
-      redrawForBuffer();
-    };
-
-    const handleKey = (s: string, context?: { index: number; sequenceCount: number; now: number }): boolean => {
-      if (settled) return false;
-
-      const now = context?.now ?? Date.now();
-
-      if (isBracketedPasteStart(s)) {
-        inBracketedPaste = true;
-        pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+    controller = new InputController({
+      mode: "idle",
+      prompt,
+      completionProvider: commandCompletionProvider,
+      onRender: redraw,
+      onInterrupt: () => {
+        opts?.onInterrupt?.();
         return false;
-      }
-
-      if (isBracketedPasteEnd(s)) {
-        inBracketedPaste = false;
-        pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
-        requestInputRedraw();
-        return false;
-      }
-
-      if (isShiftTabSequence(s)) {
-        if (inBracketedPaste) {
-          insertText(s);
-          pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
-          return false;
-        }
-        const nextPrompt = opts?.onModeCycle?.();
-        if (typeof nextPrompt === "string") currentPrompt = nextPrompt;
-        requestInputRedraw();
-        return false;
-      }
-
-      const scrollAction = scrollActionForSequence(s);
-      if (scrollAction && !inBracketedPaste) {
-        opts?.onScroll?.(scrollAction.direction, scrollAction.amount);
-        requestInputRedraw();
-        return false;
-      }
-
-      // Escape sequences (arrows)
-      if (s.startsWith("\x1b") && s.length > 1 && !inBracketedPaste) {
-        if (s === "\x1b[A" || s === "\x1bOA") return false; // up — ignore
-        if (s === "\x1b[B" || s === "\x1bOB") return false; // down — ignore
-        if (s === "\x1b[D" || s === "\x1bOD") { if (pos > 0) pos = previousGraphemeIndex(buf, pos); requestInputRedraw(); return false; }
-        if (s === "\x1b[C" || s === "\x1bOC") { if (pos < buf.length) pos = nextGraphemeIndex(buf, pos); requestInputRedraw(); return false; }
-        if (s === "\x1b[H" || s === "\x1bOH") { pos = 0; requestInputRedraw(); return false; }
-        if (s === "\x1b[F" || s === "\x1bOF") { pos = buf.length; requestInputRedraw(); return false; }
-        return false;
-      }
-
-      // Lone Esc
-      if (s === "\x1b" && !inBracketedPaste) { opts?.onInterrupt?.(); return false; }
-
-      // Tab — complete
-      if (s === "\t" && !inBracketedPaste) {
-        const m = matches(buf);
-        if (m.length === 1) { buf = "/" + m[0][0] + " "; pos = buf.length; requestInputRedraw(); }
-        else if (m.length > 1) {
-          const pre = "/" + commonPrefix(m.map(([n]) => n));
-          if (pre.length > buf.length) { buf = pre; pos = buf.length; }
-          requestInputRedraw(m);
-        }
-        return false;
-      }
-
-      // Enter
-      if (s === "\r" || s === "\n") {
-        if (inBracketedPaste || shouldTreatNewlineAsPaste(context?.index ?? 0, context?.sequenceCount ?? 1, now, pasteWindowUntil)) {
-          insertText("\n");
-          pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
-          return false;
-        }
+      },
+      onModeCycle: opts?.onModeCycle,
+      onScroll: opts?.onScroll,
+      onSubmit: (value) => {
         if (!opts?.onRender) stdout.write("\n");
-        return finish({ type: "line", value: buf });
-      }
+        return finish({ type: "line", value });
+      },
+      onEof: () => {
+        if (!opts?.onRender) stdout.write("\n");
+        return finish({ type: "eof" });
+      },
+    });
 
-      // Ctrl+D empty → EOF
-      if (s === "\x04" && !buf && !inBracketedPaste) { if (!opts?.onRender) stdout.write("\n"); return finish({ type: "eof" }); }
-      // Ctrl+C → EOF
-      if (s === "\x03" && !inBracketedPaste) { if (!opts?.onRender) stdout.write("\n"); return finish({ type: "eof" }); }
-
-      // Backspace
-      if ((s === "\x7f" || s === "\x08") && !inBracketedPaste) {
-        if (pos > 0) {
-          const previous = previousGraphemeIndex(buf, pos);
-          buf = buf.slice(0, previous) + buf.slice(pos);
-          pos = previous;
-          requestInputRedraw();
-        }
-        return false;
-      }
-
-      // Home / End
-      if (s === "\x01" && !inBracketedPaste) { pos = 0; requestInputRedraw(); return false; }
-      if (s === "\x05" && !inBracketedPaste) { pos = buf.length; requestInputRedraw(); return false; }
-
-      // Printable
-      if (isPlainTextInputSequence(s)) {
-        insertText(s);
-        if (inBracketedPaste || (context?.sequenceCount ?? 1) >= 3) {
-          pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
-        }
-        return false;
-      }
-
-      if (inBracketedPaste) {
-        insertText(s);
-        pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
-      }
-      return false;
-    };
-
-    const handleKeys = (keys: string[]) => {
-      const now = Date.now();
-      const sequenceCount = keys.length;
-      const coalesced = coalesceInputSequences(keys, { inBracketedPaste });
-      const shouldBatchRender = sequenceCount >= 3 || coalesced.length < sequenceCount || inBracketedPaste;
-      const previousSuppressRedraw = suppressRedraw;
-      if (shouldBatchRender) suppressRedraw = true;
-      try {
-        for (let index = 0; index < coalesced.length; index++) {
-          if (handleKey(coalesced[index]!, { index, sequenceCount, now })) break;
-        }
-      } finally {
-        suppressRedraw = previousSuppressRedraw;
-        if (!suppressRedraw && needsRedraw && !settled) {
-          needsRedraw = false;
-          redrawForBuffer();
-        }
-      }
-    };
-
-    const onData = (data: Buffer) => {
-      if (pendingEscapeTimer) {
-        clearTimeout(pendingEscapeTimer);
-        pendingEscapeTimer = null;
-      }
-      const s = pendingEscape + data.toString();
-      pendingEscape = "";
-      const incompleteEscapeStart = trailingIncompleteEscapeStart(s);
-      if (incompleteEscapeStart >= 0) {
-        const complete = s.slice(0, incompleteEscapeStart);
-        pendingEscape = s.slice(incompleteEscapeStart);
-        handleKeys(splitInputSequences(complete));
-        pendingEscapeTimer = setTimeout(() => {
-          const pending = pendingEscape;
-          pendingEscape = "";
-          pendingEscapeTimer = null;
-          handleKeys(splitInputSequences(pending));
-        }, 25);
-        return;
-      }
-      handleKeys(splitInputSequences(s));
-    };
-
-    stdin.on("data", onData);
+    if (opts?.onRender) controller.render(true);
+    else stdout.write("\n" + prompt);
+    detachInput = controller.attach({ stdin, stdout });
   });
 }

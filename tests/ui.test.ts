@@ -5,8 +5,10 @@ import { fitAnsi, stripAnsi, truncateAnsi, visibleLength, wrapAnsi } from "../sr
 import {
   COMMANDS,
   coalesceInputSequences,
+  commandCompletionProvider,
   disableBracketedPaste,
   enableBracketedPaste,
+  InputController,
   isBracketedPasteEnd,
   isBracketedPasteStart,
   isPlainTextInputSequence,
@@ -24,9 +26,14 @@ import { movePickerIndex, pickerActionForSequence, pickerWindow } from "../src/u
 import { footerDivider, statusBar, statusBarFromItems, thinkingHeader, thinkingStatusLine, thinkingText, toolDiffPreview, welcomeBanner } from "../src/ui/renderer.js";
 import { AssistantStream } from "../src/tui/assistant-stream.js";
 import { shouldUseAlternateScreen } from "../src/tui/alternate-screen.js";
+import { FrameRenderer, shouldUseSynchronizedOutput } from "../src/tui/frame-renderer.js";
 import { TuiLayout } from "../src/tui/layout.js";
+import { approvalModalLines, pickerModalLines } from "../src/tui/modal.js";
+import { runtimeItemsToEngineRuntimeEvents, sessionMessagesToRuntimeEvents } from "../src/tui/runtime-replay.js";
+import { TuiRuntimeViewModel } from "../src/tui/runtime-view-model.js";
 import { ActiveToolLines } from "../src/tui/tool-lines.js";
 import { Transcript } from "../src/tui/transcript.js";
+import { createSession } from "../src/session/types.js";
 
 describe("ANSI helpers", () => {
   it("measures wide characters without counting ANSI codes", () => {
@@ -125,6 +132,42 @@ describe("Transcript", () => {
     expect(transcript.lines[0].text).toBe("line 0");
     expect(transcript.lines.at(-1)?.text).toBe("line 11999");
   });
+
+  it("returns wrapped row ranges that match full wrapping slices", () => {
+    const transcript = new Transcript();
+    transcript.append(Array.from({ length: 60 }, (_, index) => `row-${index}-abcdef`).join("\n"));
+
+    const full = transcript.wrappedRows(5).map(stripAnsi);
+    expect(transcript.wrappedRowsRange(5, 10, 18).map(stripAnsi)).toEqual(full.slice(10, 18));
+    expect(transcript.wrappedRowsRange(5, full.length - 8, full.length - 2).map(stripAnsi)).toEqual(full.slice(-8, -2));
+  });
+
+  it("invalidates cached wrap heights when transcript lines change", () => {
+    const transcript = new Transcript();
+    transcript.append("abcdef");
+
+    expect(transcript.desiredHeight(3)).toBe(2);
+    transcript.replaceLine(0, "xy");
+    expect(transcript.desiredHeight(3)).toBe(1);
+    expect(stripAnsi(transcript.render(2, 3)).split("\n").map(line => line.trim())).toEqual(["xy", ""]);
+
+    transcript.appendDelta("z1");
+    expect(transcript.desiredHeight(3)).toBe(2);
+    transcript.replaceRange(0, 1, "a\nbcdef");
+    expect(transcript.desiredHeight(3)).toBe(3);
+  });
+
+  it("drops cached wrap heights when old transcript lines are trimmed", () => {
+    const transcript = new Transcript();
+    transcript.maxLines = 3;
+    transcript.append("aaaa\nbbbb\ncccc");
+    expect(transcript.desiredHeight(2)).toBe(6);
+
+    transcript.append("dd");
+    expect(transcript.lines.map(line => line.text)).toEqual(["bbbb", "cccc", "dd"]);
+    expect(transcript.desiredHeight(2)).toBe(5);
+    expect(transcript.maxScrollOffset(1, 2)).toBe(4);
+  });
 });
 
 describe("AssistantStream", () => {
@@ -177,6 +220,160 @@ describe("AssistantStream", () => {
     stream.append(transcript, "second");
 
     expect(transcript.lines.map(line => line.text)).toEqual(["first", "second"]);
+  });
+});
+
+describe("TuiRuntimeViewModel", () => {
+  it("projects runtime events into transcript and view state", () => {
+    const transcript = new Transcript();
+    let renderNowCount = 0;
+    let requestRenderCount = 0;
+    let now = 2_000;
+    const view = new TuiRuntimeViewModel(transcript, {
+      thinkingVisible: () => true,
+      turnStartedAt: () => 1_000,
+      now: () => now,
+      renderNow: () => { renderNowCount++; },
+      requestRender: () => { requestRenderCount++; },
+      enableThinkingTimer: false,
+    });
+    let storeNotifications = 0;
+    const unsubscribe = view.subscribe(() => { storeNotifications++; });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "api_call_start", data: {} } as any);
+    expect(stripAnsi(view.activeStatusLine || "")).toContain("Thinking 0s");
+
+    view.handleRuntimeEvent({ type: "thinking_delta", data: { text: "- **Plan**" } } as any);
+    now = 2_500;
+    view.handleRuntimeEvent({ type: "content_delta", data: { text: "Answer" } } as any);
+    let plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+    expect(plain).toContain("Plan");
+    expect(plain).toContain("Answer");
+
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "edit", tool_call_id: "call-1" } } as any);
+    expect(view.activeToolCount).toBe(1);
+    const linesAfterBegin = transcript.lines.length;
+    view.handleRuntimeEvent({ type: "tool_call", data: { id: "call-1", name: "edit", arguments: {} } } as any);
+    expect(transcript.lines).toHaveLength(linesAfterBegin);
+
+    view.handleRuntimeEvent({
+      type: "tool_progress",
+      data: { tool: "edit", tool_call_id: "call-1", progress: { message: "halfway" } },
+    } as any);
+    plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+    expect(plain).toContain("halfway");
+
+    view.handleRuntimeEvent({
+      type: "tool_result",
+      data: { tool_call_id: "call-1", name: "edit", content: "ok", is_error: false },
+      preview: [
+        "Successfully edited file.ts",
+        "",
+        "[diff]",
+        "  -- file.ts --",
+        "- old",
+        "+ new",
+      ].join("\n"),
+    } as any);
+    plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+    expect(view.activeToolCount).toBe(0);
+    expect(plain).toContain("file.ts");
+    expect(plain).toContain("+ new");
+
+    view.finishTurn();
+    expect(view.activeStatusLine).toBeNull();
+    expect(storeNotifications).toBeGreaterThan(0);
+    expect(renderNowCount).toBeGreaterThan(0);
+    expect(requestRenderCount).toBeGreaterThan(0);
+    unsubscribe();
+    view.dispose();
+  });
+
+  it("rebuilds a loaded session transcript without leaking runtime state", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+    const session = createSession({
+      id: "session-1",
+      title: "Proof session",
+      messages: [
+        { role: "system", content: "system", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+        { role: "user", content: "prove it", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+        { role: "assistant", content: "**Done**", tool_calls: null, tool_call_id: null, name: null, reasoning_content: "private plan" },
+        { role: "tool", content: "ok", tool_calls: null, tool_call_id: "call-1", name: "read_file", reasoning_content: null, is_error: false },
+      ],
+    });
+
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "edit", tool_call_id: "call-2" } } as any);
+    expect(view.activeToolCount).toBe(1);
+
+    view.renderSessionTranscript({
+      session,
+      loaded: true,
+      version: "0.2.0",
+      model: "deepseek-v4-pro",
+      mode: "agent",
+      toolCount: 12,
+    });
+
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+    expect(plain).toContain("Seek Code");
+    expect(plain).toContain("Loaded session: Proof session");
+    expect(plain).toContain("prove it");
+    expect(plain).toContain("private plan");
+    expect(plain).toContain("Done");
+    expect(plain).toContain("read_file");
+    expect(view.activeToolCount).toBe(0);
+    expect(view.activeStatusLine).toBeNull();
+  });
+
+  it("replays session messages through runtime events", () => {
+    const events = sessionMessagesToRuntimeEvents([
+      { role: "system", content: "system", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+      { role: "user", content: "inspect", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+      {
+        role: "assistant",
+        content: "Calling tool",
+        tool_calls: [{ id: "call-1", name: "read_file", arguments: { path: "a.ts" } }],
+        tool_call_id: null,
+        name: null,
+        reasoning_content: "need file",
+      },
+      { role: "tool", content: "file content", tool_calls: null, tool_call_id: "call-1", name: "read_file", reasoning_content: null, is_error: false },
+    ]);
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+
+    expect(events.map(event => event.type)).toEqual(["user_message", "assistant_message", "tool_call", "tool_result"]);
+    view.replayRuntimeEvents(events);
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+
+    expect(plain).toContain("inspect");
+    expect(plain).toContain("need file");
+    expect(plain).toContain("Calling tool");
+    expect(plain).toContain("read_file");
+    expect(plain).toContain("file content");
+    expect(view.activeToolCount).toBe(0);
+  });
+
+  it("replays server runtime items without duplicating final assistant messages", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+    const events = runtimeItemsToEngineRuntimeEvents([
+      { type: "user_message", data: { text: "hello" } },
+      { type: "api_call_start", data: {} },
+      { type: "content_delta", data: { text: "Hi" } },
+      {
+        type: "assistant_message",
+        data: { role: "assistant", content: "Hi", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+      },
+    ]);
+
+    view.replayRuntimeEvents(events);
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+
+    expect(plain).toContain("hello");
+    expect(plain.match(/\bHi\b/g)).toHaveLength(1);
   });
 });
 
@@ -543,6 +740,128 @@ describe("Input shortcuts", () => {
   });
 });
 
+describe("InputController", () => {
+  it("edits, completes, and submits prompt input through one state machine", () => {
+    const renders: Array<{ value: string; cursor: number; completions: string[] }> = [];
+    const submissions: string[] = [];
+    const controller = new InputController({
+      mode: "idle",
+      completionProvider: commandCompletionProvider,
+      onRender: (state) => {
+        renders.push({ value: state.value, cursor: state.cursor, completions: state.completions });
+      },
+      onSubmit: (value) => {
+        submissions.push(value);
+        return true;
+      },
+    });
+
+    controller.handleData("/");
+    controller.handleData("t");
+    controller.handleData("a");
+    expect(controller.getState()).toMatchObject({ value: "/ta", cursor: 3 });
+    expect(controller.getState().completions.map(stripAnsi).join("\n")).toContain("/tasks");
+
+    controller.handleData("\t");
+    expect(controller.getState()).toMatchObject({ value: "/tasks ", cursor: 7 });
+
+    controller.handleData("n");
+    controller.handleData("o");
+    controller.handleData("w");
+    controller.handleData("\x1b[D");
+    controller.handleData("\x7f");
+    controller.handleData("\r");
+
+    expect(submissions).toEqual(["/tasks nw"]);
+    expect(renders.length).toBeGreaterThan(0);
+  });
+
+  it("keeps paste newlines as text and submits after paste ends", () => {
+    const submissions: string[] = [];
+    let now = 1_000;
+    const controller = new InputController({
+      mode: "running",
+      clearOnSubmit: true,
+      now: () => now,
+      onSubmit: (value) => {
+        submissions.push(value);
+        return true;
+      },
+    });
+
+    controller.handleData("\x1b[200~hello\nworld\x1b[201~");
+    expect(controller.getState().value).toBe("hello\nworld");
+
+    now = 1_200;
+    controller.handleData("\r");
+    expect(submissions).toEqual(["hello\nworld"]);
+    expect(controller.getState().value).toBe("");
+  });
+
+  it("routes scroll, mode cycle, and interrupts without duplicating parsers", () => {
+    const scrolls: string[] = [];
+    let interrupted = 0;
+    let mode = "idle";
+    const controller = new InputController({
+      mode: "idle",
+      prompt: "a",
+      onModeCycle: () => {
+        mode = "running";
+        return "b";
+      },
+      onScroll: (direction, amount) => {
+        scrolls.push(`${direction}:${amount}`);
+      },
+      onInterrupt: () => {
+        interrupted++;
+        return false;
+      },
+    });
+
+    controller.handleData("\x1b[5~");
+    controller.handleData("\x1b[Z");
+    controller.handleSequences(["\x1b"]);
+
+    expect(scrolls).toEqual(["up:8"]);
+    expect(mode).toBe("running");
+    expect(controller.getState().prompt).toBe("b");
+    expect(interrupted).toBe(1);
+  });
+
+  it("passes picker and approval keys through the shared parser without editing text", () => {
+    const pickerKeys: string[] = [];
+    const picker = new InputController({
+      mode: "picker",
+      editable: false,
+      onUnhandledSequence: (sequence) => {
+        pickerKeys.push(sequence);
+        return false;
+      },
+    });
+
+    picker.handleData("\x1b[5~");
+    picker.handleData("\x1b[H");
+    picker.handleData("y");
+
+    expect(pickerKeys).toEqual(["\x1b[5~", "\x1b[H", "y"]);
+    expect(picker.getState()).toMatchObject({ value: "", cursor: 0 });
+
+    const approvals: string[] = [];
+    const approval = new InputController({
+      mode: "approval",
+      editable: false,
+      onUnhandledSequence: (sequence) => {
+        approvals.push(sequence);
+        return true;
+      },
+    });
+
+    approval.handleData("always");
+    expect(approvals).toEqual(["always"]);
+    expect(approval.getState().value).toBe("");
+  });
+});
+
 describe("Picker", () => {
   it("keeps the selected item inside a sliding visible window", () => {
     const items = Array.from({ length: 20 }, (_, index) => `session-${index}`);
@@ -594,6 +913,29 @@ describe("Picker", () => {
   });
 });
 
+describe("TUI modal requests", () => {
+  it("renders picker modal lines from structured state", () => {
+    const lines = pickerModalLines(
+      3,
+      Array.from({ length: 6 }, (_, index) => ({ name: `item-${index}`, desc: `desc-${index}` })),
+      "Select item",
+      3,
+    ).map(stripAnsi);
+
+    expect(lines.join("\n")).toContain("item-3");
+    expect(lines.join("\n")).toContain("desc-3");
+    expect(lines.at(-1)).toContain("Select item");
+  });
+
+  it("renders approval modal lines without transcript writes", () => {
+    const text = approvalModalLines("bash", { command: "npm test" }).map(stripAnsi).join("\n");
+
+    expect(text).toContain("Approval required: bash");
+    expect(text).toContain("command=npm test");
+    expect(text).toContain("y yes");
+  });
+});
+
 describe("Modes", () => {
   it("cycles through interactive modes", () => {
     expect(nextModeName("plan")).toBe("agent");
@@ -612,6 +954,83 @@ describe("Alternate screen mode", () => {
   it("disables auto alternate screen inside Zellij", () => {
     expect(shouldUseAlternateScreen("auto", { ZELLIJ: "1" })).toBe(false);
     expect(shouldUseAlternateScreen("auto", {})).toBe(true);
+  });
+});
+
+describe("FrameRenderer", () => {
+  it("diffs frames and can wrap writes in synchronized output", () => {
+    const chunks: string[] = [];
+    const renderer = new FrameRenderer({
+      stdout: {
+        isTTY: true,
+        write(chunk: string | Uint8Array) { chunks.push(String(chunk)); return true; },
+      } as any,
+      env: { SEEKCODE_TUI_SYNC_OUTPUT: "1" } as any,
+      now: (() => {
+        let t = 0;
+        return () => ++t;
+      })(),
+    });
+
+    const first = renderer.render(["alpha", "beta"], { cursor: { row: 2, col: 3 } });
+    expect(first).toMatchObject({ changedRows: 2, totalRows: 2, fullRepaint: true });
+    expect(chunks.join("")).toContain("\x1b[?2026h");
+    expect(chunks.join("")).toContain("\x1b[1;1Halpha");
+    expect(chunks.join("")).toContain("\x1b[2;1Hbeta");
+    expect(chunks.join("")).toContain("\x1b[?2026l");
+
+    chunks.length = 0;
+    const second = renderer.render(["alpha", "gamma"], { cursor: { row: 2, col: 6 } });
+    const output = chunks.join("");
+    expect(second).toMatchObject({ changedRows: 1, totalRows: 2, fullRepaint: false });
+    expect(output).not.toContain("\x1b[1;1Halpha");
+    expect(output).toContain("\x1b[2;1Hgamma");
+    expect(output).toContain("\x1b[2;6H");
+  });
+
+  it("logs slow frames only when debug timing is enabled", () => {
+    const debug: string[] = [];
+    const times = [0, 50];
+    const renderer = new FrameRenderer({
+      stdout: { isTTY: false, write() { return true; } } as any,
+      stderr: { write(chunk: string | Uint8Array) { debug.push(String(chunk)); return true; } } as any,
+      env: { SEEKCODE_TUI_DEBUG: "1", SEEKCODE_TUI_SLOW_FRAME_MS: "10" } as any,
+      now: () => times.shift() ?? 50,
+      synchronizedOutput: false,
+    });
+
+    renderer.render(["alpha"], { cursor: { row: 1, col: 1 } });
+    expect(debug.join("")).toContain("slow frame 50.0ms");
+  });
+
+  it("diffs anchored frames for inline dynamic regions", () => {
+    const chunks: string[] = [];
+    const renderer = new FrameRenderer({
+      stdout: {
+        isTTY: false,
+        write(chunk: string | Uint8Array) { chunks.push(String(chunk)); return true; },
+      } as any,
+      synchronizedOutput: false,
+    });
+
+    const stats = renderer.renderAnchored(["one", "two"], {
+      previousFrame: ["one", "old", "stale"],
+      cursor: { row: 2, col: 2 },
+    });
+    const output = chunks.join("");
+
+    expect(stats).toMatchObject({ changedRows: 2, totalRows: 3, fullRepaint: false });
+    expect(output).not.toContain("one");
+    expect(output).toContain("two");
+    expect(output).toContain("\x1b[2K");
+    expect(output).toContain("\x1b[1A");
+    expect(output).toContain("\x1b[1C");
+  });
+
+  it("detects synchronized output support from env and tty", () => {
+    expect(shouldUseSynchronizedOutput({ SEEKCODE_TUI_SYNC_OUTPUT: "1" } as any, { isTTY: false } as any)).toBe(true);
+    expect(shouldUseSynchronizedOutput({ SEEKCODE_TUI_SYNC_OUTPUT: "0" } as any, { isTTY: true } as any)).toBe(false);
+    expect(shouldUseSynchronizedOutput({ TERM: "dumb" } as any, { isTTY: true } as any)).toBe(false);
   });
 });
 
@@ -689,6 +1108,43 @@ describe("TuiLayout", () => {
       expect(output.indexOf("Thinking 1s · esc to interrupt")).toBeLessThan(output.indexOf("● /tasks"));
     } finally {
       process.stdout.write = originalWrite;
+      process.stdout.columns = originalColumns;
+      process.stdout.rows = originalRows;
+    }
+  });
+
+  it("renders fullscreen through a frame diff instead of repainting unchanged rows", () => {
+    const originalColumns = process.stdout.columns;
+    const originalRows = process.stdout.rows;
+    const chunks: string[] = [];
+    process.stdout.columns = 24;
+    process.stdout.rows = 8;
+    try {
+      const transcript = new Transcript();
+      transcript.append("hello");
+      const renderer = new FrameRenderer({
+        stdout: {
+          isTTY: false,
+          write(chunk: string | Uint8Array) { chunks.push(String(chunk)); return true; },
+        } as any,
+        synchronizedOutput: false,
+      });
+      const layout = new TuiLayout(transcript, "fullscreen", renderer);
+
+      layout.render({ footer: "─\nstatus", prompt: "● ", input: "" });
+      expect(renderer.lastStats?.changedRows).toBe(8);
+      expect(chunks.join("")).toContain("hello");
+
+      chunks.length = 0;
+      layout.render({ footer: "─\nstatus", prompt: "● ", input: "" });
+      expect(renderer.lastStats?.changedRows).toBe(0);
+      expect(chunks.join("")).not.toContain("hello");
+
+      transcript.appendDelta(" world");
+      layout.render({ footer: "─\nstatus", prompt: "● ", input: "" });
+      expect(renderer.lastStats?.changedRows).toBeGreaterThan(0);
+      expect(chunks.join("")).toContain("hello world");
+    } finally {
       process.stdout.columns = originalColumns;
       process.stdout.rows = originalRows;
     }

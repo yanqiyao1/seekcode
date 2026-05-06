@@ -3,21 +3,10 @@
 
 import { Command } from "commander";
 import {
-  COMMANDS,
-  coalesceInputSequences,
-  isPlainTextInputSequence,
-  isShiftTabSequence,
-  isBracketedPasteEnd,
-  isBracketedPasteStart,
-  nextGraphemeIndex,
-  PASTE_BURST_NEWLINE_WINDOW_MS,
-  previousGraphemeIndex,
+  commandCompletionProvider,
+  InputController,
   readInput,
   restoreTTYInput,
-  scrollActionForSequence,
-  shouldTreatNewlineAsPaste,
-  splitInputSequences,
-  trailingIncompleteEscapeStart,
   type ScrollDirection,
 } from "./ui/input.js";
 import { movePickerIndex, pickerActionForSequence, pickerWindow, type PickItem } from "./ui/picker.js";
@@ -30,16 +19,14 @@ import * as screen from "./tui/screen.js";
 import { TuiLayout } from "./tui/layout.js";
 import { shouldUseAlternateScreen } from "./tui/alternate-screen.js";
 import { Transcript } from "./tui/transcript.js";
-import { ActiveToolLines } from "./tui/tool-lines.js";
-import { AssistantStream } from "./tui/assistant-stream.js";
-import { renderMarkdown } from "./ui/markdown.js";
+import { TuiRuntimeViewModel } from "./tui/runtime-view-model.js";
+import { approvalModalLines, pickerModalLines, type TuiModalKind, type TuiModalState } from "./tui/modal.js";
 
 import { explainConfig, loadConfig, migrateProjectConfig, migrateUserConfig, userConfigPath, validateConfig, writeUserApiKey, type Config } from "./config.js";
 import { DeepSeekClient } from "./client/deepseek.js";
 import { getRegistry } from "./tools/registry.js";
 import { getMode, nextModeName, type UICallbacks } from "./modes/base.js";
 import { Engine } from "./engine/loop.js";
-import type { EngineRuntimeEvent } from "./engine/events.js";
 import { ConversationHistory } from "./session/history.js";
 import { createSession } from "./session/types.js";
 import { buildSystemPrompt, buildToolsDescription } from "./engine/context.js";
@@ -108,15 +95,6 @@ const LIVE_READONLY_COMMANDS = new Set([
   "/version",
   "/help",
 ]);
-
-function commandCompletions(prefix: string): string[] {
-  if (!prefix.startsWith("/")) return [];
-  const needle = prefix.slice(1).toLowerCase();
-  return COMMANDS
-    .filter(([name]) => !needle || name.startsWith(needle))
-    .slice(0, 8)
-    .map(([name, description]) => `  /${name}  ${p.dim(description)}`);
-}
 
 function isLiveReadonlyCommand(input: string): boolean {
   if (!input.startsWith("/")) return false;
@@ -193,26 +171,6 @@ async function runOneShot(cfg: ReturnType<typeof loadConfig>, prompt: string) {
   }
 }
 
-async function withCapturedConsole<T>(transcript: Transcript, render: () => void, fn: () => Promise<T>): Promise<T> {
-  const originalLog = console.log;
-  const originalError = console.error;
-  const append = (args: unknown[], isError = false) => {
-    const text = args.map(arg => typeof arg === "string" ? arg : JSON.stringify(arg, null, 2)).join(" ");
-    transcript.append(isError ? p.error(text) : text);
-    transcript.scrollToBottom();
-    render();
-  };
-
-  console.log = (...args: unknown[]) => append(args);
-  console.error = (...args: unknown[]) => append(args, true);
-  try {
-    return await fn();
-  } finally {
-    console.log = originalLog;
-    console.error = originalError;
-  }
-}
-
 async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
   if (!cfg.api_key) throw new Error("DEEPSEEK_API_KEY is required. Set it in the environment, config file, or --api-key.");
   setupTools(cfg);
@@ -247,21 +205,34 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
   let lastTurnDurationMs = 0;
   let lastCacheTokens = 0;
   let exitSummary: string | null = null;
-  let pendingGlobalEscape = "";
-  let pendingGlobalEscapeTimer: NodeJS.Timeout | null = null;
-  let inGlobalBracketedPaste = false;
-  let globalPasteWindowUntil = 0;
-  let suppressGlobalInputRender = false;
-  let globalInputNeedsRender = false;
   let activeSkillInstruction: string | null = null;
   let promptState = { value: "", cursor: 0, completions: [] as string[] };
-  let activeStatusLine: string | null = null;
   const queuedInputs: string[] = [];
-  const activeToolLines = new ActiveToolLines();
-  const assistantStream = new AssistantStream();
+  let runtimeView: TuiRuntimeViewModel | null = null;
+  let liveInputController: InputController | null = null;
+  let liveInputStop: (() => void) | null = null;
   let pendingRenderTimer: NodeJS.Timeout | null = null;
   let pendingRenderArgs: typeof promptState | null = null;
   let resizeRenderTimer: NodeJS.Timeout | null = null;
+  let activeModal: TuiModalState | null = null;
+
+  const setModal = (modal: typeof activeModal) => {
+    activeModal = modal;
+    requestImmediateRender();
+  };
+
+  const clearModal = () => {
+    if (!activeModal) return;
+    activeModal = null;
+    requestImmediateRender();
+  };
+
+  const appendUiOutput = (message: unknown, isError = false) => {
+    const text = typeof message === "string" ? message : JSON.stringify(message, null, 2);
+    transcript.append(isError ? p.error(text) : text);
+    transcript.scrollToBottom();
+    requestImmediateRender();
+  };
 
   const renderScreen = (input = promptState.value, cursor = promptState.cursor, completions = promptState.completions) => {
     if (pendingRenderTimer) {
@@ -270,13 +241,15 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       pendingRenderArgs = null;
     }
     promptState = { value: input, cursor, completions };
+    const modalLines = activeModal?.lines;
     layout.render({
       footer: footerPrompt(),
       prompt: r.promptSymbol(cfg.mode),
-      statusLine: activeStatusLine || undefined,
-      input,
-      cursor,
-      completions,
+      statusLine: runtimeView?.activeStatusLine || undefined,
+      input: modalLines ? "" : input,
+      cursor: modalLines ? 0 : cursor,
+      completions: modalLines ?? completions,
+      completionLimit: modalLines?.length,
       freezeHistory: false,
     });
   };
@@ -304,7 +277,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     const visibleRows = layout.visibleTranscriptRows({
       footer: footerPrompt(),
       prompt: r.promptSymbol(cfg.mode),
-      statusLine: activeStatusLine || undefined,
+      statusLine: runtimeView?.activeStatusLine || undefined,
       input: promptState.value,
       completions: promptState.completions,
     }, size.rows, size.cols);
@@ -316,13 +289,18 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     renderScreen();
   };
 
-  const autoFollowBottom = () => {
-    if (transcript.scrollOffset === 0) transcript.scrollToBottom();
-  };
+  runtimeView = new TuiRuntimeViewModel(transcript, {
+    thinkingVisible: () => cfg.thinking_visible,
+    turnStartedAt: () => activeTurnStartedAt,
+    renderNow: requestImmediateRender,
+    requestRender,
+  });
 
   const runLiveCommand = async (input: string) => {
-    const changed = await withCapturedConsole(transcript, renderScreen, () => handleSlashCommand(input, cfg, session, history, costTracker, {
+    const changed = await handleSlashCommand(input, cfg, session, history, costTracker, {
       renderPicker,
+      clearModal,
+      write: appendUiOutput,
       applyLoadedSession,
       rebuildRuntime,
       rebuildSystemPrompt,
@@ -330,21 +308,23 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       setExitSummary: (message) => { exitSummary = message; },
       setActiveSkill: (instruction) => { activeSkillInstruction = instruction; },
       liveReadonly: true,
-    }));
+    });
     if (changed === true) modeObj = getMode(cfg.mode);
   };
 
-  const submitLiveInput = () => {
-    const input = promptState.value.trim();
-    if (!input) {
-      promptState = { value: "", cursor: 0, completions: [] };
-      requestImmediateRender();
-      return;
-    }
+  const abortActiveTurn = () => {
+    if (!engineRunning) return;
+    activeAbortController?.abort();
+    engine.interrupt();
+    transcript.append(r.interruptedMsg());
+    requestImmediateRender();
+  };
+
+  const submitLiveInput = (rawInput: string) => {
+    const input = rawInput.trim();
+    if (!input) return;
     transcript.append(`\n${p.blue("›")} ${p.text(input)}`);
     transcript.scrollToBottom();
-    promptState = { value: "", cursor: 0, completions: [] };
-    requestImmediateRender();
     if (isLiveReadonlyCommand(input)) {
       void runLiveCommand(input).catch((e: any) => {
         transcript.append(p.error(`\nError: ${e.message}\n`));
@@ -355,241 +335,77 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     if (input.startsWith("/")) {
       const cmd = input.split(/\s+/)[0];
       transcript.append(p.warning(`  Command ${cmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
-      requestImmediateRender();
       return;
     }
     queuedInputs.push(input);
     transcript.append(p.dim("  Queued for the next turn."));
-    requestImmediateRender();
   };
 
-  const requestLiveInputRender = (immediate = false) => {
-    if (suppressGlobalInputRender) {
-      globalInputNeedsRender = true;
-      return;
-    }
-    if (immediate) requestImmediateRender();
-    else requestRender();
-  };
-
-  const insertLiveInputText = (text: string, immediate = false) => {
-    if (!text) return;
-    promptState.value = promptState.value.slice(0, promptState.cursor) + text + promptState.value.slice(promptState.cursor);
-    promptState.cursor += text.length;
-    promptState.completions = commandCompletions(promptState.value);
-    requestLiveInputRender(immediate);
-  };
-
-  const editLiveInput = (key: string, context?: { index: number; sequenceCount: number; now: number }): boolean => {
-    const now = context?.now ?? Date.now();
-
-    if (isBracketedPasteStart(key)) {
-      inGlobalBracketedPaste = true;
-      globalPasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
+  liveInputController = new InputController({
+    mode: "running",
+    completionProvider: commandCompletionProvider,
+    completionLimit: 8,
+    clearOnSubmit: true,
+    onRender: (state, meta) => {
+      promptState = { value: state.value, cursor: state.cursor, completions: state.completions };
+      if (meta.immediate) requestImmediateRender();
+      else requestRender(state.value, state.cursor, state.completions);
+    },
+    onSubmit: (value) => {
+      submitLiveInput(value);
       return true;
-    }
-    if (isBracketedPasteEnd(key)) {
-      inGlobalBracketedPaste = false;
-      globalPasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
-      requestLiveInputRender(true);
-      return true;
-    }
-
-    if (isShiftTabSequence(key) && !inGlobalBracketedPaste) {
+    },
+    onInterrupt: () => {
+      abortActiveTurn();
+      return false;
+    },
+    onCtrlC: () => {
+      abortActiveTurn();
+      return false;
+    },
+    onModeCycle: () => {
       cfg.mode = nextModeName(cfg.mode);
       session.mode = cfg.mode;
       modeObj = getMode(cfg.mode);
-      requestLiveInputRender(true);
-      return true;
-    }
-    if (key === "\r" || key === "\n") {
-      if (inGlobalBracketedPaste || shouldTreatNewlineAsPaste(context?.index ?? 0, context?.sequenceCount ?? 1, now, globalPasteWindowUntil)) {
-        insertLiveInputText("\n", true);
-        globalPasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
-        return true;
-      }
-      submitLiveInput();
-      return true;
-    }
-    if (key === "\x03" && !inGlobalBracketedPaste) {
-      activeAbortController?.abort();
-      engine.interrupt();
-      transcript.append(r.interruptedMsg());
+      return r.promptSymbol(cfg.mode);
+    },
+    onScroll: scrollTranscript,
+  });
+
+  const onResize = () => {
+    if (resizeRenderTimer) return;
+    resizeRenderTimer = setTimeout(() => {
+      resizeRenderTimer = null;
       requestImmediateRender();
-      return true;
-    }
-    if ((key === "\x7f" || key === "\x08") && !inGlobalBracketedPaste) {
-      if (promptState.cursor > 0) {
-        const previous = previousGraphemeIndex(promptState.value, promptState.cursor);
-        promptState.value = promptState.value.slice(0, previous) + promptState.value.slice(promptState.cursor);
-        promptState.cursor = previous;
-        promptState.completions = commandCompletions(promptState.value);
-        requestLiveInputRender(true);
-      }
-      return true;
-    }
-    if ((key === "\x01" || key === "\x1b[H" || key === "\x1bOH") && !inGlobalBracketedPaste) {
-      promptState.cursor = 0;
-      requestLiveInputRender(true);
-      return true;
-    }
-    if ((key === "\x05" || key === "\x1b[F" || key === "\x1bOF") && !inGlobalBracketedPaste) {
-      promptState.cursor = promptState.value.length;
-      requestLiveInputRender(true);
-      return true;
-    }
-    if ((key === "\x1b[D" || key === "\x1bOD") && !inGlobalBracketedPaste) {
-      if (promptState.cursor > 0) promptState.cursor = previousGraphemeIndex(promptState.value, promptState.cursor);
-      requestLiveInputRender(true);
-      return true;
-    }
-    if ((key === "\x1b[C" || key === "\x1bOC") && !inGlobalBracketedPaste) {
-      if (promptState.cursor < promptState.value.length) promptState.cursor = nextGraphemeIndex(promptState.value, promptState.cursor);
-      requestLiveInputRender(true);
-      return true;
-    }
-    if (key === "\t" && !inGlobalBracketedPaste) {
-      const matches = COMMANDS.filter(([name]) => promptState.value.startsWith("/") && name.startsWith(promptState.value.slice(1).toLowerCase()));
-      if (matches.length === 1) {
-        promptState.value = "/" + matches[0][0] + " ";
-        promptState.cursor = promptState.value.length;
-      }
-      promptState.completions = commandCompletions(promptState.value);
-      requestLiveInputRender(true);
-      return true;
-    }
-    if (key.startsWith("\x1b") && !inGlobalBracketedPaste) return false;
-    if (isPlainTextInputSequence(key)) {
-      insertLiveInputText(key);
-      if (inGlobalBracketedPaste || (context?.sequenceCount ?? 1) >= 3) globalPasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
-      return true;
-    }
-    if (inGlobalBracketedPaste) {
-      insertLiveInputText(key, true);
-      globalPasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
-      return true;
-    }
-    return false;
+    }, 16);
   };
 
-  const handleGlobalKey = (key: string, context?: { index: number; sequenceCount: number; now: number }) => {
-    if (key === "\x1b" && !inGlobalBracketedPaste) {
-      if (engineRunning) {
-        activeAbortController?.abort();
-        engine.interrupt();
-        transcript.append(r.interruptedMsg());
-        renderScreen();
-      }
-      return;
-    }
-    const scrollAction = scrollActionForSequence(key);
-    if (scrollAction && !inGlobalBracketedPaste) scrollTranscript(scrollAction.direction, scrollAction.amount);
-    else if (engineRunning) editLiveInput(key, context);
+  const startGlobalInput = () => {
+    if (liveInputStop) return;
+    liveInputController?.reset({ render: false });
+    liveInputController?.setMode("running", false);
+    liveInputStop = liveInputController?.attach({
+      stdin: process.stdin,
+      stdout: process.stdout,
+      resizeTarget: process.stdout,
+      onResize,
+    }) ?? null;
   };
 
-  const handleGlobalKeys = (keys: string[]) => {
-    const now = Date.now();
-    const sequenceCount = keys.length;
-    const coalesced = coalesceInputSequences(keys, { inBracketedPaste: inGlobalBracketedPaste });
-    const shouldBatchRender = sequenceCount >= 3 || coalesced.length < sequenceCount || inGlobalBracketedPaste;
-    const previousSuppressRender = suppressGlobalInputRender;
-    if (shouldBatchRender) suppressGlobalInputRender = true;
-    try {
-      for (let index = 0; index < coalesced.length; index++) {
-        handleGlobalKey(coalesced[index]!, { index, sequenceCount, now });
-      }
-    } finally {
-      suppressGlobalInputRender = previousSuppressRender;
-      if (!suppressGlobalInputRender && globalInputNeedsRender) {
-        globalInputNeedsRender = false;
-        requestImmediateRender();
-      }
+  const stopGlobalInput = () => {
+    liveInputStop?.();
+    liveInputStop = null;
+    liveInputController?.reset({ render: false });
+    if (resizeRenderTimer) {
+      clearTimeout(resizeRenderTimer);
+      resizeRenderTimer = null;
     }
   };
-
-    const onGlobalData = (data: Buffer) => {
-    if (pendingGlobalEscapeTimer) {
-      clearTimeout(pendingGlobalEscapeTimer);
-      pendingGlobalEscapeTimer = null;
-    }
-    const value = pendingGlobalEscape + data.toString();
-    pendingGlobalEscape = "";
-    const incompleteEscapeStart = trailingIncompleteEscapeStart(value);
-    if (incompleteEscapeStart >= 0) {
-      const complete = value.slice(0, incompleteEscapeStart);
-      pendingGlobalEscape = value.slice(incompleteEscapeStart);
-      handleGlobalKeys(splitInputSequences(complete));
-      pendingGlobalEscapeTimer = setTimeout(() => {
-        const pending = pendingGlobalEscape;
-        pendingGlobalEscape = "";
-        pendingGlobalEscapeTimer = null;
-        handleGlobalKeys(splitInputSequences(pending));
-      }, 25);
-      return;
-    }
-    handleGlobalKeys(splitInputSequences(value));
-    };
-
-    const onResize = () => {
-      if (resizeRenderTimer) return;
-      resizeRenderTimer = setTimeout(() => {
-        resizeRenderTimer = null;
-        requestImmediateRender();
-      }, 16);
-    };
-
-    const startGlobalInput = () => {
-      const { stdin } = process;
-      screen.enableBracketedPaste();
-      stdin.setRawMode?.(true);
-      stdin.resume();
-      stdin.on("data", onGlobalData);
-      process.stdout.on?.("resize", onResize);
-    };
-
-    const stopGlobalInput = () => {
-      process.stdin.removeListener("data", onGlobalData);
-      process.stdout.removeListener?.("resize", onResize);
-      if (pendingGlobalEscapeTimer) {
-        clearTimeout(pendingGlobalEscapeTimer);
-        pendingGlobalEscapeTimer = null;
-      }
-      pendingGlobalEscape = "";
-      inGlobalBracketedPaste = false;
-      globalPasteWindowUntil = 0;
-      screen.disableBracketedPaste();
-      if (resizeRenderTimer) {
-        clearTimeout(resizeRenderTimer);
-        resizeRenderTimer = null;
-      }
-    };
 
   const clearPrompt = () => renderScreen("", 0, []);
 
-  const renderPicker = (idx: number, items: PickItem[], title: string, maxVisibleItems = 12) => {
-    const window = pickerWindow(items, idx, maxVisibleItems);
-    const lines: string[] = [];
-    if (window.start > 0) {
-      lines.push(p.dim(`  ↑ ${window.start} newer session${window.start === 1 ? "" : "s"}`));
-    }
-    for (const entry of window.entries) {
-      const item = entry.item;
-      const prefix = entry.selected ? p.blue("❯ ") : "  ";
-      lines.push(item.desc ? `${prefix}${item.name}  ${p.dim(item.desc)}` : `${prefix}${item.name}`);
-    }
-    if (window.end < window.total) {
-      lines.push(p.dim(`  ↓ ${window.total - window.end} older session${window.total - window.end === 1 ? "" : "s"}`));
-    }
-    lines.push(p.dim(`${title}  ↑↓ select  Enter confirm  Esc cancel`));
-    layout.render({
-      footer: footerPrompt(),
-      prompt: r.promptSymbol(cfg.mode),
-      statusLine: activeStatusLine || undefined,
-      input: "",
-      cursor: 0,
-      completions: lines,
-      completionLimit: lines.length,
-    });
+  const renderPicker = (idx: number, items: PickItem[], title: string, maxVisibleItems = 12, kind: TuiModalKind = "picker") => {
+    setModal({ kind, lines: pickerModalLines(idx, items, title, maxVisibleItems) });
   };
 
   const footerItems = () => cfg.status_items.filter(item => !["cache", "cost", "tools", "hints"].includes(item));
@@ -602,7 +418,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       tokens: session.cumulative_tokens_in + session.cumulative_tokens_out,
       contextLimit: cfg.context_limit,
       cacheTokens: lastCacheTokens,
-      activeTools: activeToolLines.size,
+      activeTools: runtimeView?.activeToolCount ?? 0,
       elapsedMs: engineRunning && activeTurnStartedAt ? Date.now() - activeTurnStartedAt : lastTurnDurationMs,
       cost: costTracker.totalCost,
     });
@@ -646,177 +462,22 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
   };
 
   const renderSessionTranscript = (loaded = false) => {
-    transcript.clear();
     layout.reset();
-    transcript.append(r.welcomeBanner(VERSION, cfg.model, cfg.mode, tools.size));
-    transcript.append(p.dim(loaded
-      ? `\nLoaded session: ${session.title || session.id}. Continue typing or /help.`
-      : "\nType a request or /help. Tab completes commands. Shift+Tab cycles modes."));
-    if (!loaded) return;
-    for (const message of session.messages.filter(message => message.role !== "system").slice(-80)) {
-      if (message.role === "user") {
-        transcript.append(`\n${p.blue("›")} ${p.text(message.content || "")}`);
-      } else if (message.role === "assistant") {
-        if (message.reasoning_content) {
-          transcript.append(r.thinkingHeader(undefined, false));
-          transcript.append(r.thinkingText(message.reasoning_content));
-          if (message.content) transcript.append("");
-        }
-        if (message.content) transcript.append(renderMarkdown(message.content));
-      } else if (message.role === "tool") {
-        const content = message.content || "";
-        const status = message.is_error
-          ? "error"
-          : /^Error:|was denied\./i.test(content) ? "error" : "success";
-        transcript.append(r.toolCallStatus(message.name || "tool", status, content));
-      }
-    }
-    transcript.scrollToBottom();
+    runtimeView?.renderSessionTranscript({
+      session,
+      loaded,
+      version: VERSION,
+      model: cfg.model,
+      mode: cfg.mode,
+      toolCount: tools.size,
+    });
   };
   renderSessionTranscript();
 
   // UICallbacks implementation
-  let inThinking = false;
-  let thinkingBuf = "";
-  let thinkingStartedAt = 0;
-  let thinkingRenderTimer: NodeJS.Timeout | null = null;
-  let thinkingBodyFlushed = false;
-  let lastTranscriptEvent: "tool" | "thinking" | "content" | "other" = "other";
-  const clearThinkingTimer = () => {
-    if (thinkingRenderTimer) {
-      clearInterval(thinkingRenderTimer);
-      thinkingRenderTimer = null;
-    }
-  };
-  const updateThinkingHeader = (final = false) => {
-    if (!thinkingStartedAt) return;
-    activeStatusLine = final ? null : r.thinkingStatusLine(
-      Date.now() - thinkingStartedAt,
-      true,
-    );
-    if (final) requestImmediateRender();
-    else requestRender();
-  };
-  const ensureThinkingHeader = (startedAt = Date.now()) => {
-    if (thinkingStartedAt) return;
-    thinkingStartedAt = startedAt;
-    lastTranscriptEvent = "thinking";
-    activeStatusLine = r.thinkingStatusLine(0, true);
-    renderScreen();
-    clearThinkingTimer();
-    thinkingRenderTimer = setInterval(() => {
-      if (!thinkingStartedAt) return;
-      updateThinkingHeader(false);
-    }, 250);
-    thinkingRenderTimer.unref?.();
-  };
-  const flushThinkingBody = () => {
-    if (thinkingBodyFlushed) return;
-    const formatted = r.thinkingText(thinkingBuf);
-    if (formatted) {
-      transcript.append(formatted);
-      transcript.append("");
-      transcript.append("");
-      lastTranscriptEvent = "thinking";
-    }
-    thinkingBodyFlushed = true;
-    inThinking = false;
-    thinkingBuf = "";
-    assistantStream.reset();
-  };
-  const finishThinkingStatus = () => {
-    if (!thinkingStartedAt) return;
-    flushThinkingBody();
-    clearThinkingTimer();
-    updateThinkingHeader(true);
-    thinkingStartedAt = 0;
-    activeStatusLine = null;
-    thinkingBodyFlushed = false;
-  };
-  const separateAfterTool = () => {
-    if (lastTranscriptEvent !== "tool") return;
-    if (!transcript.lines.length) return;
-    if (!transcript.lines.at(-1)?.text.trim()) return;
-    transcript.append("");
-    lastTranscriptEvent = "other";
-  };
-  const renderedToolCalls = new Set<string>();
-  const renderToolCallStart = (name: string, key?: string) => {
-    if (key && renderedToolCalls.has(key)) return;
-    if (key) renderedToolCalls.add(key);
-    flushThinkingBody();
-    assistantStream.reset();
-    transcript.append(r.toolCallStatus(name, "running"));
-    activeToolLines.start(name, transcript.lines.length - 1);
-    autoFollowBottom();
-    renderScreen();
-  };
-  const renderToolResult = (name: string, preview: string) => {
-    const line = r.toolCallStatus(name, preview.startsWith("Error:") ? "error" : "success", preview);
-    const activeToolLine = activeToolLines.finish(name);
-    if (activeToolLine !== undefined) transcript.replaceLine(activeToolLine, line);
-    else transcript.append(line);
-    const diffPreview = r.toolDiffPreview(preview);
-    if (diffPreview) transcript.append(diffPreview);
-    assistantStream.reset();
-    lastTranscriptEvent = "tool";
-    autoFollowBottom();
-    renderScreen();
-  };
-  const handleRuntimeEvent = (event: EngineRuntimeEvent) => {
-    switch (event.type) {
-    case "api_call_start":
-      if (!cfg.thinking_visible) return;
-      ensureThinkingHeader(activeTurnStartedAt || Date.now());
-      break;
-    case "thinking_delta": {
-      if (!cfg.thinking_visible) return;
-      if (!inThinking) separateAfterTool();
-      if (!inThinking) { thinkingBuf = ""; inThinking = true; thinkingBodyFlushed = false; ensureThinkingHeader(activeTurnStartedAt || Date.now()); }
-      thinkingBuf += event.data.text;
-      updateThinkingHeader(false);
-      break;
-    }
-    case "content_delta":
-      flushThinkingBody();
-      assistantStream.append(transcript, event.data.text);
-      lastTranscriptEvent = "content";
-      autoFollowBottom();
-      requestRender();
-      break;
-    case "tool_call_begin":
-      renderToolCallStart(event.data.name, event.data.tool_call_id || event.data.name);
-      break;
-    case "tool_call":
-      if (!renderedToolCalls.has(event.data.id) && !renderedToolCalls.has(event.data.name)) {
-        renderToolCallStart(event.data.name, event.data.id || event.data.name);
-      }
-      break;
-    case "tool_result":
-      renderToolResult(event.data.name, event.preview);
-      break;
-    case "tool_progress": {
-      const message = event.rendered?.preview || event.data.progress.message;
-      const line = r.toolCallStatus(event.data.tool, "running", message);
-      const activeToolLine = activeToolLines.current(event.data.tool);
-      if (activeToolLine !== undefined) transcript.replaceLine(activeToolLine, line);
-      else transcript.append(line);
-      autoFollowBottom();
-      requestRender();
-      break;
-    }
-    case "context_intervention": {
-      const value = event.data as { risk?: string; action?: string; reason?: string; compaction?: { message?: string } };
-      transcript.append(p.dim(`\nContext guard: ${value.risk || "unknown"} / ${value.action || "intervention"} — ${value.reason || "capacity intervention"}.\n`));
-      if (value.compaction?.message) transcript.append(p.dim(value.compaction.message + "\n"));
-      renderScreen();
-      break;
-    }
-    }
-  };
   const ui: UICallbacks = {
     onRuntimeEvent(event) {
-      handleRuntimeEvent(event);
+      runtimeView?.handleRuntimeEvent(event);
     },
     async requestApproval(toolName, args, _description) {
       // Check permission ruleset first
@@ -842,37 +503,60 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         return false;
       }
 
-      transcript.append(r.approvalPrompt(toolName, (args || {}) as Record<string, unknown>));
-      transcript.append(p.dim("  Choice: y yes, n no, a always allow"));
-      renderScreen();
+      const resumeLiveInput = !!liveInputStop;
+      if (resumeLiveInput) stopGlobalInput();
+      setModal({ kind: "approval", lines: approvalModalLines(toolName, (args || {}) as Record<string, unknown>) });
       return new Promise((resolve) => {
-        const { stdin } = process;
-        const wasPaused = stdin.isPaused();
-        stdin.resume();
-        const onData = (d: Buffer) => {
-          if (wasPaused) stdin.pause();
-          const a = d.toString().trim().toLowerCase();
-          stdin.removeListener("data", onData);
-          if (a === "a" || a === "always") {
+        let detachInput: (() => void) | null = null;
+        let approvalInput: InputController | null = null;
+        let settled = false;
+
+        const finish = (decision: boolean, choice: "always" | "once" | "deny"): true => {
+          if (settled) return true;
+          settled = true;
+          detachInput?.();
+          approvalInput?.dispose();
+          activeModal = null;
+
+          if (choice === "always") {
             cache.rememberApproval(toolName, "always", args as Record<string, unknown>);
             rememberAlwaysAllow(toolName);
-            transcript.append(p.success("  Approved for this session."));
-            renderScreen();
-            resolve(true);
-          } else if (a.startsWith("y")) {
+            transcript.append(p.success(`  Approved ${toolName} for this session.`));
+          } else if (choice === "once") {
             cache.rememberApproval(toolName, "once", args as Record<string, unknown>);
-            transcript.append(p.success("  Approved once."));
-            renderScreen();
-            resolve(true);
+            transcript.append(p.success(`  Approved ${toolName} once.`));
           } else {
             cache.rememberDenial(toolName, DenialReason.USER_DENIED, args as Record<string, unknown>);
             rememberAlwaysDeny(toolName);
-            transcript.append(p.warning("  Denied."));
-            renderScreen();
-            resolve(false);
+            transcript.append(p.warning(`  Denied ${toolName}.`));
           }
+
+          renderScreen();
+          if (resumeLiveInput && engineRunning) startGlobalInput();
+          resolve(decision);
+          return true;
         };
-        stdin.once("data", onData);
+
+        approvalInput = new InputController({
+          mode: "approval",
+          editable: false,
+          onUnhandledSequence: (sequence) => {
+            const a = sequence.trim().toLowerCase();
+            if (!a || a === "\r" || a === "\n") return false;
+            if (a === "a" || a === "always") {
+              return finish(true, "always");
+            }
+            if (a.startsWith("y")) return finish(true, "once");
+            return finish(false, "deny");
+          },
+          onCtrlC: () => finish(false, "deny"),
+          onInterrupt: () => finish(false, "deny"),
+        });
+        detachInput = approvalInput.attach({
+          stdin: process.stdin,
+          stdout: process.stdout,
+          bracketedPaste: false,
+        });
       });
     },
   };
@@ -920,15 +604,17 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
 
       // Slash commands
       if (input.startsWith("/")) {
-        const changed = await withCapturedConsole(transcript, renderScreen, () => handleSlashCommand(input, cfg, session, history, costTracker, {
+        const changed = await handleSlashCommand(input, cfg, session, history, costTracker, {
           renderPicker,
+          clearModal,
+          write: appendUiOutput,
           applyLoadedSession,
           rebuildRuntime,
           rebuildSystemPrompt,
           renderLoadedSession: () => renderSessionTranscript(true),
           setExitSummary: (message) => { exitSummary = message; },
           setActiveSkill: (instruction) => { activeSkillInstruction = instruction; },
-        }));
+        });
         if (changed === "exit") break;
         if (changed) modeObj = getMode(cfg.mode);
         renderScreen();
@@ -949,7 +635,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         engineRunning = true;
         activeTurnStartedAt = Date.now();
         activeAbortController = new AbortController();
-        renderedToolCalls.clear();
+        runtimeView?.beginTurn();
         startGlobalInput();
         const skillInstruction = activeSkillInstruction;
         activeSkillInstruction = null;
@@ -959,8 +645,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         });
         renderScreen();
         engineRunning = false;
-        finishThinkingStatus();
-        assistantStream.reset();
+        runtimeView?.finishTurn();
         const tokensIn = (result.usage?.prompt_tokens as number) || 0;
         const tokensOut = (result.usage?.completion_tokens as number) || 0;
         session.cumulative_tokens_in += tokensIn;
@@ -1000,8 +685,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         transcript.append("");
         renderScreen();
       } catch (e: any) {
-        finishThinkingStatus();
-        assistantStream.reset();
+        runtimeView?.finishTurn();
         engineRunning = false;
         if (isAbortError(e)) {
           transcript.append("");
@@ -1018,7 +702,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     }
   } finally {
     screen.disableBracketedPaste();
-    clearThinkingTimer();
+    runtimeView?.dispose();
     if (pendingRenderTimer) {
       clearTimeout(pendingRenderTimer);
       pendingRenderTimer = null;
@@ -1036,21 +720,27 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
   }
 }
 
+type PickerRenderer = (idx: number, items: PickItem[], title: string, maxVisibleItems?: number, kind?: TuiModalKind) => void;
+
 interface SlashCommandRuntime {
-    renderPicker?: (idx: number, items: PickItem[], title: string, maxVisibleItems?: number) => void;
-    applyLoadedSession: (loaded: ReturnType<typeof createSession>) => void;
-    rebuildRuntime: () => void;
-    rebuildSystemPrompt: () => void;
-    renderLoadedSession: () => void;
-    setExitSummary?: (message: string) => void;
-    setActiveSkill?: (instruction: string) => void;
-    liveReadonly?: boolean;
-  }
+  renderPicker?: PickerRenderer;
+  clearModal?: () => void;
+  write?: (message: unknown, isError?: boolean) => void;
+  applyLoadedSession: (loaded: ReturnType<typeof createSession>) => void;
+  rebuildRuntime: () => void;
+  rebuildSystemPrompt: () => void;
+  renderLoadedSession: () => void;
+  setExitSummary?: (message: string) => void;
+  setActiveSkill?: (instruction: string) => void;
+  liveReadonly?: boolean;
+}
 
 async function pickFromList(
   items: PickItem[],
   title = "Select",
-  render?: (idx: number, items: PickItem[], title: string, maxVisibleItems?: number) => void,
+  render?: PickerRenderer,
+  clearRender?: () => void,
+  kind: TuiModalKind = "picker",
 ): Promise<string | null> {
   const { stdin, stdout } = process;
   if (!stdin.isTTY || !items.length) return null;
@@ -1059,8 +749,6 @@ async function pickFromList(
   const len = items.length;
   let first = true;
   let previousTotalLines = 0;
-  let pendingEscape = "";
-  let pendingEscapeTimer: NodeJS.Timeout | null = null;
   let resizeTimer: NodeJS.Timeout | null = null;
 
   const maxVisibleItems = () => Math.max(1, Math.min(len, (process.stdout.rows || 24) - 6));
@@ -1069,7 +757,7 @@ async function pickFromList(
     const visibleItems = maxVisibleItems();
     const totalLines = visibleItems + 3;
     const window = pickerWindow(items, idx, visibleItems);
-    if (render) { render(idx, items, title, visibleItems); return; }
+    if (render) { render(idx, items, title, visibleItems, kind); return; }
     stdout.write("\x1b[?25l");
     if (!first && previousTotalLines > 0) stdout.write(`\x1b[${previousTotalLines}A`);
     first = false;
@@ -1095,45 +783,24 @@ async function pickFromList(
   };
 
   return new Promise((resolve) => {
-    const wasRaw = stdin.isRaw;
-    stdin.setRawMode?.(true);
-    stdin.resume();
+    let detachInput: (() => void) | null = null;
+    let controller: InputController | null = null;
+    let settled = false;
     if (!render) stdout.write("\r\x1b[2K\n");
     renderPicker();
 
     const handleKey = (key: string) => {
+      if (settled) return true;
       const action = pickerActionForSequence(key);
-      if (!action) return;
-      if (action === "confirm") { cleanup(); resolve(items[idx].name); return; }
-      if (action === "cancel") { cleanup(); resolve(null); return; }
+      if (!action) return false;
+      if (action === "confirm") { cleanup(); resolve(items[idx].name); return true; }
+      if (action === "cancel") { cleanup(); resolve(null); return true; }
       const nextIndex = movePickerIndex(idx, len, action, maxVisibleItems());
       if (nextIndex !== idx) {
         idx = nextIndex;
         renderPicker();
       }
-    };
-
-    const onData = (data: Buffer) => {
-      if (pendingEscapeTimer) {
-        clearTimeout(pendingEscapeTimer);
-        pendingEscapeTimer = null;
-      }
-      const value = pendingEscape + data.toString();
-      pendingEscape = "";
-      const incompleteEscapeStart = trailingIncompleteEscapeStart(value);
-      if (incompleteEscapeStart >= 0) {
-        const complete = value.slice(0, incompleteEscapeStart);
-        pendingEscape = value.slice(incompleteEscapeStart);
-        for (const key of splitInputSequences(complete)) handleKey(key);
-        pendingEscapeTimer = setTimeout(() => {
-          const pending = pendingEscape;
-          pendingEscape = "";
-          pendingEscapeTimer = null;
-          for (const key of splitInputSequences(pending)) handleKey(key);
-        }, 25);
-        return;
-      }
-      for (const key of splitInputSequences(value)) handleKey(key);
+      return false;
     };
 
     const onResize = () => {
@@ -1146,25 +813,39 @@ async function pickFromList(
     };
 
     const cleanup = () => {
-      if (pendingEscapeTimer) {
-        clearTimeout(pendingEscapeTimer);
-        pendingEscapeTimer = null;
-      }
+      if (settled) return;
+      settled = true;
+      detachInput?.();
+      controller?.dispose();
       if (resizeTimer) {
         clearTimeout(resizeTimer);
         resizeTimer = null;
       }
-      stdin.removeListener("data", onData);
-      stdout.removeListener?.("resize", onResize);
-      if (!render) {
+      if (render) {
+        clearRender?.();
+      } else {
         stdout.write(`${previousTotalLines > 0 ? `\x1b[${previousTotalLines}A` : ""}\x1b[J\r`);
         stdout.write("\x1b[?25h");
       }
-      restoreTTYInput(stdin, wasRaw);
     };
 
-    stdin.on("data", onData);
-    stdout.on?.("resize", onResize);
+    controller = new InputController({
+      mode: "picker",
+      editable: false,
+      onUnhandledSequence: (key) => handleKey(key),
+      onCtrlC: () => {
+        cleanup();
+        resolve(null);
+        return true;
+      },
+    });
+    detachInput = controller.attach({
+      stdin,
+      stdout,
+      resizeTarget: stdout,
+      bracketedPaste: false,
+      onResize,
+    });
   });
 }
 
@@ -1185,27 +866,33 @@ const PROVIDERS: PickItem[] = [
 
 async function pickModel(
   current: string,
-  render?: (idx: number, items: PickItem[], title: string) => void,
+  render?: PickerRenderer,
+  clearRender?: () => void,
 ): Promise<string | null> {
   const idx = MODELS.findIndex(m => m.name === current);
   const items = idx > 0 ? [...MODELS.slice(idx), ...MODELS.slice(0, idx)] : [...MODELS];
-  return pickFromList(items, "Select model", render);
+  return pickFromList(items, "Select model", render, clearRender);
 }
 
 async function pickProvider(
   current: string,
-  render?: (idx: number, items: PickItem[], title: string) => void,
+  render?: PickerRenderer,
+  clearRender?: () => void,
 ): Promise<string | null> {
   const idx = PROVIDERS.findIndex(provider => provider.name === current);
   const items = idx > 0 ? [...PROVIDERS.slice(idx), ...PROVIDERS.slice(0, idx)] : [...PROVIDERS];
-  return pickFromList(items, "Select provider", render);
+  return pickFromList(items, "Select provider", render, clearRender);
 }
 
-async function confirmPrompt(message: string, render?: (idx: number, items: PickItem[], title: string, maxVisibleItems?: number) => void): Promise<boolean> {
+async function confirmPrompt(
+  message: string,
+  render?: PickerRenderer,
+  clearRender?: () => void,
+): Promise<boolean> {
   const selected = await pickFromList([
     { name: "no", desc: "Cancel" },
     { name: "yes", desc: "Delete permanently" },
-  ], message, render);
+  ], message, render, clearRender, "confirm");
   return selected === "yes";
 }
 
@@ -1216,15 +903,18 @@ async function handleSlashCommand(
 ): Promise<boolean | "exit"> {
   const parts = input.trim().split(/\s+/);
   const cmd = parts[0].toLowerCase();
+  const write = runtime.write ?? ((message: unknown) => {
+    console.log(typeof message === "string" ? message : JSON.stringify(message, null, 2));
+  });
 
   if (runtime.liveReadonly && !LIVE_READONLY_COMMANDS.has(cmd)) {
-    console.log(p.warning(`Command ${cmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
+    write(p.warning(`Command ${cmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
     return false;
   }
 
   switch (cmd) {
     case "/help":
-      console.log(`
+      write(`
 ${p.blueBold("Commands")}
   /help          Show this help
   Shift+Tab      Cycle mode (plan → agent → yolo)
@@ -1257,24 +947,24 @@ ${p.blueBold("Commands")}
 
     case "/plan":
       cfg.mode = "plan"; session.mode = "plan";
-      console.log(p.modePlan("Switched to Plan mode (read-only)."));
+      write(p.modePlan("Switched to Plan mode (read-only)."));
       return true;
     case "/agent":
       cfg.mode = "agent"; session.mode = "agent";
-      console.log(p.success("Switched to Agent mode (interactive approval)."));
+      write(p.success("Switched to Agent mode (interactive approval)."));
       return true;
     case "/yolo":
       cfg.mode = "yolo"; session.mode = "yolo";
-      console.log(p.warning("Switched to YOLO mode (auto-approved)."));
+      write(p.warning("Switched to YOLO mode (auto-approved)."));
       return true;
 
     case "/provider": {
       let rawProvider: string | undefined = parts[1];
       if (!rawProvider) {
-        rawProvider = await pickProvider(cfg.provider, runtime.renderPicker) || undefined;
+        rawProvider = await pickProvider(cfg.provider, runtime.renderPicker, runtime.clearModal) || undefined;
       }
       if (!rawProvider) {
-        console.log(JSON.stringify({
+        write(JSON.stringify({
           provider: cfg.provider,
           base_url: cfg.base_url,
           model: cfg.model,
@@ -1291,9 +981,9 @@ ${p.blueBold("Commands")}
       session.model = capability.resolved_model;
       runtime.rebuildRuntime();
       runtime.rebuildSystemPrompt();
-      console.log(p.success(`Provider: ${provider}`));
-      console.log(p.success(`Model: ${capability.resolved_model}`));
-      console.log(p.dim(`Base URL: ${cfg.base_url}`));
+      write(p.success(`Provider: ${provider}`));
+      write(p.success(`Model: ${capability.resolved_model}`));
+      write(p.dim(`Base URL: ${cfg.base_url}`));
       break;
     }
 
@@ -1305,32 +995,32 @@ ${p.blueBold("Commands")}
           cfg.model = capability.resolved_model;
           session.model = capability.resolved_model;
           runtime.rebuildRuntime();
-          console.log(p.success(`Model: ${capability.resolved_model}`));
-          if (capability.deprecation) console.log(p.warning(`${capability.deprecation.alias} is deprecated; use ${capability.deprecation.replacement}`));
+          write(p.success(`Model: ${capability.resolved_model}`));
+          if (capability.deprecation) write(p.warning(`${capability.deprecation.alias} is deprecated; use ${capability.deprecation.replacement}`));
         } else {
-          console.log(p.warning(`Unknown model: ${model}. Available: deepseek-v4-pro, deepseek-v4-flash`));
+          write(p.warning(`Unknown model: ${model}. Available: deepseek-v4-pro, deepseek-v4-flash`));
         }
       } else {
         // Interactive picker with arrow key support
-        const selected = await pickModel(cfg.model, runtime.renderPicker);
+        const selected = await pickModel(cfg.model, runtime.renderPicker, runtime.clearModal);
         if (selected) {
           cfg.model = selected;
           session.model = selected;
           runtime.rebuildRuntime();
-          console.log(p.success(`Model: ${selected}`));
+          write(p.success(`Model: ${selected}`));
         }
       }
       break;
     }
     case "/capabilities": {
       const capability = providerCapability(cfg.provider as ApiProvider, cfg.model);
-      console.log(JSON.stringify(capability, null, 2));
+      write(JSON.stringify(capability, null, 2));
       break;
     }
     case "/reasoning": {
       const cycle: Record<string, string> = { off: "low", low: "medium", medium: "high", high: "max", max: "xhigh", xhigh: "off" };
       (cfg as any).reasoning_effort = cycle[cfg.reasoning_effort] || "high";
-      console.log(p.success(`Reasoning effort: ${cfg.reasoning_effort}`));
+      write(p.success(`Reasoning effort: ${cfg.reasoning_effort}`));
       break;
     }
     case "/clear":
@@ -1349,14 +1039,14 @@ ${p.blueBold("Commands")}
       session.title = "Untitled session";
       costTracker.reset(cfg.model);
       runtime.rebuildSystemPrompt();
-      console.log(p.success("Conversation cleared."));
+      write(p.success("Conversation cleared."));
       break;
     case "/save": {
       try {
         const id = saveSession(session);
-        console.log(p.success(`Session saved: ${id} — ${session.title}`));
+        write(p.success(`Session saved: ${id} — ${session.title}`));
       } catch (e: any) {
-        console.log(p.error(`Could not save session: ${e.message}`));
+        write(p.error(`Could not save session: ${e.message}`));
       }
       break;
     }
@@ -1364,14 +1054,14 @@ ${p.blueBold("Commands")}
       const id = parts[1];
       if (id) {
         const loaded = loadSession(id);
-        if (!loaded) { console.log(p.error(`Session not found: ${id}`)); break; }
+        if (!loaded) { write(p.error(`Session not found: ${id}`)); break; }
         runtime.applyLoadedSession(loaded);
         runtime.renderLoadedSession();
-        console.log(p.success(`Loaded session: ${loaded.title} (${loaded.messages.filter(message => message.role !== "system").length} messages)`));
+        write(p.success(`Loaded session: ${loaded.title} (${loaded.messages.filter(message => message.role !== "system").length} messages)`));
         return true;
       }
       const sessions = listSessions();
-      if (!sessions.length) { console.log(p.dim("No saved sessions.")); break; }
+      if (!sessions.length) { write(p.dim("No saved sessions.")); break; }
       const selected = await pickFromList(
         sessions.map(s => ({
           name: s.id,
@@ -1379,20 +1069,21 @@ ${p.blueBold("Commands")}
         })),
         "Select session to load",
         runtime.renderPicker,
+        runtime.clearModal,
       );
       if (!selected) break;
       const loaded = loadSession(selected);
-      if (!loaded) { console.log(p.error(`Session not found: ${selected}`)); break; }
+      if (!loaded) { write(p.error(`Session not found: ${selected}`)); break; }
       runtime.applyLoadedSession(loaded);
       runtime.renderLoadedSession();
-      console.log(p.success(`Loaded session: ${loaded.title} (${loaded.messages.filter(message => message.role !== "system").length} messages)`));
+      write(p.success(`Loaded session: ${loaded.title} (${loaded.messages.filter(message => message.role !== "system").length} messages)`));
       return true;
     }
     case "/delete": {
       let id: string | undefined = parts[1];
       const sessions = listSessions();
       if (!id) {
-        if (!sessions.length) { console.log(p.dim("No saved sessions.")); break; }
+        if (!sessions.length) { write(p.dim("No saved sessions.")); break; }
         id = await pickFromList(
           sessions.map(s => ({
             name: s.id,
@@ -1400,6 +1091,7 @@ ${p.blueBold("Commands")}
           })),
           "Select session to delete",
           runtime.renderPicker,
+          runtime.clearModal,
         ) || undefined;
         if (!id) break;
       }
@@ -1415,39 +1107,39 @@ ${p.blueBold("Commands")}
         workspace_path: "",
         message_count: 0,
       } : null);
-      if (!target) { console.log(p.error(`Session not found: ${id}`)); break; }
-      const confirmed = await confirmPrompt(`Delete session ${id}?`, runtime.renderPicker);
-      if (!confirmed) { console.log(p.dim("Delete cancelled.")); break; }
+      if (!target) { write(p.error(`Session not found: ${id}`)); break; }
+      const confirmed = await confirmPrompt(`Delete session ${id}?`, runtime.renderPicker, runtime.clearModal);
+      if (!confirmed) { write(p.dim("Delete cancelled.")); break; }
 
       if (deleteSession(id)) {
         if (id === session.id) {
           session.id = createSession().id;
         }
-        console.log(p.success(`Deleted session: ${id} — ${target.title}`));
+        write(p.success(`Deleted session: ${id} — ${target.title}`));
       } else {
-        console.log(p.error(`Could not delete session: ${id}`));
+        write(p.error(`Could not delete session: ${id}`));
       }
       break;
     }
     case "/sessions": {
       const sessions = listSessions();
-      if (!sessions.length) { console.log(p.dim("No saved sessions.")); break; }
-      console.log(p.blueBold(`Saved sessions (${sessions.length}):`));
+      if (!sessions.length) { write(p.dim("No saved sessions.")); break; }
+      write(p.blueBold(`Saved sessions (${sessions.length}):`));
       for (const s of sessions.slice(0, 10)) {
-        console.log(`  ${p.blue(s.id)} | ${s.title} | ${s.updated_at?.slice(0, 16) || ""} | ${s.message_count} msgs | ${s.mode} | ${basename(s.workspace_path || "")}`);
+        write(`  ${p.blue(s.id)} | ${s.title} | ${s.updated_at?.slice(0, 16) || ""} | ${s.message_count} msgs | ${s.mode} | ${basename(s.workspace_path || "")}`);
       }
       break;
     }
     case "/restore": {
       if (parts[1] === "revert") {
         const result = await revertLastTurn(resolve("."));
-        console.log(p.success(result));
+        write(p.success(result));
       } else {
         const snapshots = await restoreWorkspace(resolve("."));
-        if (!snapshots.length) { console.log(p.dim("No snapshots available.")); break; }
-        console.log(p.blueBold("Snapshots:"));
+        if (!snapshots.length) { write(p.dim("No snapshots available.")); break; }
+        write(p.blueBold("Snapshots:"));
         for (const s of snapshots.slice(0, 10)) {
-          console.log(`  ${p.blue(s.hash.slice(0, 8))} ${s.message} [${s.date?.slice(0, 19) || ""}]`);
+          write(`  ${p.blue(s.hash.slice(0, 8))} ${s.message} [${s.date?.slice(0, 19) || ""}]`);
         }
       }
       break;
@@ -1457,8 +1149,8 @@ ${p.blueBold("Commands")}
       const limit = cfg.context_limit;
       const pct = limit ? (tokens / limit) * 100 : 0;
       const bar = "█".repeat(Math.floor(pct / 5)) + "░".repeat(20 - Math.floor(pct / 5));
-      console.log(`Context: [${bar}] ${tokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct.toFixed(0)}%)`);
-      console.log(formatCapacityDecision(new CapacityController().observe(tokens, limit)));
+      write(`Context: [${bar}] ${tokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct.toFixed(0)}%)`);
+      write(formatCapacityDecision(new CapacityController().observe(tokens, limit)));
       break;
     }
     case "/tasks": {
@@ -1466,34 +1158,34 @@ ${p.blueBold("Commands")}
       const subcmd = parts[1];
       const id = parts[2];
       if (runtime.liveReadonly && ["cancel", "complete"].includes(subcmd || "")) {
-        console.log(p.warning(`/${cmd.slice(1)} ${subcmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
+        write(p.warning(`/${cmd.slice(1)} ${subcmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
         break;
       }
       if (subcmd === "read" && id) {
         const task = tm.getTask(id) || tm.getHistory().find(item => item.id === id);
-        console.log(task ? JSON.stringify(task, null, 2) : p.error(`Task not found: ${id}`));
+        write(task ? JSON.stringify(task, null, 2) : p.error(`Task not found: ${id}`));
         break;
       }
       if (subcmd === "cancel" && id) {
-        console.log(tm.killTask(id) ? p.success(`Cancelled task ${id}.`) : p.error(`Task not active: ${id}`));
+        write(tm.killTask(id) ? p.success(`Cancelled task ${id}.`) : p.error(`Task not active: ${id}`));
         break;
       }
       if (subcmd === "complete" && id) {
-        console.log(tm.completeTask(id, parts.slice(3).join(" ") || undefined) ? p.success(`Completed task ${id}.`) : p.error(`Task not active: ${id}`));
+        write(tm.completeTask(id, parts.slice(3).join(" ") || undefined) ? p.success(`Completed task ${id}.`) : p.error(`Task not active: ${id}`));
         break;
       }
       const checklist = formatTodoState();
-      if (checklist) console.log(checklist);
+      if (checklist) write(checklist);
       const stats = tm.getTaskStats();
-      console.log(p.blueBold(`Durable tasks: ${stats.active} active, ${stats.total} total`));
-      console.log(`  Completed: ${stats.completed} | Failed: ${stats.failed} | Killed: ${stats.killed}`);
+      write(p.blueBold(`Durable tasks: ${stats.active} active, ${stats.total} total`));
+      write(`  Completed: ${stats.completed} | Failed: ${stats.failed} | Killed: ${stats.killed}`);
       if (Object.keys(stats.byType).length) {
-        console.log("  By type: " + Object.entries(stats.byType).map(([k, v]) => `${k}:${v}`).join(" "));
+        write("  By type: " + Object.entries(stats.byType).map(([k, v]) => `${k}:${v}`).join(" "));
       }
       const active = tm.getActiveTasks();
       for (const t of active.slice(0, 10)) {
         const dur = ((Date.now() - t.startTime) / 1000).toFixed(0);
-        console.log(`  ${t.status === "running" ? "◎" : "○"} [${t.type}] ${t.description} (${dur}s)`);
+        write(`  ${t.status === "running" ? "◎" : "○"} [${t.type}] ${t.description} (${dur}s)`);
       }
       break;
     }
@@ -1501,110 +1193,110 @@ ${p.blueBold("Commands")}
       const subcmd = parts[1];
       const id = parts[2];
       if (runtime.liveReadonly && ["cancel", "prune"].includes(subcmd || "")) {
-        console.log(p.warning(`/${cmd.slice(1)} ${subcmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
+        write(p.warning(`/${cmd.slice(1)} ${subcmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
         break;
       }
       if (subcmd === "cancel" && id) {
-        console.log(getJobManager().cancel(id) ? p.success(`Cancelled job ${id}.`) : p.error(`Job not running: ${id}`));
+        write(getJobManager().cancel(id) ? p.success(`Cancelled job ${id}.`) : p.error(`Job not running: ${id}`));
         break;
       }
       if (subcmd === "show" && id) {
         const job = getJobManager().get(id);
-        console.log(job ? formatJob(job, 4000) : p.error(`Job not found: ${id}`));
+        write(job ? formatJob(job, 4000) : p.error(`Job not found: ${id}`));
         break;
       }
       if (subcmd === "prune") {
-        console.log(p.success(`Pruned ${getJobManager().prune()} old job(s).`));
+        write(p.success(`Pruned ${getJobManager().prune()} old job(s).`));
         break;
       }
       const jobs = getJobManager().list();
       if (!jobs.length) {
-        console.log(p.dim("No background jobs."));
+        write(p.dim("No background jobs."));
         break;
       }
       for (const job of jobs.slice(0, 10)) {
-        console.log(formatJob(job, 800));
-        console.log("");
+        write(formatJob(job, 800));
+        write("");
       }
       break;
     }
     case "/skills": {
       if (parts[1] === "--remote" || parts[1] === "remote") {
         try {
-          console.log(await listRemoteSkills(cfg.skills_registry_url, cfg.skills_max_install_size_bytes));
+          write(await listRemoteSkills(cfg.skills_registry_url, cfg.skills_max_install_size_bytes));
         } catch (e: any) {
-          console.log(p.error(`Could not fetch remote skills: ${e.message}`));
+          write(p.error(`Could not fetch remote skills: ${e.message}`));
         }
         break;
       }
-      console.log(listSkills(resolve("."), cfg.skills_dir));
+      write(listSkills(resolve("."), cfg.skills_dir));
       break;
     }
     case "/skill": {
       const subcmdOrName = parts[1];
       if (!subcmdOrName) {
-        console.log(p.error("Usage: /skill <name|new|install <spec>|update <name>|uninstall <name>|trust <name>>"));
+        write(p.error("Usage: /skill <name|new|install <spec>|update <name>|uninstall <name>|trust <name>>"));
         break;
       }
       try {
         if (subcmdOrName === "install") {
           const spec = parts.slice(2).join(" ");
-          if (!spec) { console.log(p.error("Usage: /skill install <github:owner/repo|https://...|registry-name>")); break; }
+          if (!spec) { write(p.error("Usage: /skill install <github:owner/repo|https://...|registry-name>")); break; }
           const result = await installSkill(spec, {
             skillsDir: cfg.skills_dir,
             registryUrl: cfg.skills_registry_url,
             maxSizeBytes: cfg.skills_max_install_size_bytes,
           });
           runtime.rebuildSystemPrompt();
-          console.log(p.success(`Installed skill '${result.skill.name}' at ${result.skill.path}`));
+          write(p.success(`Installed skill '${result.skill.name}' at ${result.skill.path}`));
           break;
         }
         if (subcmdOrName === "update") {
           const name = parts[2];
-          if (!name) { console.log(p.error("Usage: /skill update <name>")); break; }
+          if (!name) { write(p.error("Usage: /skill update <name>")); break; }
           const result = await updateSkill(name, {
             skillsDir: cfg.skills_dir,
             registryUrl: cfg.skills_registry_url,
             maxSizeBytes: cfg.skills_max_install_size_bytes,
           });
           runtime.rebuildSystemPrompt();
-          console.log(p.success(`Skill '${result.skill.name}' ${result.status}.`));
+          write(p.success(`Skill '${result.skill.name}' ${result.status}.`));
           break;
         }
         if (subcmdOrName === "uninstall") {
           const name = parts[2];
-          if (!name) { console.log(p.error("Usage: /skill uninstall <name>")); break; }
-          console.log(p.success(uninstallSkill(name, { skillsDir: cfg.skills_dir })));
+          if (!name) { write(p.error("Usage: /skill uninstall <name>")); break; }
+          write(p.success(uninstallSkill(name, { skillsDir: cfg.skills_dir })));
           runtime.rebuildSystemPrompt();
           break;
         }
         if (subcmdOrName === "trust") {
           const name = parts[2];
-          if (!name) { console.log(p.error("Usage: /skill trust <name>")); break; }
-          console.log(p.success(trustSkill(name, { skillsDir: cfg.skills_dir, workspaceDir: resolve(".") })));
+          if (!name) { write(p.error("Usage: /skill trust <name>")); break; }
+          write(p.success(trustSkill(name, { skillsDir: cfg.skills_dir, workspaceDir: resolve(".") })));
           break;
         }
         const result = activateSkill(subcmdOrName, { workspaceDir: resolve("."), skillsDir: cfg.skills_dir });
         if (!result.ok || !result.instruction) {
-          console.log(p.error(result.message));
+          write(p.error(result.message));
           break;
         }
         runtime.setActiveSkill?.(result.instruction);
-        console.log(p.success(result.message));
+        write(p.success(result.message));
       } catch (e: any) {
-        console.log(p.error(`Skill error: ${e.message}`));
+        write(p.error(`Skill error: ${e.message}`));
       }
       break;
     }
     case "/permissions": {
       const rules = getAllRules();
       const mem = getSessionMemory();
-      console.log(p.blueBold(`Permissions: ${rules.length} rules`));
-      console.log(`  Always allowed: ${mem.allow.join(", ") || "none"}`);
-      console.log(`  Always denied: ${mem.deny.join(", ") || "none"}`);
-      console.log("  Default rules:");
+      write(p.blueBold(`Permissions: ${rules.length} rules`));
+      write(`  Always allowed: ${mem.allow.join(", ") || "none"}`);
+      write(`  Always denied: ${mem.deny.join(", ") || "none"}`);
+      write("  Default rules:");
       for (const r of rules.slice(0, 20)) {
-        console.log(`    ${r.permission}:${r.pattern} → ${r.action}`);
+        write(`    ${r.permission}:${r.pattern} → ${r.action}`);
       }
       break;
     }
@@ -1612,42 +1304,42 @@ ${p.blueBold("Commands")}
       const subcmd = parts[1] || "list";
       try {
         if (subcmd === "list") {
-          console.log(JSON.stringify(getMCPManager(cfg).list(), null, 2));
+          write(JSON.stringify(getMCPManager(cfg).list(), null, 2));
           break;
         }
         if (subcmd === "reload") {
           const manager = await reloadMCPManager(cfg);
-          console.log(JSON.stringify({ reloaded: true, servers: manager.list() }, null, 2));
+          write(JSON.stringify({ reloaded: true, servers: manager.list() }, null, 2));
           break;
         }
         if (subcmd === "enable" || subcmd === "disable") {
           const name = parts[2];
-          if (!name) { console.log(p.error("Usage: /mcp enable|disable <name>")); break; }
+          if (!name) { write(p.error("Usage: /mcp enable|disable <name>")); break; }
           setMCPServerEnabled(name, subcmd === "enable");
-          console.log(p.success(`${subcmd === "enable" ? "Enabled" : "Disabled"} MCP server ${name}. Run /mcp reload to apply.`));
+          write(p.success(`${subcmd === "enable" ? "Enabled" : "Disabled"} MCP server ${name}. Run /mcp reload to apply.`));
           break;
         }
         if (subcmd === "remove" || subcmd === "delete") {
           const name = parts[2];
-          if (!name) { console.log(p.error("Usage: /mcp remove <name>")); break; }
+          if (!name) { write(p.error("Usage: /mcp remove <name>")); break; }
           removeMCPServer(name);
-          console.log(p.success(`Removed MCP server ${name}. Run /mcp reload to apply.`));
+          write(p.success(`Removed MCP server ${name}. Run /mcp reload to apply.`));
           break;
         }
         if (subcmd === "add") {
           const name = parts[2];
           const command = parts[3];
           if (!name || !command) {
-            console.log(p.error("Usage: /mcp add <name> <command> [args...]"));
+            write(p.error("Usage: /mcp add <name> <command> [args...]"));
             break;
           }
           addMCPServer({ name, transport: "stdio", command, args: parts.slice(4), env: {}, enabled: true });
-          console.log(p.success(`Added MCP server ${name}. Run /mcp reload to apply.`));
+          write(p.success(`Added MCP server ${name}. Run /mcp reload to apply.`));
           break;
         }
-        console.log(p.error("Usage: /mcp [list|add|enable|disable|remove|reload]"));
+        write(p.error("Usage: /mcp [list|add|enable|disable|remove|reload]"));
       } catch (e: any) {
-        console.log(p.error(`MCP error: ${e.message}`));
+        write(p.error(`MCP error: ${e.message}`));
       }
       break;
     }
@@ -1655,25 +1347,25 @@ ${p.blueBold("Commands")}
       const subcmd = parts[1] || "explain";
       if (subcmd === "validate") {
         const report = validateConfig();
-        console.log(JSON.stringify(report, null, 2));
+        write(JSON.stringify(report, null, 2));
         break;
       }
       if (subcmd === "migrate") {
         const target = parts[2] || "user";
         const dryRun = parts.includes("--dry-run");
         const report = target === "project" ? migrateProjectConfig({ dryRun }) : migrateUserConfig({ dryRun });
-        console.log(JSON.stringify(report, null, 2));
+        write(JSON.stringify(report, null, 2));
         break;
       }
       if (subcmd === "explain") {
-        console.log(JSON.stringify(explainConfig(), null, 2));
+        write(JSON.stringify(explainConfig(), null, 2));
         break;
       }
-      console.log(p.error("Usage: /config [validate|migrate user|migrate project|explain] [--dry-run]"));
+      write(p.error("Usage: /config [validate|migrate user|migrate project|explain] [--dry-run]"));
       break;
     }
     case "/cost":
-      console.log(costTracker.formatDetailed());
+      write(costTracker.formatDetailed());
       break;
     case "/exit": {
       try {
@@ -1692,10 +1384,10 @@ ${p.blueBold("Commands")}
       return "exit";
     }
     case "/version":
-      console.log(`seek-code v${VERSION}`);
+      write(`seek-code v${VERSION}`);
       break;
     default:
-      console.log(p.error(`Unknown command: ${cmd}`));
+      write(p.error(`Unknown command: ${cmd}`));
   }
   return false;
 }
