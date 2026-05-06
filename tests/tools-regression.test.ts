@@ -1043,6 +1043,44 @@ describe("engine", () => {
     expect(session.messages.filter(message => message.role === "assistant")).toHaveLength(0);
   });
 
+  it("normalizes aborted tool termination instead of leaking low-level terminated errors", async () => {
+    const controller = new AbortController();
+    getRegistry().register({
+      name: "terminating_tool",
+      description: "throws after abort",
+      parameters: { type: "object", properties: {} },
+      permission: "always_allow" as any,
+      category: "test",
+      parallelOk: false,
+      execute: async () => {
+        controller.abort();
+        throw new Error("terminated");
+      },
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "terminating_tool", arguments: {} }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "should not be called", reasoning_content: null, tool_calls: [] },
+    ]);
+    const events: EngineRuntimeEvent[] = [];
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      onRuntimeEvent: async (event) => { events.push(event); },
+    }, { signal: controller.signal });
+
+    expect(result.tool_results).toHaveLength(1);
+    expect(result.tool_results[0].content).toContain("interrupted before tool 'terminating_tool' completed (abort requested)");
+    expect(result.tool_results[0].content).not.toContain("terminated");
+    expect(events.find(event => event.type === "tool_result")).toMatchObject({
+      type: "tool_result",
+      data: { is_error: true },
+    });
+    expect(client.calls).toHaveLength(1);
+  });
+
   it("records tool budget exhaustion as an error result and stops the turn", async () => {
     getRegistry().register({
       name: "ok_tool",

@@ -103,15 +103,16 @@ export class Engine {
         this.history.addToolResult(result);
         respondedToolCallIds.add(result.tool_call_id);
       };
+      const interruptedToolResult = (tc: ToolCall, reason: string): ToolResult => ({
+        tool_call_id: tc.id,
+        name: tc.name || "tool",
+        content: `Error: interrupted before tool '${tc.name || "tool"}' completed (${reason}).`,
+        is_error: true,
+      });
       const addInterruptedToolResults = async (toolCalls: ToolCall[], reason: string) => {
         for (const tc of toolCalls) {
           if (respondedToolCallIds.has(tc.id)) continue;
-          const tr: ToolResult = {
-            tool_call_id: tc.id,
-            name: tc.name || "tool",
-            content: `Error: interrupted before tool '${tc.name || "tool"}' completed (${reason}).`,
-            is_error: true,
-          };
+          const tr = interruptedToolResult(tc, reason);
           recordToolResult(tr);
           turnToolCalls.push(tc);
           turnToolResults.push(tr);
@@ -328,6 +329,16 @@ export class Engine {
             });
             await emitRuntimeEvent(callbacks, { type: "hook", data: { event: "PostToolUse", tool: tc.name, ...postHook } });
           } catch (e: any) {
+            if (this.interrupted || options.signal?.aborted || isAbortLikeError(e)) {
+              this.interrupted = true;
+              const reason = options.signal?.aborted ? "abort requested" : "interrupt requested";
+              const tr = interruptedToolResult(tc, reason);
+              recordToolResult(tr);
+              turnToolResults.push(tr);
+              turnToolCalls.push(tc);
+              await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: tr.content });
+              break;
+            }
             const err = `Error executing ${tc.name}: ${e.message}`;
             const tr: ToolResult = {
               tool_call_id: tc.id, name: tc.name, content: err, is_error: true,
@@ -470,6 +481,11 @@ function mergeUsage(
 
 function isUsageRecord(value: unknown): value is UsageTelemetry {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.name === "AbortError" || /aborted|abort/i.test(error.message);
 }
 
 function withWorkspaceDefaults(toolName: string, args: Record<string, unknown>, workspacePath: string): Record<string, unknown> {

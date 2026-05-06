@@ -201,6 +201,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
   let turnCount = 0;
   let engineRunning = false;
   let activeAbortController: AbortController | null = null;
+  let activeTurnToken = 0;
   let activeTurnStartedAt = 0;
   let lastTurnDurationMs = 0;
   let lastCacheTokens = 0;
@@ -474,12 +475,14 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
   };
   renderSessionTranscript();
 
-  // UICallbacks implementation
-  const ui: UICallbacks = {
+  const createUiCallbacks = (turnToken: number): UICallbacks => ({
     onRuntimeEvent(event) {
+      if (turnToken !== activeTurnToken) return;
+      if (activeAbortController?.signal.aborted) return;
       runtimeView?.handleRuntimeEvent(event);
     },
     async requestApproval(toolName, args, _description) {
+      if (turnToken !== activeTurnToken || activeAbortController?.signal.aborted) return false;
       // Check permission ruleset first
       const permResult = checkPermission({
         toolName,
@@ -510,13 +513,21 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         let detachInput: (() => void) | null = null;
         let approvalInput: InputController | null = null;
         let settled = false;
+        const abortSignal = activeAbortController?.signal;
 
-        const finish = (decision: boolean, choice: "always" | "once" | "deny"): true => {
+        const finish = (decision: boolean, choice: "always" | "once" | "deny" | "abort"): true => {
           if (settled) return true;
           settled = true;
           detachInput?.();
           approvalInput?.dispose();
+          abortSignal?.removeEventListener("abort", abortApproval);
           activeModal = null;
+
+          if (turnToken !== activeTurnToken || activeAbortController?.signal.aborted) {
+            renderScreen();
+            resolve(false);
+            return true;
+          }
 
           if (choice === "always") {
             cache.rememberApproval(toolName, "always", args as Record<string, unknown>);
@@ -525,7 +536,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
           } else if (choice === "once") {
             cache.rememberApproval(toolName, "once", args as Record<string, unknown>);
             transcript.append(p.success(`  Approved ${toolName} once.`));
-          } else {
+          } else if (choice === "deny") {
             cache.rememberDenial(toolName, DenialReason.USER_DENIED, args as Record<string, unknown>);
             rememberAlwaysDeny(toolName);
             transcript.append(p.warning(`  Denied ${toolName}.`));
@@ -536,6 +547,12 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
           resolve(decision);
           return true;
         };
+        const abortApproval = () => finish(false, "abort");
+        if (abortSignal?.aborted) {
+          abortApproval();
+          return;
+        }
+        abortSignal?.addEventListener("abort", abortApproval, { once: true });
 
         approvalInput = new InputController({
           mode: "approval",
@@ -559,7 +576,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         });
       });
     },
-  };
+  });
 
   try {
     screen.enableBracketedPaste();
@@ -635,6 +652,8 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         engineRunning = true;
         activeTurnStartedAt = Date.now();
         activeAbortController = new AbortController();
+        const turnToken = ++activeTurnToken;
+        const ui = createUiCallbacks(turnToken);
         runtimeView?.beginTurn();
         startGlobalInput();
         const skillInstruction = activeSkillInstruction;
@@ -687,7 +706,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       } catch (e: any) {
         runtimeView?.finishTurn();
         engineRunning = false;
-        if (isAbortError(e)) {
+        if (isAbortError(e) || activeAbortController?.signal.aborted) {
           transcript.append("");
         } else {
           transcript.append(p.error(`\nError: ${e.message}\n`));
@@ -698,6 +717,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         engineRunning = false;
         activeTurnStartedAt = 0;
         activeAbortController = null;
+        activeTurnToken++;
       }
     }
   } finally {
