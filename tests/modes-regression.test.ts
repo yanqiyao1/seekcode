@@ -296,6 +296,35 @@ describe("sandbox and approval policy", () => {
     expect(checkCommand("rm -rf /")).toMatchObject({ decision: "deny" });
   });
 
+  it("keeps shell policy stable across read-only, ask, and deny edge cases", () => {
+    const allowCases = [
+      "FOO=bar cat file.txt",
+      "find src -name '*.ts' -print",
+      "git diff --stat README.md",
+      "tail -n 20 logs/app.log",
+    ];
+    const askCases = [
+      "tail -f logs/app.log",
+      "source ~/.bashrc",
+      "git status --output=out.txt",
+      "bash script.sh",
+    ];
+    const denyCases = [
+      "chmod 777 script.sh",
+      "dd if=/dev/zero of=/dev/sda",
+    ];
+
+    for (const command of allowCases) {
+      expect(checkCommand(command)).toMatchObject({ decision: "allow" });
+    }
+    for (const command of askCases) {
+      expect(checkCommand(command)).toMatchObject({ decision: "ask" });
+    }
+    for (const command of denyCases) {
+      expect(checkCommand(command)).toMatchObject({ decision: "deny" });
+    }
+  });
+
   it("enforces workspace boundaries across root, cwd, workdir, files, and shell paths", () => {
     const config = testConfig({ workspace_boundary: true, trusted_workspaces: [tmp] });
     const writeTool = tool("write", PermissionLevel.ASK, "file");
@@ -307,6 +336,39 @@ describe("sandbox and approval policy", () => {
     expect(checkSandboxPolicy(config, ctx(gitTool, "git_diff", { files: ["src/a.ts", "/etc/passwd"], workdir: tmp }, tmp))).toMatchObject({ decision: "deny" });
     expect(checkSandboxPolicy(config, ctx(bashTool, "bash", { command: "cat /etc/passwd", workdir: tmp }, tmp))).toMatchObject({ decision: "deny" });
     expect(checkSandboxPolicy(config, ctx(bashTool, "bash", { command: `cat ${join(tmp, "README.md")}`, workdir: tmp }, tmp))).toMatchObject({ decision: "allow" });
+  });
+
+  it("evaluates shell relative paths against the command workdir before enforcing workspace boundary", () => {
+    const workspace = join(tmp, "workspace");
+    const subdir = join(workspace, "pkg", "src");
+    mkdirSync(subdir, { recursive: true });
+    const config = testConfig({ workspace_boundary: true, trusted_workspaces: [workspace] });
+    const bashTool = tool("bash", PermissionLevel.ASK, "shell");
+
+    expect(checkSandboxPolicy(config, ctx(
+      bashTool,
+      "bash",
+      { command: "cat ../README.md", workdir: subdir },
+      workspace,
+    ))).toMatchObject({ decision: "allow" });
+    expect(checkSandboxPolicy(config, ctx(
+      bashTool,
+      "bash",
+      { command: "cat ../../../escape.txt", workdir: subdir },
+      workspace,
+    ))).toMatchObject({ decision: "deny" });
+    expect(checkSandboxPolicy(config, ctx(
+      bashTool,
+      "bash",
+      { command: "cat ../README.md", workdir: "pkg/src" },
+      workspace,
+    ))).toMatchObject({ decision: "allow" });
+    expect(checkSandboxPolicy(config, ctx(
+      bashTool,
+      "bash",
+      { command: "cat ../../../escape.txt", workdir: "pkg/src" },
+      workspace,
+    ))).toMatchObject({ decision: "deny" });
   });
 
   it("applies approval policy, sandbox mode, and trust boundary consistently", () => {

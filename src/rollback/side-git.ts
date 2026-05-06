@@ -1,7 +1,7 @@
 /** Side-git workspace snapshots — separate bare repo in .seekcode/side-git/. */
 
-import { mkdirSync, existsSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { mkdirSync, existsSync, rmSync } from "node:fs";
+import { resolve, join, relative } from "node:path";
 import { spawnSync } from "node:child_process";
 import { SEEKCODE_DIR } from "../paths.js";
 
@@ -54,6 +54,7 @@ export class SideGit {
     try {
       this.run("restore", "--source", commitHash, "--worktree", "--staged", "--", ".", ":(exclude).seekcode/side-git", ":(exclude).deepseek/side-git");
       this.run("clean", "-fd", "-e", ".seekcode/side-git", "-e", ".deepseek/side-git", "--", ".");
+      this.removeIgnoredUntrackedFiles();
       return true;
     }
     catch { return false; }
@@ -78,4 +79,23 @@ export class SideGit {
     if (result.status !== 0) throw new Error(result.stderr || result.stdout || `git exited with ${result.status}`);
     return result.stdout;
   }
+
+  private removeIgnoredUntrackedFiles(): void {
+    const output = this.run("ls-files", "-o", "-i", "--exclude-standard", "-z", "--", ".");
+    for (const relPath of output.split("\0").filter(Boolean)) {
+      const normalized = relPath.replace(/\\/g, "/").replace(/\/+$/, "");
+      if (!normalized || isProtectedMetadataPath(normalized)) continue;
+      const target = resolve(this.workspace, relPath);
+      const rel = relative(this.workspace, target);
+      if (!rel || rel.startsWith("..") || rel.startsWith("/") || /^[a-zA-Z]:/.test(rel)) continue;
+      rmSync(target, { recursive: true, force: true });
+    }
+  }
+}
+
+function isProtectedMetadataPath(relPath: string): boolean {
+  return relPath === SEEKCODE_DIR
+    || relPath.startsWith(`${SEEKCODE_DIR}/`)
+    || relPath === ".deepseek"
+    || relPath.startsWith(".deepseek/");
 }

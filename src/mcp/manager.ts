@@ -97,7 +97,16 @@ export class MCPManager {
       const health = await client.health();
       if (!health.ok) {
         const current = this.statuses.get(serverCfg.name);
-        this.statuses.set(serverCfg.name, { ...current, status: "failed", message: health.message, stderr_tail: health.stderr_tail, failure_count: (current?.failure_count || 0) + 1 });
+        unregisterMCPTools(serverCfg.name);
+        this.toolFingerprints.delete(serverCfg.name);
+        this.statuses.set(serverCfg.name, {
+          ...current,
+          status: "failed",
+          message: health.message,
+          stderr_tail: health.stderr_tail,
+          tool_count: 0,
+          failure_count: (current?.failure_count || 0) + 1,
+        });
         this.scheduleReconnect(serverCfg);
       } else {
         await this.refreshTools(serverCfg);
@@ -122,7 +131,15 @@ export class MCPManager {
       return true;
     } catch (e: any) {
       const current = this.statuses.get(serverCfg.name);
-      this.statuses.set(serverCfg.name, { ...current, status: "failed", message: e.message, failure_count: (current?.failure_count || 0) + 1 });
+      unregisterMCPTools(serverCfg.name);
+      this.toolFingerprints.delete(serverCfg.name);
+      this.statuses.set(serverCfg.name, {
+        ...current,
+        status: "failed",
+        message: e.message,
+        tool_count: 0,
+        failure_count: (current?.failure_count || 0) + 1,
+      });
       return false;
     }
   }

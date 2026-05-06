@@ -68,7 +68,7 @@ function legacy(alias: string): ModelDeprecation {
   };
 }
 
-export function parseProvider(value: string | undefined | null): ApiProvider {
+export function resolveProviderAlias(value: string | undefined | null): ApiProvider | null {
   const normalized = (value || "deepseek").trim().toLowerCase().replace(/_/g, "-");
   switch (normalized) {
     case "deepseek":
@@ -94,8 +94,12 @@ export function parseProvider(value: string | undefined | null): ApiProvider {
     case "sg-lang":
       return "sglang";
     default:
-      return "deepseek";
+      return null;
   }
+}
+
+export function parseProvider(value: string | undefined | null): ApiProvider {
+  return resolveProviderAlias(value) || "deepseek";
 }
 
 export function canonicalModelName(model: string): string | null {

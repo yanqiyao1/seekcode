@@ -220,6 +220,9 @@ export class TuiRuntimeViewModel {
           this.renderToolCallStart(event.data.name, event.data.id || event.data.name);
         }
         break;
+      case "approval_required":
+        this.renderApprovalRequired(event.data.tool, event.data.args);
+        break;
       case "tool_result":
         this.renderToolResult(event.data.name, event.preview);
         break;
@@ -282,6 +285,18 @@ export class TuiRuntimeViewModel {
     else this.transcript.append(line);
     const diffPreview = r.toolDiffPreview(preview);
     if (diffPreview) this.transcript.append(diffPreview);
+    this.assistantStream.reset();
+    this.setLastTranscriptEvent("tool");
+    this.syncActiveToolCount();
+    this.autoFollowBottom();
+    this.options.renderNow?.();
+  }
+
+  private renderApprovalRequired(name: string, args: Record<string, unknown>): void {
+    const line = r.toolCallStatus(name, "denied", `Approval required: ${Object.keys(args).length ? JSON.stringify(args) : "no arguments"}`);
+    const activeToolLine = this.activeToolLines.finish(name);
+    if (activeToolLine !== undefined) this.transcript.replaceLine(activeToolLine, line);
+    else this.transcript.append(line);
     this.assistantStream.reset();
     this.setLastTranscriptEvent("tool");
     this.syncActiveToolCount();

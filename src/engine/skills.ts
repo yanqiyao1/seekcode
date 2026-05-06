@@ -514,6 +514,7 @@ export async function updateSkill(
   }
   const skill = installSkillFromArchive(downloaded.archive, downloaded.sourceSpec, skillsDir, maxSizeBytes, {
     force: true,
+    expectedName: name,
   });
   return { status: "updated", skill };
 }
@@ -543,7 +544,7 @@ export function installSkillFromArchive(
   sourceSpec: string,
   skillsDir: string,
   maxSizeBytes = DEFAULT_SKILL_INSTALL_SIZE_BYTES,
-  options: { force?: boolean } = {},
+  options: { force?: boolean; expectedName?: string } = {},
 ): InstalledSkill {
   if (archive.byteLength > maxSizeBytes) {
     throw new Error(`archive exceeds max_install_size_bytes (${maxSizeBytes})`);
@@ -564,6 +565,9 @@ export function installSkillFromArchive(
     directory: "",
     system: false,
   });
+  if (options.expectedName && parsed.name !== options.expectedName) {
+    throw new Error(`archive skill name mismatch: expected '${options.expectedName}', got '${parsed.name}'`);
+  }
   if (parsed.body.includes("\0")) throw new Error("SKILL.md body contains NUL byte");
   const destination = join(resolveSkillPath(skillsDir), parsed.name);
   if (existsSync(destination) && !options.force) {

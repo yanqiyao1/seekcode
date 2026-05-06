@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { nextModeName } from "../src/modes/base.js";
 import { fitAnsi, stripAnsi, truncateAnsi, visibleLength, wrapAnsi } from "../src/ui/ansi.js";
@@ -121,6 +121,21 @@ describe("Transcript", () => {
     transcript.render(2, 3);
 
     expect(transcript.scrollOffset).toBe(2);
+  });
+
+  it("keeps the visible history anchored while new transcript content arrives", () => {
+    const transcript = new Transcript();
+    transcript.append(Array.from({ length: 8 }, (_, index) => `line ${index}`).join("\n"));
+    transcript.render(3, 80);
+    transcript.scrollUp(2);
+    const before = stripAnsi(transcript.render(3, 80)).split("\n").map(line => line.trim());
+
+    transcript.append("line 8\nline 9");
+    const after = stripAnsi(transcript.render(3, 80)).split("\n").map(line => line.trim());
+
+    expect(before).toEqual(["line 3", "line 4", "line 5"]);
+    expect(after).toEqual(before);
+    expect(transcript.scrollOffset).toBe(4);
   });
 
   it("retains more than ten thousand transcript lines", () => {
@@ -416,6 +431,22 @@ describe("TuiRuntimeViewModel", () => {
 
     expect(plain).toContain("hello");
     expect(plain.match(/\bHi\b/g)).toHaveLength(1);
+  });
+
+  it("replays approval_required runtime items as denied tool status", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+    const events = runtimeItemsToEngineRuntimeEvents([
+      { type: "tool_call_begin", data: { name: "write", tool_call_id: "call-write-1" } },
+      { type: "approval_required", data: { tool: "write", args: { path: "draft.txt", content: "hello" } } },
+    ]);
+
+    view.replayRuntimeEvents(events);
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+
+    expect(plain).toContain("write");
+    expect(plain).toContain("Approval required");
+    expect(plain).toContain("draft.txt");
   });
 });
 
@@ -921,6 +952,26 @@ describe("InputController", () => {
     approval.handleData("always");
     expect(approvals).toEqual(["always"]);
     expect(approval.getState().value).toBe("");
+  });
+
+  it("passes Esc through approval mode so modal handlers can cancel without editing text", async () => {
+    const sequences: string[] = [];
+    vi.useFakeTimers();
+    const approval = new InputController({
+      mode: "approval",
+      editable: false,
+      onUnhandledSequence: (sequence) => {
+        sequences.push(sequence);
+        return true;
+      },
+    });
+
+    approval.handleData("\x1b");
+    await vi.advanceTimersByTimeAsync(30);
+
+    expect(sequences).toEqual(["\x1b"]);
+    expect(approval.getState()).toMatchObject({ value: "", cursor: 0 });
+    vi.useRealTimers();
   });
 });
 

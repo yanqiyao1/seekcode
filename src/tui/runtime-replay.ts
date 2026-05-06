@@ -89,6 +89,16 @@ export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRu
       };
     case "tool_call":
       return { type: "tool_call", data: data as unknown as ToolCall, artifact_ids: item.artifact_ids };
+    case "approval_required":
+      return {
+        type: "approval_required",
+        data: {
+          tool: String(data?.tool ?? "tool"),
+          args: (data?.args && typeof data.args === "object") ? data.args as Record<string, unknown> : {},
+          description: typeof data?.description === "string" ? data.description : undefined,
+        },
+        artifact_ids: item.artifact_ids,
+      };
     case "tool_result": {
       const result = data as unknown as ToolResult;
       return {

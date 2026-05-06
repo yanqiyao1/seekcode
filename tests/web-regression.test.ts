@@ -823,4 +823,32 @@ describe("web tools", () => {
     expect(ref).toBeTruthy();
     expect(fetched).toContain("blocked by web.blocked_domains");
   });
+
+  it("does not reuse cached redirect fetches after domain policy changes", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "https://example.com/redirect-policy-test") {
+        return new Response("", {
+          status: 302,
+          headers: { location: "https://final.example/page" },
+        });
+      }
+      if (url === "https://final.example/page") {
+        return new Response("<html><body><h1>Redirected page</h1></body></html>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const first = await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/redirect-policy-test" });
+
+    getRegistry().clear();
+    registerWebTools({ blocked_domains: ["final.example"] });
+    const second = await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/redirect-policy-test" });
+
+    expect(first).toContain("URL: https://final.example/page");
+    expect(second).toContain("blocked by web.blocked_domains");
+  });
 });

@@ -12,6 +12,12 @@ export interface ApprovalAuditEventData {
   reason?: string;
 }
 
+export interface ApprovalRequiredEventData {
+  tool: string;
+  args: Record<string, unknown>;
+  description?: string;
+}
+
 export interface HookEventData {
   event: "PreToolUse" | "PostToolUse";
   tool: string;
@@ -60,6 +66,7 @@ export interface EngineRuntimeEventMap {
   context_intervention: ContextIntervention;
   tool_call: ToolCall;
   tool_budget_exceeded: { tool: string; budget: number };
+  approval_required: ApprovalRequiredEventData;
   approval_audit: ApprovalAuditEventData;
   hook: HookEventData;
   tool_stats: { stats: ToolStats; degraded: string | null };

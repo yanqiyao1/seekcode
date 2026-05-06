@@ -134,7 +134,7 @@ export class Engine {
       while (iterations < this.config.max_turns) {
         if (this.interrupted) break;
         iterations++;
-        const approvalPolicy = effectiveApprovalPolicy(this.config);
+        const approvalPolicy = effectiveApprovalPolicy(this.config, mode);
 
         const projectedTokens = this.requestTokenCount();
         const capacityDecision = this.capacity.observe(projectedTokens, this.config.context_limit);
@@ -212,53 +212,73 @@ export class Engine {
             continue;
           }
 
-          const ctx: ApprovalContext = {
-            tool_name: tc.name, tool_args: tc.arguments,
-            tool_def: toolDef, workspace_path: this.session.workspace_path,
-          };
-          const sandbox = checkSandboxPolicy(this.config, ctx);
-          if (sandbox.decision === "deny") {
-            const deny = `Tool '${tc.name}' was denied by sandbox: ${sandbox.reason}.`;
-            const tr: ToolResult = {
-              tool_call_id: tc.id, name: tc.name, content: deny, is_error: true,
-            };
-            recordToolResult(tr);
-            turnToolCalls.push(tc);
-            turnToolResults.push(tr);
-            await emitRuntimeEvent(callbacks, { type: "approval_audit", data: { tool: tc.name, decision: "deny", reason: sandbox.reason } });
-            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: deny.slice(0, 200) });
-            continue;
-          }
-
-          let approved: boolean;
-          if (sandbox.decision === "ask" && approvalPolicy !== "never") {
-            approved = await callbacks?.requestApproval?.(
-              tc.name,
-              tc.arguments,
-              `Sandbox approval required: ${sandbox.reason}\n\nArguments: ${JSON.stringify(tc.arguments)}`,
-            ) ?? false;
-          } else {
-            approved = sandbox.decision === "allow" && approvalPolicy === "never"
-              ? true
-              : await mode.checkPermission(ctx, callbacks);
-          }
-          if (sandbox.decision === "ask" && approvalPolicy === "never") approved = true;
-          await emitRuntimeEvent(callbacks, { type: "approval_audit", data: { tool: tc.name, decision: approved ? "allow" : "deny", reason: sandbox.reason } });
-          if (!approved) {
-            const deny = `Tool '${tc.name}' was denied.`;
-            const tr: ToolResult = {
-              tool_call_id: tc.id, name: tc.name, content: deny, is_error: true,
-            };
-            recordToolResult(tr);
-            turnToolCalls.push(tc);
-            turnToolResults.push(tr);
-            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: deny.slice(0, 200) });
-            continue;
-          }
-
           try {
             let resultContent: string;
+            const pushToolError = async (content: string): Promise<void> => {
+              const tr: ToolResult = {
+                tool_call_id: tc.id,
+                name: tc.name,
+                content,
+                is_error: true,
+              };
+              recordToolResult(tr);
+              turnToolResults.push(tr);
+              turnToolCalls.push(tc);
+              await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: content.slice(0, 200) });
+            };
+            const normalizeArgs = async (nextArgs: Record<string, unknown>): Promise<Record<string, unknown> | null> => {
+              const validation = await validateToolInput(toolDef, nextArgs, {
+                tool_name: tc.name,
+                workspace_path: this.session.workspace_path,
+              });
+              if (!validation.ok) {
+                const err = `Error: invalid input for tool '${tc.name}': ${validation.message || "validation failed"}`;
+                await pushToolError(err);
+                return null;
+              }
+              return withWorkspaceDefaults(tc.name, validation.args ?? nextArgs, this.session.workspace_path);
+            };
+            const authorizeArgs = async (nextArgs: Record<string, unknown>): Promise<boolean> => {
+              const nextCtx: ApprovalContext = {
+                tool_name: tc.name,
+                tool_args: nextArgs,
+                tool_def: toolDef,
+                workspace_path: this.session.workspace_path,
+              };
+              const nextSandbox = checkSandboxPolicy(this.config, nextCtx);
+              if (nextSandbox.decision === "deny") {
+                await emitRuntimeEvent(callbacks, { type: "approval_audit", data: { tool: tc.name, decision: "deny", reason: nextSandbox.reason } });
+                await pushToolError(`Tool '${tc.name}' was denied by sandbox: ${nextSandbox.reason}.`);
+                return false;
+              }
+
+              let approvedAfterMutation: boolean;
+              if (nextSandbox.decision === "ask" && approvalPolicy !== "never") {
+                approvedAfterMutation = await callbacks?.requestApproval?.(
+                  tc.name,
+                  nextArgs,
+                  `Sandbox approval required: ${nextSandbox.reason}\n\nArguments: ${JSON.stringify(nextArgs)}`,
+                ) ?? false;
+              } else {
+                approvedAfterMutation = nextSandbox.decision === "allow" && approvalPolicy === "never"
+                  ? true
+                  : await mode.checkPermission(nextCtx, callbacks);
+              }
+              if (nextSandbox.decision === "ask" && approvalPolicy === "never") approvedAfterMutation = true;
+              await emitRuntimeEvent(callbacks, {
+                type: "approval_audit",
+                data: { tool: tc.name, decision: approvedAfterMutation ? "allow" : "deny", reason: nextSandbox.reason },
+              });
+              if (!approvedAfterMutation) {
+                await pushToolError(`Tool '${tc.name}' was denied.`);
+                return false;
+              }
+              return true;
+            };
             let args = withWorkspaceDefaults(tc.name, tc.arguments as Record<string, unknown>, this.session.workspace_path);
+            const normalizedArgs = await normalizeArgs(args);
+            if (!normalizedArgs) continue;
+            args = normalizedArgs;
             const preHook = await fireHooks("PreToolUse", {
               tool_name: tc.name,
               tool_input: args,
@@ -279,40 +299,11 @@ export class Engine {
             }
             if (preHook.modified_input) {
               args = withWorkspaceDefaults(tc.name, { ...args, ...preHook.modified_input }, this.session.workspace_path);
-              const modifiedCtx: ApprovalContext = {
-                tool_name: tc.name, tool_args: args,
-                tool_def: toolDef, workspace_path: this.session.workspace_path,
-              };
-              const modifiedSandbox = checkSandboxPolicy(this.config, modifiedCtx);
-              if (modifiedSandbox.decision === "deny") {
-                const deny = `Tool '${tc.name}' was denied after hook input modification: ${modifiedSandbox.reason}.`;
-                const tr: ToolResult = {
-                  tool_call_id: tc.id, name: tc.name, content: deny, is_error: true,
-                };
-                recordToolResult(tr);
-                turnToolResults.push(tr);
-                turnToolCalls.push(tc);
-                await emitRuntimeEvent(callbacks, { type: "approval_audit", data: { tool: tc.name, decision: "deny", reason: modifiedSandbox.reason } });
-                await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: deny.slice(0, 200) });
-                continue;
-              }
+              const revalidatedArgs = await normalizeArgs(args);
+              if (!revalidatedArgs) continue;
+              args = revalidatedArgs;
             }
-            const validation = await validateToolInput(toolDef, args, {
-              tool_name: tc.name,
-              workspace_path: this.session.workspace_path,
-            });
-            if (!validation.ok) {
-              const err = `Error: invalid input for tool '${tc.name}': ${validation.message || "validation failed"}`;
-              const tr: ToolResult = {
-                tool_call_id: tc.id, name: tc.name, content: err, is_error: true,
-              };
-              recordToolResult(tr);
-              turnToolResults.push(tr);
-              turnToolCalls.push(tc);
-              await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: err.slice(0, 200) });
-              continue;
-            }
-            if (validation.args) args = withWorkspaceDefaults(tc.name, validation.args, this.session.workspace_path);
+            if (!(await authorizeArgs(args))) continue;
             // Map argument names (Python snake_case → JS camelCase already handled by Zod/JSON parsing)
             const toolStart = Date.now();
             resultContent = await toolDef.execute(args, {
@@ -543,8 +534,8 @@ function isUsageRecord(value: unknown): value is UsageTelemetry {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-function effectiveApprovalPolicy(config: Config): Config["approval_policy"] {
-  return config.mode === "yolo" ? "never" : config.approval_policy;
+function effectiveApprovalPolicy(config: Config, mode: BaseMode): Config["approval_policy"] {
+  return mode.name === "yolo" ? "never" : config.approval_policy;
 }
 
 function isAbortLikeError(error: unknown): boolean {

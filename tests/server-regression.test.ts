@@ -322,6 +322,158 @@ describe("HTTP/SSE server", () => {
     expect(thread.turns.find(turn => turn.id === turnId)?.status).not.toBe("failed");
   });
 
+  it("does not persist partial streamed assistant state when the upstream stream fails mid-turn", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    clientSendMocks.push(async function* () {
+      yield { type: "thinking", text: "drafting" };
+      yield { type: "content", text: "partial answer" };
+      yield { type: "tool_call_begin", index: 0, tool_call_id: "call_partial_1", name: "read" };
+      throw new Error("upstream stream failed");
+    });
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const created = await createResp.json() as { session_id: string; thread_id: string };
+
+    const chatResp = await app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "trigger upstream failure" }),
+    });
+    const body = await chatResp.text();
+    const thread = await (await app.request(`/v1/threads/${created.thread_id}`)).json() as {
+      turns: Array<{ id: string; status: string; error?: string }>;
+      session: { messages: Array<{ role: string; content?: string | null }> };
+    };
+    const events = await (await app.request(`/v1/threads/${created.thread_id}/events?since_seq=0`)).json() as {
+      events: Array<{ event: string; turn_id?: string }>;
+    };
+    const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as {
+      items: Array<{ type: string; turn_id?: string; data?: { text?: string; name?: string } }>;
+    };
+    const turnId = thread.turns.at(-1)!.id;
+
+    expect(body).toContain("event: thinking");
+    expect(body).toContain("event: content");
+    expect(body).toContain("event: tool_call");
+    expect(body).toContain("event: error");
+    expect(thread.turns.find(turn => turn.id === turnId)).toMatchObject({
+      status: "failed",
+      error: "upstream stream failed",
+    });
+    expect(thread.session.messages.some(message => message.role === "assistant" && (message.content || "").includes("partial answer"))).toBe(false);
+    expect(items.items.filter(item => item.turn_id === turnId).map(item => item.type)).not.toEqual(
+      expect.arrayContaining(["thinking_delta", "content_delta", "tool_call_begin"]),
+    );
+    expect(events.events.filter(event => event.turn_id === turnId).map(event => event.event)).not.toEqual(
+      expect.arrayContaining(["thinking", "content", "tool_call"]),
+    );
+    expect(items.items.filter(item => item.turn_id === turnId).map(item => item.type)).toEqual(
+      expect.arrayContaining(["turn_input"]),
+    );
+    expect(events.events.filter(event => event.turn_id === turnId).map(event => event.event)).toEqual(
+      expect.arrayContaining(["turn.queued", "turn.in_progress", "item.turn_input", "turn.failed"]),
+    );
+  });
+
+  it("persists approval_required across SSE replay, thread events, items, and runtime reload", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    clientSendMocks.push(
+      async function* () {
+        yield { type: "tool_call_begin", index: 0, tool_call_id: "call_write_1", name: "write" };
+        yield {
+          type: "done",
+          finish_reason: "tool_calls",
+          usage: null,
+          content: "",
+          reasoning_content: null,
+          tool_calls: [{ id: "call_write_1", name: "write", arguments: { path: "draft.txt", content: "hello" } }],
+        };
+      },
+      async function* () {
+        yield { type: "content", text: "write denied" };
+        yield { type: "done", finish_reason: "stop", usage: { total_tokens: 1 }, content: "write denied", reasoning_content: null, tool_calls: [] };
+      },
+    );
+
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const created = await createResp.json() as { session_id: string; thread_id: string };
+
+    const chatResp = await app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "please write a draft file" }),
+    });
+    const body = await chatResp.text();
+    const turnId = getRuntimeRecord(created.thread_id)!.turns.at(-1)!.id;
+
+    const eventsBefore = await (await app.request(`/v1/threads/${created.thread_id}/events?since_seq=0`)).json() as {
+      events: Array<{ event: string; turn_id?: string; data?: { tool?: string; args?: Record<string, unknown>; description?: string } }>;
+    };
+    const itemsBefore = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as {
+      items: Array<{ type: string; turn_id?: string; data?: { tool?: string; args?: Record<string, unknown>; description?: string } }>;
+    };
+
+    const approvalEvent = eventsBefore.events.find(event => event.event === "approval_required");
+    const approvalItem = itemsBefore.items.find(item => item.type === "approval_required");
+
+    expect(body).toContain("event: tool_call");
+    expect(body).toContain("event: approval_required");
+    expect(body).toContain("event: content");
+    expect(body).toContain("event: done");
+    expect(approvalEvent).toMatchObject({
+      event: "approval_required",
+      turn_id: turnId,
+      data: {
+        tool: "write",
+        args: { path: "draft.txt", content: "hello" },
+      },
+    });
+    expect(approvalEvent?.data?.description).toContain("Write content to a file.");
+    expect(approvalItem).toMatchObject({
+      type: "approval_required",
+      turn_id: turnId,
+      data: {
+        tool: "write",
+        args: { path: "draft.txt", content: "hello" },
+      },
+    });
+    expect(approvalItem?.data?.description).toContain("Write content to a file.");
+    expect(eventsBefore.events.map(event => event.event)).toEqual(expect.arrayContaining([
+      "tool_call",
+      "item.approval_required",
+      "approval_required",
+      "item.approval_audit",
+    ]));
+    expect(itemsBefore.items.map(item => item.type)).toEqual(expect.arrayContaining([
+      "tool_call_begin",
+      "tool_call",
+      "approval_required",
+      "approval_audit",
+      "tool_result",
+    ]));
+
+    reloadRuntimeStoreForTests();
+
+    const eventsAfter = await (await app.request(`/v1/threads/${created.thread_id}/events?since_seq=0`)).json() as {
+      events: Array<{ event: string; turn_id?: string; data?: { tool?: string; args?: Record<string, unknown> } }>;
+    };
+    const itemsAfter = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as {
+      items: Array<{ type: string; turn_id?: string; data?: { tool?: string; args?: Record<string, unknown> } }>;
+    };
+
+    expect(eventsAfter.events.find(event => event.event === "approval_required")).toMatchObject({
+      event: "approval_required",
+      turn_id: turnId,
+      data: { tool: "write", args: { path: "draft.txt", content: "hello" } },
+    });
+    expect(itemsAfter.items.find(item => item.type === "approval_required")).toMatchObject({
+      type: "approval_required",
+      turn_id: turnId,
+      data: { tool: "write", args: { path: "draft.txt", content: "hello" } },
+    });
+  });
+
   it("deletes runtime threads, replay files, and session resume targets", async () => {
     process.env.DEEPSEEK_API_KEY = "test";
     const app = createApp();

@@ -23,13 +23,14 @@ import { registerFileTools } from "../src/tools/file-ops.js";
 import { registerGitTools } from "../src/tools/git.js";
 import { registerPatchTool } from "../src/tools/patch.js";
 import { applyPatch as applyAdvancedPatch } from "../src/tools/patch-advanced.js";
+import { registerShellTool } from "../src/tools/shell.js";
 import { SideGit } from "../src/rollback/side-git.js";
 import { registerToolSearchTool } from "../src/tools/tool-search.js";
 import { registerDiagnosticsTools } from "../src/tools/diagnostics.js";
 import { registerArtifactTools } from "../src/tools/artifacts.js";
 import { clearArtifactsForTests, listArtifactLinks, readArtifact } from "../src/artifacts/store.js";
 import { clearMCPManagerForTests, getMCPManager } from "../src/mcp/manager.js";
-import { activateSkill, applySkillToUserInput, installSkillFromArchive, scanSkills, trustSkill, uninstallSkill } from "../src/engine/skills.js";
+import { activateSkill, applySkillToUserInput, installSkillFromArchive, scanSkills, trustSkill, uninstallSkill, updateSkill } from "../src/engine/skills.js";
 
 let tmp: string;
 let oldArtifactsDir: string | undefined;
@@ -135,6 +136,38 @@ describe("file tools", () => {
     expect(glob).toContain("目录/文件.txt");
   });
 
+  it("handles relative ls/search/glob paths without requiring an explicit root", async () => {
+    registerFileTools();
+    const oldCwd = process.cwd();
+    process.chdir(tmp);
+    try {
+      mkdirSync(join("src", "nested"), { recursive: true });
+      writeFileSync(join("src", "nested", "file.txt"), "needle\n");
+
+      const list = await getRegistry().lookup("ls")!.execute({ path: "src" });
+      const search = await getRegistry().lookup("search")!.execute({ path: "src", pattern: "needle" });
+      const glob = await getRegistry().lookup("glob")!.execute({ path: "src", pattern: "nested/*.txt" });
+
+      expect(list).toContain("nested/");
+      expect(search).toContain("file.txt");
+      expect(glob).toContain("nested/file.txt");
+    } finally {
+      process.chdir(oldCwd);
+    }
+  });
+
+  it("reads and writes empty files without fabricating content", async () => {
+    registerFileTools();
+    const file = join(tmp, "empty.txt");
+
+    const write = await getRegistry().lookup("write")!.execute({ path: file, content: "", root: tmp });
+    const read = await getRegistry().lookup("read")!.execute({ path: file, root: tmp });
+
+    expect(write).toContain("Successfully wrote 0 bytes");
+    expect(read).toBe("");
+    expect(readFileSync(file, "utf-8")).toBe("");
+  });
+
   it("accepts common path/content aliases for write validation", async () => {
     registerFileTools();
     const file = join(tmp, "alias-target.txt");
@@ -223,6 +256,22 @@ describe("git and patch tools", () => {
 
     expect(result).toContain("-old");
     expect(result).toContain("+new");
+  });
+
+  it("git_diff handles Unicode file names in nested directories", async () => {
+    registerGitTools();
+    await run("git init");
+    await run("git config user.email test@example.com");
+    await run("git config user.name Tester");
+    mkdirSync(join(tmp, "目录"), { recursive: true });
+    writeFileSync(join(tmp, "目录", "文件 名.txt"), "旧内容\n");
+    await run("git add . && git commit -m init");
+    writeFileSync(join(tmp, "目录", "文件 名.txt"), "新内容\n");
+
+    const result = await getRegistry().lookup("git_diff")!.execute({ workdir: tmp, files: ["目录/文件 名.txt"] });
+
+    expect(result).toContain("-旧内容");
+    expect(result).toContain("+新内容");
   });
 
   it("apply_patch cleans up temp files after a failed patch", async () => {
@@ -464,6 +513,50 @@ describe("git and patch tools", () => {
     expect(result[0].message).toMatch(/symlink|escapes workdir/i);
     expect(readFileSync(join(outside, "target.txt"), "utf-8")).toBe("outside\n");
   });
+
+  it("advanced patch applies the intended repeated block instead of the first textual match", () => {
+    const file = join(tmp, "repeat.txt");
+    writeFileSync(file, [
+      "start",
+      "common",
+      "target",
+      "common",
+      "middle",
+      "common",
+      "target",
+      "common",
+      "end",
+      "",
+    ].join("\n"));
+    const patch = [
+      "diff --git a/repeat.txt b/repeat.txt",
+      "index 1111111..2222222 100644",
+      "--- a/repeat.txt",
+      "+++ b/repeat.txt",
+      "@@ -6,3 +6,3 @@",
+      " common",
+      "-target",
+      "+patched",
+      " common",
+      "",
+    ].join("\n");
+
+    const result = applyAdvancedPatch(patch, { workdir: tmp });
+
+    expect(result[0]).toMatchObject({ type: "update", path: "repeat.txt" });
+    expect(readFileSync(file, "utf-8")).toBe([
+      "start",
+      "common",
+      "target",
+      "common",
+      "middle",
+      "common",
+      "patched",
+      "common",
+      "end",
+      "",
+    ].join("\n"));
+  });
 });
 
 describe("tool catalog", () => {
@@ -647,6 +740,23 @@ describe("side git rollback", () => {
     expect(existsSync(later)).toBe(false);
     expect(existsSync(join(workspace, ".seekcode", "side-git", "HEAD"))).toBe(true);
     expect((await sideGit.listSnapshots()).map(item => item.message)).toEqual(["post-turn-1", "pre-turn-1"]);
+  });
+
+  it("removes ignored files that were created after the snapshot", async () => {
+    const workspace = join(tmp, "ignored cleanup");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, ".gitignore"), "ignored.log\n");
+    const ignored = join(workspace, "ignored.log");
+    const sideGit = new SideGit(workspace);
+
+    expect(await sideGit.init()).toBe(true);
+    const snap = await sideGit.snapshotPre(1);
+    expect(snap).toBeTruthy();
+    writeFileSync(ignored, "temporary\n");
+    const snapshots = await sideGit.listSnapshots();
+
+    expect(await sideGit.restoreTo(snapshots[0].hash)).toBe(true);
+    expect(existsSync(ignored)).toBe(false);
   });
 });
 
@@ -1006,6 +1116,81 @@ describe("engine", () => {
     expect(result.tool_results[0]).toMatchObject({ is_error: true });
     expect(result.tool_results[0].content).toContain("required_value is required");
     expect(client.calls[1].messages.find((message: any) => message.role === "tool")?.content).toContain("invalid input");
+  });
+
+  it("re-checks sandbox boundaries after validateInput rewrites tool arguments", async () => {
+    let executed = false;
+    getRegistry().register({
+      name: "write",
+      description: "write",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ASK,
+      category: "file",
+      parallelOk: false,
+      validateInput: () => ({
+        ok: true,
+        args: { path: "../escape.txt", content: "rewritten" },
+      }),
+      execute: async () => {
+        executed = true;
+        return "should not run";
+      },
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "write", arguments: { path: "inside.txt", content: "x" } }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+
+    expect(executed).toBe(false);
+    expect(result.tool_results[0].is_error).toBe(true);
+    expect(result.tool_results[0].content).toContain("sandbox");
+    expect(existsSync(join(tmp, "..", "escape.txt"))).toBe(false);
+  });
+
+  it("requests approval with validateInput-normalized arguments", async () => {
+    let approvalArgs: Record<string, unknown> | null = null;
+    let executed = false;
+    getRegistry().register({
+      name: "ask_tool",
+      description: "ask tool",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ASK,
+      category: "test",
+      parallelOk: false,
+      validateInput: () => ({
+        ok: true,
+        args: { path: "normalized.txt", content: "normalized" },
+      }),
+      execute: async () => {
+        executed = true;
+        return "should not run";
+      },
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "ask_tool", arguments: { path: "raw.txt", content: "raw" } }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      requestApproval: async (_toolName, args) => {
+        approvalArgs = args;
+        return false;
+      },
+    });
+
+    expect(executed).toBe(false);
+    expect(approvalArgs).toEqual({ path: "normalized.txt", content: "normalized" });
+    expect(result.tool_results[0].content).toContain("denied");
   });
 
   it("emits tool progress events and rendered result metadata", async () => {
@@ -1409,6 +1594,122 @@ describe("engine", () => {
     expect(requestMessages.some(message => message.role === "user" && message.content === "go")).toBe(true);
   });
 
+  it("keeps request projection anchored to only the latest compaction boundary after repeated compactions", () => {
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    for (let i = 0; i < 24; i++) {
+      history.addUser(`user ${i} ${"x".repeat(220)}`);
+      history.addAssistant(`assistant ${i}`, null, i % 2 === 0 ? "reasoning".repeat(20) : null);
+    }
+    const compactor = new ContextCompactor({ ...testConfig(), context_limit: 120 });
+
+    const first = compactor.compact(history);
+    for (let i = 24; i < 34; i++) {
+      history.addUser(`later user ${i} ${"y".repeat(220)}`);
+      history.addAssistant(`later assistant ${i}`);
+    }
+    const second = compactor.compact(history);
+    const projected = projectMessagesForRequest(session.messages);
+    const boundaries = projected.filter(message => message.name === "context_compaction_boundary");
+    const summaries = projected.filter(message => message.name === "context_summary");
+
+    expect(first.boundary_id).toBeTruthy();
+    expect(second.boundary_id).toBeTruthy();
+    expect(second.boundary_id).not.toBe(first.boundary_id);
+    expect(boundaries).toHaveLength(1);
+    expect(summaries).toHaveLength(1);
+    expect(boundaries[0].content).toContain(`boundary_id: ${second.boundary_id}`);
+    expect(projected.some(message => message.content?.includes(first.boundary_id!))).toBe(false);
+    expect(projected.some(message => message.role === "user" && message.content?.includes("user 0"))).toBe(false);
+    expect(projected.some(message => message.role === "user" && message.content?.includes("later user 33"))).toBe(true);
+  });
+
+  it("replays prior assistant tool calls and tool results in stable order across multiple turns", async () => {
+    getRegistry().register({
+      name: "alpha_tool",
+      description: "alpha",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      execute: async () => "alpha-result",
+    });
+    getRegistry().register({
+      name: "beta_tool",
+      description: "beta",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      execute: async () => "beta-result",
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "alpha_tool", arguments: {} }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "first turn done", reasoning_content: null, tool_calls: [] },
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_2", name: "beta_tool", arguments: {} }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "second turn done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    await engine.runTurn("turn one", getMode("agent"));
+    await engine.runTurn("turn two", getMode("agent"));
+
+    const secondRequestMessages = client.calls[2].messages as Array<{ role?: string; tool_calls?: Array<{ id: string }>; tool_call_id?: string; name?: string; content?: string }>;
+    const relevant = secondRequestMessages.filter(message =>
+      (message.role === "assistant" && message.tool_calls?.length)
+      || message.role === "tool",
+    );
+
+    expect(relevant.map(message => message.role === "assistant" ? message.tool_calls?.[0]?.id : message.tool_call_id)).toEqual(["call_1", "call_1"]);
+    expect(relevant[0]).toMatchObject({ role: "assistant" });
+    expect(relevant[1]).toMatchObject({ role: "tool", name: "alpha_tool", content: "alpha-result" });
+  });
+
+  it("emits distinct prefix invalidations across repeated compacting turns and keeps only the latest boundary in requests", async () => {
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    for (let i = 0; i < 20; i++) {
+      history.addUser(`seed user ${i} ${"z".repeat(220)}`);
+      history.addAssistant(`seed assistant ${i}`);
+    }
+    const client = new FakeClient([
+      { type: "done", finish_reason: "stop", usage: null, content: "after first compaction", reasoning_content: null, tool_calls: [] },
+      { type: "done", finish_reason: "stop", usage: null, content: "after second compaction", reasoning_content: null, tool_calls: [] },
+    ]);
+    const events: EngineRuntimeEvent[] = [];
+    const engine = new Engine({ ...testConfig(), context_limit: 100 }, session, history, client as any, getRegistry());
+
+    await engine.runTurn("first compacting turn", getMode("agent"), {
+      onRuntimeEvent: async (event) => { events.push(event); },
+    });
+    for (let i = 0; i < 8; i++) {
+      history.addUser(`post turn user ${i} ${"q".repeat(220)}`);
+      history.addAssistant(`post turn assistant ${i}`);
+    }
+    await engine.runTurn("second compacting turn", getMode("agent"), {
+      onRuntimeEvent: async (event) => { events.push(event); },
+    });
+
+    const invalidations = events.filter(event => event.type === "prefix_invalidated");
+    const firstBoundaryId = (invalidations[0]?.data as any)?.boundary_id;
+    const secondBoundaryId = (invalidations[1]?.data as any)?.boundary_id;
+    const secondRequestMessages = client.calls[1].messages as Array<{ name?: string; content?: string }>;
+    const secondBoundaries = secondRequestMessages.filter(message => message.name === "context_compaction_boundary");
+
+    expect(invalidations).toHaveLength(2);
+    expect(firstBoundaryId).toBeTruthy();
+    expect(secondBoundaryId).toBeTruthy();
+    expect(secondBoundaryId).not.toBe(firstBoundaryId);
+    expect(secondBoundaries).toHaveLength(1);
+    expect(secondBoundaries[0].content).toContain(`boundary_id: ${secondBoundaryId}`);
+    expect(secondRequestMessages.some(message => message.content?.includes(firstBoundaryId))).toBe(false);
+  });
+
   it("blocks tool paths that escape the workspace boundary", async () => {
     getRegistry().register({
       name: "write",
@@ -1424,6 +1725,26 @@ describe("engine", () => {
     history.addSystem("system");
     const client = new FakeClient([
       { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "write", arguments: { path: "../escape.txt", content: "x" } }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+
+    expect(result.tool_results[0].is_error).toBe(true);
+    expect(result.tool_results[0].content).toContain("sandbox");
+  });
+
+  it("blocks bash commands that escape the workspace boundary through relative paths", async () => {
+    registerShellTool();
+    const workspace = join(tmp, "workspace");
+    const subdir = join(workspace, "pkg", "src");
+    mkdirSync(subdir, { recursive: true });
+    const session = createSession({ workspace_path: workspace });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "bash", arguments: { command: "cat ../../../escape.txt", workdir: subdir } }] },
       { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
     ]);
     const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
@@ -1491,6 +1812,65 @@ describe("engine", () => {
     expect(readFileSync(join(tmp, "inside.txt"), "utf-8")).toBe("x");
   });
 
+  it("uses the active yolo mode instead of the config snapshot when deciding sandbox approvals", async () => {
+    registerFileTools();
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "write", arguments: { path: "inside.txt", content: "x" } }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    let approvalRequests = 0;
+    const engine = new Engine({
+      ...testConfig(),
+      mode: "agent",
+      approval_policy: "untrusted",
+      trusted_workspaces: [],
+    }, session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("yolo"), {
+      requestApproval: async () => {
+        approvalRequests++;
+        return false;
+      },
+    });
+
+    expect(approvalRequests).toBe(0);
+    expect(result.tool_results[0]).toMatchObject({ name: "write", is_error: false });
+    expect(readFileSync(join(tmp, "inside.txt"), "utf-8")).toBe("x");
+  });
+
+  it("uses the active agent mode instead of the config snapshot when sandbox approval is required", async () => {
+    registerFileTools();
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "write", arguments: { path: "inside.txt", content: "x" } }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    let approvalRequests = 0;
+    const engine = new Engine({
+      ...testConfig(),
+      mode: "yolo",
+      approval_policy: "untrusted",
+      trusted_workspaces: [],
+    }, session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      requestApproval: async () => {
+        approvalRequests++;
+        return false;
+      },
+    });
+
+    expect(approvalRequests).toBe(1);
+    expect(result.tool_results[0].is_error).toBe(true);
+    expect(result.tool_results[0].content).toContain("denied");
+    expect(existsSync(join(tmp, "inside.txt"))).toBe(false);
+  });
+
   it("blocks tool execution when a PreToolUse hook denies it", async () => {
     let executed = false;
     getRegistry().register({
@@ -1521,6 +1901,42 @@ describe("engine", () => {
     expect(executed).toBe(false);
     expect(result.tool_results[0]).toMatchObject({ is_error: true });
     expect(result.tool_results[0].content).toContain("hook blocked");
+  });
+
+  it("re-checks sandbox boundaries after PreToolUse modifies tool arguments", async () => {
+    let executed = false;
+    getRegistry().register({
+      name: "write",
+      description: "write",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "file",
+      parallelOk: false,
+      execute: async () => {
+        executed = true;
+        return "should not run";
+      },
+    });
+    registerHook({
+      event: "PreToolUse",
+      matcher: "write",
+      command: `${process.execPath} -e "console.log(JSON.stringify({decision:'continue', modified_input:{path:'../escape.txt', content:'rewritten'}}))"`,
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "write", arguments: { path: "inside.txt", content: "x" } }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+
+    expect(executed).toBe(false);
+    expect(result.tool_results[0].is_error).toBe(true);
+    expect(result.tool_results[0].content).toContain("sandbox");
+    expect(existsSync(join(tmp, "..", "escape.txt"))).toBe(false);
   });
 });
 
@@ -1760,6 +2176,27 @@ describe("skills system", () => {
     expect(input).toContain("User request:\ndraft this");
   });
 
+  it("uses ephemeral instructions only for the immediate turn and does not retain them in session history", async () => {
+    const requests: any[] = [];
+    const client = {
+      send: async function* (messages: any[]) {
+        requests.push(messages);
+        yield { type: "done", finish_reason: "stop", usage: null, content: "ok", reasoning_content: null, tool_calls: [] };
+      },
+    };
+    const session = createSession({ mode: "agent", model: "deepseek-v4-pro", workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    await engine.runTurn("first", getMode("agent"), undefined, { ephemeralInstructions: "SKILL_SENTINEL_ENGINE" });
+    await engine.runTurn("second", getMode("agent"));
+
+    expect(requests).toHaveLength(2);
+    expect(requests[0].some((message: any) => String(message.content || "").includes("SKILL_SENTINEL_ENGINE"))).toBe(true);
+    expect(requests[1].some((message: any) => String(message.content || "").includes("SKILL_SENTINEL_ENGINE"))).toBe(false);
+    expect(session.messages.some(message => String(message.content || "").includes("SKILL_SENTINEL_ENGINE"))).toBe(false);
+  });
+
   it("installs, trusts, and uninstalls a skill from a safe archive", () => {
     const archive = tarGz([
       { path: "repo-main/good/SKILL.md", data: skillMd("good", "safe skill", "Do good work.") },
@@ -1850,6 +2287,33 @@ describe("skills system", () => {
     expect(existsSync(join(globalSkill, ".trusted"))).toBe(false);
     expect(activated.instruction).toContain("workspace trusted body");
     expect(activated.instruction).not.toContain("global body");
+  });
+
+  it("refuses skill updates whose downloaded archive changes the installed skill name", async () => {
+    const skillsDir = join(tmp, "installed");
+    const original = tarGz([
+      { path: "repo-main/original/SKILL.md", data: skillMd("original", "original skill", "body v1") },
+    ]);
+    const renamed = tarGz([
+      { path: "repo-main/renamed/SKILL.md", data: skillMd("renamed", "renamed skill", "body v2") },
+    ]);
+    const installed = installSkillFromArchive(original, "https://example.com/original.tar.gz", skillsDir);
+    const originalBody = readFileSync(join(installed.path, "SKILL.md"), "utf-8");
+    const fetchMock = async () => new Response(renamed, {
+      status: 200,
+      headers: { "content-length": String(renamed.byteLength) },
+    });
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    try {
+      await expect(updateSkill("original", { skillsDir })).rejects.toThrow(/renamed|skill name/i);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+
+    expect(existsSync(join(skillsDir, "original", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(skillsDir, "renamed"))).toBe(false);
+    expect(readFileSync(join(skillsDir, "original", "SKILL.md"), "utf-8")).toBe(originalBody);
   });
 });
 
@@ -1955,6 +2419,72 @@ describe("P1 tool system", () => {
     expect(noop).toBeTruthy();
     expect(removed).toContain("\"removed\": \"toggle\"");
     expect(getRegistry().lookup("mcp_toggle_noop")).toBeUndefined();
+  });
+
+  it("unregisters stale MCP tools when a health check fails after the server toolset becomes unreadable", async () => {
+    registerDiagnosticsTools();
+    const stateFile = join(tmp, "mcp-health-state.json");
+    const serverFile = join(tmp, "mcp-health-server.mjs");
+    writeFileSync(stateFile, JSON.stringify({ tools: ["alive"] }));
+    writeFileSync(serverFile, `
+import { readFileSync } from "node:fs";
+const stateFile = ${JSON.stringify(stateFile)};
+function readState() {
+  return JSON.parse(readFileSync(stateFile, "utf-8"));
+}
+function tools() {
+  const state = readState();
+  return (state.tools || []).map((name) => ({
+    name,
+    description: name + " tool",
+    inputSchema: { type: "object", properties: { value: { type: "string" } } },
+  }));
+}
+function respond(id, result, error) {
+  process.stdout.write(JSON.stringify(error ? { jsonrpc: "2.0", id, error } : { jsonrpc: "2.0", id, result }) + "\\n");
+}
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk.toString("utf-8");
+  let index;
+  while ((index = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, index).trim();
+    buffer = buffer.slice(index + 1);
+    if (!line) continue;
+    const request = JSON.parse(line);
+    if (request.method === "initialize") {
+      respond(request.id, { protocolVersion: "2024-11-05", capabilities: {} });
+    } else if (request.method === "tools/list") {
+      const state = readState();
+      if (state.failToolsList) {
+        respond(request.id, null, { code: -32001, message: "tools/list failed" });
+      } else {
+        respond(request.id, { tools: tools() });
+      }
+    } else if (request.method === "tools/call") {
+      respond(request.id, { content: [{ type: "text", text: request.params.name + ":" + JSON.stringify(request.params?.arguments || {}) }] });
+    } else {
+      respond(request.id, {});
+    }
+  }
+});
+`);
+
+    await getRegistry().lookup("mcp_manager")!.execute({
+      action: "add",
+      name: "fragile",
+      command: process.execPath,
+      args: [serverFile],
+    });
+    await getRegistry().lookup("mcp_manager")!.execute({ action: "reload" });
+
+    expect(getRegistry().lookup("mcp_fragile_alive")).toBeTruthy();
+
+    writeFileSync(stateFile, JSON.stringify({ failToolsList: true }));
+    const health = JSON.parse(await getRegistry().lookup("mcp_manager")!.execute({ action: "health", name: "fragile" }));
+
+    expect(health.fragile.status).toBe("failed");
+    expect(getRegistry().lookup("mcp_fragile_alive")).toBeUndefined();
   });
 
   it("runs TypeScript diagnostics and archives output", async () => {

@@ -29,6 +29,7 @@ import {
   updateRuntimeThread,
   updateTurn,
   type RuntimeEvent,
+  type RuntimeRecord,
 } from "./runtime-store.js";
 import { registerFileTools } from "../tools/file-ops.js";
 import { registerShellTool } from "../tools/shell.js";
@@ -341,17 +342,32 @@ export async function chatHandler(c: Context) {
       const engine = new Engine(record.config, record.session, record.history, client, tools, record.prefix);
       record.activeEngine = engine;
       const mode = getMode(record.config.mode);
-      const streamedToolCalls = new Set<string>();
+      const liveStreamedToolCalls = new Set<string>();
+      const persistedStreamedToolCalls = new Set<string>();
+      const bufferedRuntimeEvents: EngineRuntimeEvent[] = [];
+      const persistRuntimeEvent = (event: EngineRuntimeEvent) => {
+        appendRuntimeItem(record, event.type, event.data, { turnId: turn.id, artifactIds: event.artifact_ids });
+        const sse = runtimeEventToSSE(event, persistedStreamedToolCalls);
+        if (!sse) return;
+        appendEvent(record, sse.event, sse.data, turn.id);
+      };
+      const flushBufferedRuntimeEvents = () => {
+        if (!bufferedRuntimeEvents.length) return;
+        for (const event of bufferedRuntimeEvents.splice(0)) persistRuntimeEvent(event);
+      };
       const result = await engine.runTurn(message, mode, {
         onRuntimeEvent: async (event) => {
-          appendRuntimeItem(record, event.type, event.data, { turnId: turn.id, artifactIds: event.artifact_ids });
-          const sse = runtimeEventToSSE(event, streamedToolCalls);
-          if (!sse) return;
-          appendEvent(record, sse.event, sse.data, turn.id);
-          await stream.writeSSE({ event: sse.event, data: JSON.stringify(sse.data) });
+          const sse = runtimeEventToSSE(event, liveStreamedToolCalls);
+          if (sse) await stream.writeSSE({ event: sse.event, data: JSON.stringify(sse.data) });
+          if (event.type === "assistant_message") flushBufferedRuntimeEvents();
+          if (isSpeculativeRuntimeEvent(event)) {
+            bufferedRuntimeEvents.push(event);
+            return;
+          }
+          persistRuntimeEvent(event);
         },
-        requestApproval: async (toolName, args) => {
-          await stream.writeSSE({ event: "approval_required", data: JSON.stringify({ tool: toolName, args }) });
+        requestApproval: async (toolName, args, description) => {
+          await emitApprovalRequired(record, stream, turn.id, toolName, args, description);
           return false;
         },
       }, { signal: abortController.signal });
@@ -380,6 +396,13 @@ export async function chatHandler(c: Context) {
       record.activeEngine = undefined;
     }
   });
+}
+
+function isSpeculativeRuntimeEvent(event: EngineRuntimeEvent): boolean {
+  return event.type === "api_call_start"
+    || event.type === "thinking_delta"
+    || event.type === "content_delta"
+    || event.type === "tool_call_begin";
 }
 
 function runtimeEventToSSE(
@@ -413,6 +436,21 @@ function runtimeEventToSSE(
       return null;
   }
 }
+
+async function emitApprovalRequired(
+  record: RuntimeRecord,
+  stream: { writeSSE(message: { event: string; data: string }): Promise<void> },
+  turnId: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  description: string,
+): Promise<void> {
+  const data = { tool: toolName, args, description };
+  appendRuntimeItem(record, "approval_required", data, { turnId });
+  appendEvent(record, "approval_required", data, turnId);
+  await stream.writeSSE({ event: "approval_required", data: JSON.stringify(data) });
+}
+
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && (error.name === "AbortError" || /aborted|abort/i.test(error.message));
 }

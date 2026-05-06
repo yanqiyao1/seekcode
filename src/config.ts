@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { z } from "zod";
-import { DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS, defaultBaseUrlForProvider, parseProvider, providerCapability } from "./client/capabilities.js";
+import { DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS, defaultBaseUrlForProvider, parseProvider, providerCapability, resolveProviderAlias } from "./client/capabilities.js";
 import { DEFAULT_SKILL_INSTALL_SIZE_BYTES, DEFAULT_SKILLS_REGISTRY_URL, defaultSkillsDir } from "./engine/skills.js";
 import { LEGACY_DEEPSEEK_DIR, SEEKCODE_DIR, homeDir } from "./paths.js";
 
@@ -367,7 +367,9 @@ export function loadConfig(cliOverrides: Record<string, unknown> = {}): Config {
   mergeConfigLayer(merged, normalizeCliOverrides(cliOverrides));
 
   if (typeof merged.provider === "string") {
-    merged.provider = parseProvider(merged.provider);
+    const resolvedProvider = resolveProviderAlias(merged.provider);
+    if (!resolvedProvider) throw new Error(`provider must be one of: deepseek, deepseek-cn, nvidia-nim, openrouter, novita, fireworks, sglang`);
+    merged.provider = resolvedProvider;
   }
   const parsed = ConfigSchema.parse(merged);
   const capability = providerCapability(parsed.provider, parsed.model);

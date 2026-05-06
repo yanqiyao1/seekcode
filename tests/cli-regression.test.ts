@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 const repoRoot = resolve(".");
 const srcCli = ["npx", ["tsx", "src/index.ts"]] as const;
-const distCli = ["node", ["dist/index.js"]] as const;
+const distCli = ["node", [join(repoRoot, "dist", "index.js")]] as const;
 
 let tmp: string;
 let server: Server | undefined;
@@ -69,6 +69,69 @@ describe("CLI and packaging", () => {
     expect(JSON.parse(fromConfig.stdout).resolved).toMatchObject({ model: "deepseek-v4-flash", mode: "plan", reasoning_effort: "low" });
     expect(JSON.parse(fromEnv.stdout).resolved).toMatchObject({ model: "deepseek-v4-pro", mode: "yolo" });
     expect(JSON.parse(fromCli.stdout).resolved).toMatchObject({ model: "deepseek-v4-flash", mode: "agent" });
+  });
+
+  it("applies project config from the current workspace during runtime commands", async () => {
+    const workspace = join(tmp, "workspace");
+    mkdirSync(join(workspace, ".seekcode"), { recursive: true });
+    writeFileSync(join(workspace, ".seekcode", "config.toml"), [
+      'base_url = "http://127.0.0.1:9/v1"',
+      'reasoning_effort = "off"',
+      "",
+    ].join("\n"));
+
+    const result = await runCliAsync(distCli, ["hello", "from", "workspace"], {
+      env: { DEEPSEEK_API_KEY: "test-key" },
+      cwd: workspace,
+      timeoutMs: 10_000,
+    });
+    const output = stripAnsi(result.stdout + result.stderr);
+
+    expect(result.status).toBe(1);
+    expect(output).toContain("Error:");
+    expect(output).not.toContain("one-shot ok");
+  });
+
+  it("fails fast for invalid provider values in config validation", () => {
+    writeUserConfig('provider = "not-a-provider"\n');
+
+    const result = runCli(srcCli, ["config", "validate"]);
+    const output = stripAnsi(result.stdout + result.stderr);
+
+    expect(result.status).toBe(1);
+    expect(output).toContain("provider");
+  });
+
+  it("fails fast for invalid provider values during runtime startup", () => {
+    writeUserConfig('provider = "not-a-provider"\napi_key = "config-key"\n');
+
+    const result = runCli(srcCli, ["hello", "from", "bad-provider"]);
+    const output = stripAnsi(result.stdout + result.stderr);
+
+    expect(result.status).toBe(1);
+    expect(output).toContain("provider");
+    expect(output).not.toContain("one-shot ok");
+  });
+
+  it("lets explicit CLI base_url override workspace project config", async () => {
+    const requests: any[] = [];
+    await startFakeOpenAIServer(requests);
+    const workspace = join(tmp, "workspace");
+    mkdirSync(join(workspace, ".seekcode"), { recursive: true });
+    writeFileSync(join(workspace, ".seekcode", "config.toml"), [
+      'base_url = "http://127.0.0.1:9/v1"',
+      'reasoning_effort = "off"',
+      "",
+    ].join("\n"));
+
+    const result = await runCliAsync(distCli, ["--base-url", serverUrl, "--api-key", "test-key", "hello", "override"], {
+      cwd: workspace,
+      timeoutMs: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    expect(stripAnsi(result.stdout)).toContain("one-shot ok");
+    expect(requests).toHaveLength(1);
   });
 
   it("creates ~/.seekcode/config.toml during config commands", () => {
@@ -171,7 +234,7 @@ describe("CLI and packaging", () => {
 function runCli(
   cli: readonly [string, readonly string[]],
   args: string[],
-  options: { env?: Record<string, string>; input?: string; timeoutMs?: number } = {},
+  options: { env?: Record<string, string>; input?: string; timeoutMs?: number; cwd?: string } = {},
 ): { status: number | null; stdout: string; stderr: string } {
   const env = {
     ...process.env,
@@ -183,7 +246,7 @@ function runCli(
     ...options.env,
   };
   const result = spawnSync(cli[0], [...cli[1], ...args], {
-    cwd: repoRoot,
+    cwd: options.cwd || repoRoot,
     env,
     input: options.input,
     encoding: "utf-8",
@@ -200,7 +263,7 @@ function runCli(
 function runCliAsync(
   cli: readonly [string, readonly string[]],
   args: string[],
-  options: { env?: Record<string, string>; input?: string; timeoutMs?: number } = {},
+  options: { env?: Record<string, string>; input?: string; timeoutMs?: number; cwd?: string } = {},
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
   const env = {
     ...process.env,
@@ -213,7 +276,7 @@ function runCliAsync(
   };
   return new Promise(resolve => {
     const child = spawn(cli[0], [...cli[1], ...args], {
-      cwd: repoRoot,
+      cwd: options.cwd || repoRoot,
       env,
       stdio: ["pipe", "pipe", "pipe"],
     });

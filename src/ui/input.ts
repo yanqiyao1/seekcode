@@ -432,6 +432,10 @@ export class InputController {
     }
 
     if (!this.isEditable()) {
+      if (sequence === "\x1b" && !this.inBracketedPaste) {
+        if (this.unhandled(sequence, context)) return true;
+        return this.options.onInterrupt?.() === true;
+      }
       if (sequence === "\x03" && !this.inBracketedPaste) {
         const handler = this.options.onCtrlC ?? this.options.onInterrupt;
         return handler?.() !== false;

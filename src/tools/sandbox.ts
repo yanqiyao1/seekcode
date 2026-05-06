@@ -45,7 +45,7 @@ export function checkSandboxPolicy(config: Config, ctx: ApprovalContext): Sandbo
     if (config.sandbox_mode === "read-only" && !isCommandReadOnly(shellCommand)) {
       return { decision: "deny", reason: "read-only sandbox blocks shell mutations" };
     }
-    if (config.workspace_boundary && shellCommandEscapesWorkspace(shellCommand, workspace)) {
+    if (config.workspace_boundary && shellCommandEscapesWorkspace(shellCommand, workspace, shellWorkdir(ctx, workspace))) {
       return { decision: "deny", reason: `shell command escapes workspace boundary: ${workspace}` };
     }
     const commandPolicy = checkCommand(shellCommand);
@@ -87,6 +87,12 @@ function getShellCommand(ctx: ApprovalContext): string | null {
   return typeof raw === "string" && raw.trim() ? raw : null;
 }
 
+function shellWorkdir(ctx: ApprovalContext, workspace: string): string {
+  const raw = ctx.tool_args.workdir;
+  if (typeof raw !== "string" || raw.trim() === "") return workspace;
+  return resolve(workspace, raw);
+}
+
 function escapesWorkspace(ctx: ApprovalContext, workspace: string): boolean {
   for (const key of FILE_PATH_ARGS) {
     const raw = ctx.tool_args[key];
@@ -107,11 +113,11 @@ function isInsideWorkspace(path: string, workspace: string): boolean {
   return rel === "" || (!!rel && !rel.startsWith("..") && !rel.startsWith("/") && !/^[a-zA-Z]:/.test(rel));
 }
 
-function shellCommandEscapesWorkspace(command: string, workspace: string): boolean {
+function shellCommandEscapesWorkspace(command: string, workspace: string, shellCwd: string): boolean {
   for (const token of tokenizeShell(command)) {
-    if (!token || !looksLikePath(token)) continue;
-    const path = token.replace(/^file:\/\//, "");
-    if (isAbsolute(path) && !isInsideWorkspace(resolve(path), workspace)) return true;
+    const candidate = extractShellPathCandidate(token);
+    if (!candidate) continue;
+    if (!isInsideWorkspace(resolveShellPath(candidate, shellCwd), workspace)) return true;
   }
   return false;
 }
@@ -124,8 +130,25 @@ function tokenizeShell(command: string): string[] {
     .map(token => token.replace(/[),;|&]+$/g, "").replace(/^[({]+/g, ""));
 }
 
-function looksLikePath(token: string): boolean {
-  return token.startsWith("/") || token.startsWith("file:///");
+function extractShellPathCandidate(token: string): string | null {
+  if (!token) return null;
+  if (token.startsWith("file:///")) return token.replace(/^file:\/\//, "");
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(token)) return null;
+  if (token === "." || token === "..") return token;
+  if (token === "~" || token.startsWith("~/")) return expandHome(token);
+  if (token.startsWith("/") || token.startsWith("./") || token.startsWith("../")) return token;
+  if (token.startsWith("-") && token.includes("=")) {
+    const [, value = ""] = token.split("=", 2);
+    return extractShellPathCandidate(value);
+  }
+  if (token.includes("/")) return token;
+  return null;
+}
+
+function resolveShellPath(path: string, shellCwd: string): string {
+  if (path === "~" || path.startsWith("~/")) return resolve(expandHome(path));
+  if (isAbsolute(path)) return resolve(path);
+  return resolve(shellCwd, path);
 }
 
 function expandHome(path: string): string {

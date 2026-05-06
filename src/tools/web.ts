@@ -548,6 +548,8 @@ function fetchCacheKey(url: string, accept: string, maxBytes: number, config?: R
     maxBytes,
     method,
     body: body === undefined ? undefined : body,
+    allowedDomains: [...(config?.allowedDomains || [])].sort(),
+    blockedDomains: [...(config?.blockedDomains || [])].sort(),
     proxy: config?.proxy || "",
     noProxy: [...(config?.noProxy || [])].sort(),
   });

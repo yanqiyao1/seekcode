@@ -27,17 +27,21 @@ export class Transcript {
   }
 
   append(text: string): void {
+    const pinnedScroll = this.scrollOffset > 0;
     for (const raw of text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n")) {
       this.pushLine(this.createLine(raw));
     }
     this.trimToMaxLines();
+    if (pinnedScroll) this.scrollOffset = Math.min(this.scrollOffset + this.wrapDeltaForText(text), this.maxScrollOffset(undefined, this.lastRenderWidth));
   }
 
   appendFormatted(lines: string[]): void {
+    const pinnedScroll = this.scrollOffset > 0;
     for (const line of lines) {
       this.pushLine(this.createLine(line));
     }
     this.trimToMaxLines();
+    if (pinnedScroll) this.scrollOffset = Math.min(this.scrollOffset + this.wrapDeltaForLines(lines), this.maxScrollOffset(undefined, this.lastRenderWidth));
   }
 
   replaceLine(index: number, text: string): void {
@@ -58,6 +62,7 @@ export class Transcript {
   }
 
   appendDelta(text: string): void {
+    const pinnedScroll = this.scrollOffset > 0;
     const parts = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
     if (!this.lines.length) this.pushLine(this.createLine(""));
 
@@ -72,6 +77,7 @@ export class Transcript {
     }
 
     this.trimToMaxLines();
+    if (pinnedScroll) this.scrollOffset = Math.min(this.scrollOffset + this.appendDeltaWrappedGrowth(parts), this.maxScrollOffset(undefined, this.lastRenderWidth));
   }
 
   /** Render visible portion into available height */
@@ -191,6 +197,34 @@ export class Transcript {
     const wrapped = wrapAnsi(line.text, width);
     line.wrapCache.set(width, wrapped);
     return wrapped;
+  }
+
+  private wrapDeltaForText(text: string): number {
+    if (this.lastRenderWidth <= 0) return 0;
+    const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    return this.wrapDeltaForLines(normalized);
+  }
+
+  private wrapDeltaForLines(lines: string[]): number {
+    if (this.lastRenderWidth <= 0) return 0;
+    return lines.reduce((total, line) => total + Math.max(1, wrapAnsi(line, this.lastRenderWidth).length), 0);
+  }
+
+  private appendDeltaWrappedGrowth(parts: string[]): number {
+    if (this.lastRenderWidth <= 0 || !parts.length) return 0;
+    let growth = 0;
+    const lastIndex = this.lines.length - parts.length;
+    if (lastIndex >= 0) {
+      const updatedLine = this.lines[lastIndex];
+      const previousText = updatedLine.text.slice(0, Math.max(0, updatedLine.text.length - parts[0].length));
+      const previousRows = wrapAnsi(previousText, this.lastRenderWidth).length;
+      const nextRows = this.wrapLine(updatedLine, this.lastRenderWidth).length;
+      growth += Math.max(0, nextRows - Math.max(1, previousRows));
+    }
+    for (let index = 1; index < parts.length; index++) {
+      growth += Math.max(1, wrapAnsi(parts[index]!, this.lastRenderWidth).length);
+    }
+    return growth;
   }
 
   private wrappedRowsRangeFromTop(width: number, start: number, end: number): string[] {

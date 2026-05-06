@@ -27,6 +27,8 @@ export interface UpdateChunk {
   new_lines: string[];
   change_context?: string;
   is_end_of_file?: boolean;
+  old_start?: number;
+  new_start?: number;
 }
 
 export interface UpdateHunk {
@@ -178,6 +180,8 @@ function parseUpdateHunk(
         old_lines: [],
         new_lines: [],
         change_context: hunkMatch[5]?.trim() || undefined,
+        old_start: parseInt(hunkMatch[1], 10),
+        new_start: parseInt(hunkMatch[3], 10),
       };
       lineNum = parseInt(hunkMatch[3], 10);
       continue;
@@ -335,25 +339,16 @@ function applyHunk(
       }
 
       const oldContent = readFileSync(sourcePath, "utf-8");
-      let newContent = oldContent;
-
-      for (const chunk of updateHunk.chunks) {
-        // Find and replace the old_lines with new_lines
-        const oldBlock = chunk.old_lines.join("\n");
-        const newBlock = chunk.new_lines.join("\n");
-
-        if (oldBlock) {
-          if (!newContent.includes(oldBlock)) {
-            return {
-              path: relative(workdir, targetPath),
-              type: "error",
-              message: `Chunk not found in file. Context: ${chunk.change_context || "none"}`,
-              oldContent,
-            };
-          }
-          newContent = newContent.replace(oldBlock, newBlock);
-        }
+      const applied = applyUpdateChunks(oldContent, updateHunk.chunks);
+      if (!applied.ok) {
+        return {
+          path: relative(workdir, targetPath),
+          type: "error",
+          message: `Chunk not found in file. Context: ${applied.context || "none"}`,
+          oldContent,
+        };
       }
+      const newContent = applied.content;
 
       if (updateHunk.move_path && targetPath !== fullPath) {
         // Rename: write to new path, delete old
@@ -386,6 +381,44 @@ function applyHunk(
         message: "Unknown hunk type",
       };
   }
+}
+
+function applyUpdateChunks(
+  content: string,
+  chunks: UpdateChunk[],
+): { ok: true; content: string } | { ok: false; context?: string } {
+  const lines = content.split("\n");
+  let searchStart = 0;
+  for (const chunk of chunks) {
+    const matchIndex = findChunkStart(lines, chunk, searchStart);
+    if (matchIndex < 0) return { ok: false, context: chunk.change_context };
+    const oldLineCount = chunk.old_lines.length;
+    lines.splice(matchIndex, oldLineCount, ...chunk.new_lines);
+    searchStart = matchIndex + chunk.new_lines.length;
+  }
+  return { ok: true, content: lines.join("\n") };
+}
+
+function findChunkStart(lines: string[], chunk: UpdateChunk, searchStart: number): number {
+  const oldLines = chunk.old_lines;
+  if (!oldLines.length) return Math.max(0, Math.min(searchStart, lines.length));
+  const preferredStart = Number.isFinite(chunk.old_start) ? Math.max(0, (chunk.old_start || 1) - 1) : -1;
+  if (preferredStart >= 0 && matchesChunkAt(lines, oldLines, preferredStart)) return preferredStart;
+  for (let start = Math.max(0, searchStart); start <= lines.length - oldLines.length; start++) {
+    if (matchesChunkAt(lines, oldLines, start)) return start;
+  }
+  for (let start = 0; start < Math.max(0, searchStart); start++) {
+    if (matchesChunkAt(lines, oldLines, start)) return start;
+  }
+  return -1;
+}
+
+function matchesChunkAt(lines: string[], oldLines: string[], start: number): boolean {
+  if (start < 0 || start + oldLines.length > lines.length) return false;
+  for (let offset = 0; offset < oldLines.length; offset++) {
+    if (lines[start + offset] !== oldLines[offset]) return false;
+  }
+  return true;
 }
 
 function backupPatchPaths(hunks: Hunk[], workdir: string): FileBackup[] {

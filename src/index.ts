@@ -307,6 +307,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       renderLoadedSession: () => renderSessionTranscript(true),
       setExitSummary: (message) => { exitSummary = message; },
       setActiveSkill: (instruction) => { activeSkillInstruction = instruction; },
+      clearActiveSkill: () => { activeSkillInstruction = null; },
       liveReadonly: true,
     });
     if (changed === true) modeObj = getMode(cfg.mode);
@@ -442,6 +443,9 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
 
   const applyLoadedSession = (loaded: typeof session) => {
     Object.assign(session, loaded);
+    activeSkillInstruction = null;
+    clearApprovalCache();
+    clearPermissions();
     if (session.workspace_path && existsSync(session.workspace_path)) {
       process.chdir(session.workspace_path);
     } else {
@@ -626,6 +630,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
           renderLoadedSession: () => renderSessionTranscript(true),
           setExitSummary: (message) => { exitSummary = message; },
           setActiveSkill: (instruction) => { activeSkillInstruction = instruction; },
+          clearActiveSkill: () => { activeSkillInstruction = null; },
         });
         if (changed === "exit") break;
         if (changed) modeObj = getMode(cfg.mode);
@@ -748,6 +753,7 @@ interface SlashCommandRuntime {
   renderLoadedSession: () => void;
   setExitSummary?: (message: string) => void;
   setActiveSkill?: (instruction: string) => void;
+  clearActiveSkill?: () => void;
   liveReadonly?: boolean;
 }
 
@@ -1042,6 +1048,7 @@ ${p.blueBold("Commands")}
     case "/clear":
       session.messages = [];
       history.clear();
+      runtime.clearActiveSkill?.();
       clearPlanState();
       clearGoalState();
       clearAgentState();

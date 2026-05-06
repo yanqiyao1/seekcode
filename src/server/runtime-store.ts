@@ -387,7 +387,7 @@ export function createTurn(record: RuntimeRecord, message: string): RuntimeTurn 
   record.thread.latest_turn_id = turn.id;
   record.thread.updated_at = now;
   persistRecord(record);
-  appendEvent(record, "turn.queued", { turn });
+  appendEvent(record, "turn.queued", { turn }, turn.id);
   return turn;
 }
 
@@ -395,7 +395,7 @@ export function updateTurn(record: RuntimeRecord, turn: RuntimeTurn, status: Tur
   Object.assign(turn, patch, { status, updated_at: new Date().toISOString() });
   record.thread.updated_at = turn.updated_at;
   persistRecord(record);
-  appendEvent(record, `turn.${status}`, { turn });
+  appendEvent(record, `turn.${status}`, { turn }, turn.id);
 }
 
 export function appendEvent(record: RuntimeRecord, event: string, data: unknown, turnId?: string): RuntimeEvent {

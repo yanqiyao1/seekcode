@@ -20,8 +20,12 @@ function resolveFromRoot(path: string, root: string): string {
 }
 
 function workspaceRoot(args: Record<string, unknown>, fallbackPath?: string): string {
-  const root = args.root || args.workspace || args.cwd || fallbackPath || process.cwd();
-  return String(root);
+  const explicitRoot = args.root || args.workspace || args.cwd;
+  if (explicitRoot) return String(explicitRoot);
+  if (fallbackPath && (String(fallbackPath).startsWith("/") || /^[a-zA-Z]:/.test(String(fallbackPath)))) {
+    return String(fallbackPath);
+  }
+  return process.cwd();
 }
 
 function isInsideRoot(path: string, root: string): boolean {
@@ -61,7 +65,7 @@ function nearestExistingParent(path: string): string {
 
 async function readFile(args: Record<string, unknown>): Promise<string> {
   const path = args.path as string;
-  const root = workspaceRoot(args);
+  const root = workspaceRoot(args, path);
   const offset = (args.offset as number) || 0;
   const limit = (args.limit as number) || 2000;
   try {
@@ -74,7 +78,7 @@ async function readFile(args: Record<string, unknown>): Promise<string> {
 async function writeFile(args: Record<string, unknown>): Promise<string> {
   const path = args.path as string;
   const content = args.content as string;
-  const root = workspaceRoot(args);
+  const root = workspaceRoot(args, path);
   try {
     const target = resolveWritablePathInsideRoot(path, String(root));
     const oldContent = existsSync(target) ? readFileSync(target, "utf-8") : "";
@@ -91,7 +95,7 @@ async function writeFile(args: Record<string, unknown>): Promise<string> {
 
 async function editFile(args: Record<string, unknown>): Promise<string> {
   const path = args.path as string;
-  const root = workspaceRoot(args);
+  const root = workspaceRoot(args, path);
   const oldString = args.old_string as string;
   const newString = args.new_string as string;
   const replaceAll = (args.replace_all as boolean) || false;
