@@ -440,6 +440,81 @@ Seek Code 当前支持：
 </ul>
 
 <details>
+<summary><strong>默认路径与优先级</strong></summary>
+
+<br>
+
+<table>
+  <tr>
+    <th align="left">项目</th>
+    <th align="left">默认路径</th>
+    <th align="left">说明</th>
+  </tr>
+  <tr>
+    <td><strong>用户配置</strong></td>
+    <td><code>~/.seekcode/config.toml</code></td>
+    <td>首次使用时会自动创建。</td>
+  </tr>
+  <tr>
+    <td><strong>项目配置</strong></td>
+    <td><code>./.seekcode/config.toml</code></td>
+    <td>在当前仓库内覆盖用户级配置。</td>
+  </tr>
+  <tr>
+    <td><strong>Sessions</strong></td>
+    <td><code>${XDG_DATA_HOME:-~/.local/share}/seekcode/sessions</code></td>
+    <td>可用 <code>SEEKCODE_SESSIONS_DIR</code> 覆盖。</td>
+  </tr>
+  <tr>
+    <td><strong>Artifacts</strong></td>
+    <td><code>${XDG_DATA_HOME:-~/.local/share}/seekcode/artifacts</code></td>
+    <td>可用 <code>SEEKCODE_ARTIFACTS_DIR</code> 覆盖。</td>
+  </tr>
+  <tr>
+    <td><strong>Tasks</strong></td>
+    <td><code>${XDG_DATA_HOME:-~/.local/share}/seekcode/tasks/tasks.json</code></td>
+    <td>可用 <code>SEEKCODE_TASKS_DIR</code> 覆盖。</td>
+  </tr>
+  <tr>
+    <td><strong>全局 Skills</strong></td>
+    <td><code>~/.seekcode/skills</code></td>
+    <td>也是 <code>skills_dir</code> 的默认值。</td>
+  </tr>
+  <tr>
+    <td><strong>项目 Skills</strong></td>
+    <td><code>./.seekcode/skills</code></td>
+    <td>同时也会扫描 <code>./skills</code> 和 <code>./.agents/skills</code>。</td>
+  </tr>
+  <tr>
+    <td><strong>回滚快照</strong></td>
+    <td><code>./.seekcode/side-git</code></td>
+    <td><code>/restore</code> 使用的工作区本地快照存储。</td>
+  </tr>
+</table>
+
+<p>
+  <strong>优先级：</strong>
+  默认值
+  <code>&lt;</code>
+  用户配置
+  <code>&lt;</code>
+  项目配置
+  <code>&lt;</code>
+  环境变量
+  <code>&lt;</code>
+  CLI 参数
+</p>
+
+<p>
+  <strong>旧配置迁移：</strong>
+  <code>seek config migrate --target user|project</code> 可以从
+  <code>~/.config/deepseek/config.toml</code> 或 <code>./.deepseek/config.toml</code>
+  导入。旧路径用于迁移，不会在正常启动时自动加载。
+</p>
+
+</details>
+
+<details>
 <summary><strong>配置示例</strong></summary>
 
 <br>

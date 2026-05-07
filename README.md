@@ -440,6 +440,81 @@ Seek Code supports:
 </ul>
 
 <details>
+<summary><strong>Default paths and precedence</strong></summary>
+
+<br>
+
+<table>
+  <tr>
+    <th align="left">What</th>
+    <th align="left">Default path</th>
+    <th align="left">Notes</th>
+  </tr>
+  <tr>
+    <td><strong>User config</strong></td>
+    <td><code>~/.seekcode/config.toml</code></td>
+    <td>Created automatically on first use.</td>
+  </tr>
+  <tr>
+    <td><strong>Project config</strong></td>
+    <td><code>./.seekcode/config.toml</code></td>
+    <td>Overrides user config for the current repo.</td>
+  </tr>
+  <tr>
+    <td><strong>Sessions</strong></td>
+    <td><code>${XDG_DATA_HOME:-~/.local/share}/seekcode/sessions</code></td>
+    <td>Override with <code>SEEKCODE_SESSIONS_DIR</code>.</td>
+  </tr>
+  <tr>
+    <td><strong>Artifacts</strong></td>
+    <td><code>${XDG_DATA_HOME:-~/.local/share}/seekcode/artifacts</code></td>
+    <td>Override with <code>SEEKCODE_ARTIFACTS_DIR</code>.</td>
+  </tr>
+  <tr>
+    <td><strong>Tasks</strong></td>
+    <td><code>${XDG_DATA_HOME:-~/.local/share}/seekcode/tasks/tasks.json</code></td>
+    <td>Override with <code>SEEKCODE_TASKS_DIR</code>.</td>
+  </tr>
+  <tr>
+    <td><strong>Global skills</strong></td>
+    <td><code>~/.seekcode/skills</code></td>
+    <td>Default value for <code>skills_dir</code>.</td>
+  </tr>
+  <tr>
+    <td><strong>Project skills</strong></td>
+    <td><code>./.seekcode/skills</code></td>
+    <td>Also scans <code>./skills</code> and <code>./.agents/skills</code>.</td>
+  </tr>
+  <tr>
+    <td><strong>Rollback snapshots</strong></td>
+    <td><code>./.seekcode/side-git</code></td>
+    <td>Workspace-local snapshot store used by <code>/restore</code>.</td>
+  </tr>
+</table>
+
+<p>
+  <strong>Precedence:</strong>
+  defaults
+  <code>&lt;</code>
+  user config
+  <code>&lt;</code>
+  project config
+  <code>&lt;</code>
+  environment variables
+  <code>&lt;</code>
+  CLI flags
+</p>
+
+<p>
+  <strong>Legacy migration:</strong>
+  <code>seek config migrate --target user|project</code> can import from
+  <code>~/.config/deepseek/config.toml</code> or <code>./.deepseek/config.toml</code>.
+  Those legacy paths are for migration, not normal auto-loading.
+</p>
+
+</details>
+
+<details>
 <summary><strong>Example config</strong></summary>
 
 <br>
