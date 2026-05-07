@@ -5,9 +5,10 @@
  * detection, and smarter error handling.
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync, realpathSync } from "node:fs";
+import { readFileSync, mkdirSync, existsSync, unlinkSync, statSync, realpathSync } from "node:fs";
 import { resolve, dirname, relative, isAbsolute } from "node:path";
 import { diffLines } from "../ui/renderer.js";
+import { writeTextFileAtomic } from "./atomic-write.js";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -274,7 +275,7 @@ function applyHunk(
         if (options.createDirs !== false) {
           mkdirSync(parent, { recursive: true });
         }
-        writeFileSync(fullPath, (hunk as AddHunk).contents, "utf-8");
+        writeTextFileAtomic(fullPath, (hunk as AddHunk).contents);
       }
       return {
         path: relative(workdir, fullPath),
@@ -356,12 +357,12 @@ function applyHunk(
           if (options.createDirs !== false) {
             mkdirSync(targetParent, { recursive: true });
           }
-          writeFileSync(targetPath, newContent, "utf-8");
+          writeTextFileAtomic(targetPath, newContent);
           if (existsSync(sourcePath)) unlinkSync(sourcePath);
         }
       } else {
         if (!options.dryRun) {
-          writeFileSync(sourcePath, newContent, "utf-8");
+          writeTextFileAtomic(sourcePath, newContent);
         }
       }
 
@@ -442,7 +443,7 @@ function restoreBackups(backups: FileBackup[]): void {
     try {
       if (backup.existed) {
         mkdirSync(dirname(backup.path), { recursive: true });
-        writeFileSync(backup.path, backup.content || "", "utf-8");
+        writeTextFileAtomic(backup.path, backup.content || "");
       } else if (existsSync(backup.path)) {
         unlinkSync(backup.path);
       }

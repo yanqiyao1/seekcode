@@ -140,6 +140,16 @@ describe("file tools", () => {
     expect(glob).toContain("目录/文件.txt");
   });
 
+  it("writes new files to absolute paths without requiring an explicit root", async () => {
+    registerFileTools();
+    const file = join(tmp, "absolute", "nested", "note.md");
+
+    const result = await getRegistry().lookup("write")!.execute({ path: file, content: "# absolute\n" });
+
+    expect(result).toContain("Successfully wrote");
+    expect(readFileSync(file, "utf-8")).toBe("# absolute\n");
+  });
+
   it("handles relative ls/search/glob paths without requiring an explicit root", async () => {
     registerFileTools();
     const oldCwd = process.cwd();

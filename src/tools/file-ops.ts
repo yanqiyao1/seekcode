@@ -1,11 +1,12 @@
 /** File operation tools: read, write, edit, ls, search, glob. */
 
-import { readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, realpathSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, mkdirSync, realpathSync, existsSync } from "node:fs";
 import { resolve, relative, join, dirname } from "node:path";
 import { spawnSync } from "node:child_process";
 import { PermissionLevel, type ToolDef } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { diffLines } from "../ui/renderer.js";
+import { writeTextFileAtomic } from "./atomic-write.js";
 
 type FileToolExtras = Partial<Omit<ToolDef, "name" | "description" | "parameters" | "execute" | "permission" | "category" | "parallelOk">>;
 const FILE_DIFF_MAX_LINES = 160;
@@ -23,7 +24,12 @@ function workspaceRoot(args: Record<string, unknown>, fallbackPath?: string): st
   const explicitRoot = firstPresentString(args, ["root", "workspace", "cwd"]);
   if (explicitRoot) return explicitRoot.trim();
   if (fallbackPath && (String(fallbackPath).startsWith("/") || /^[a-zA-Z]:/.test(String(fallbackPath)))) {
-    return String(fallbackPath);
+    const resolvedFallback = resolve(String(fallbackPath));
+    try {
+      return statSync(resolvedFallback).isDirectory() ? resolvedFallback : dirname(resolvedFallback);
+    } catch {
+      return nearestExistingParent(resolvedFallback);
+    }
   }
   return process.cwd();
 }
@@ -144,8 +150,7 @@ async function writeFile(args: Record<string, unknown>): Promise<string> {
   try {
     const target = resolveWritablePathInsideRoot(path, String(root));
     const oldContent = existsSync(target) ? readFileSync(target, "utf-8") : "";
-    mkdirSync(dirname(target), { recursive: true });
-    writeFileSync(target, content, "utf-8");
+    writeTextFileAtomic(target, content);
     return [
       `Successfully wrote ${content.length} bytes to ${path}`,
       "",
@@ -179,7 +184,7 @@ async function editFile(args: Record<string, unknown>): Promise<string> {
     if (count === 0) return `Error: old_string not found in ${path}`;
     if (!replaceAll && count > 1) return `Error: old_string found ${count} times. Use replace_all=true or provide more context.`;
     const nextContent = replaceAll ? content.replaceAll(oldString, newString) : content.replace(oldString, newString);
-    writeFileSync(target, nextContent, "utf-8");
+    writeTextFileAtomic(target, nextContent);
     return [
       `Successfully edited ${path}`,
       "",
