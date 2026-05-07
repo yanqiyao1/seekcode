@@ -113,7 +113,13 @@ export class DeepSeekClient {
         }
         if (tc.function?.arguments) {
           acc.arguments += tc.function.arguments;
-          yield { type: "tool_call_args", index: idx, arguments: tc.function.arguments } as ToolCallArgsDelta;
+          yield {
+            type: "tool_call_args",
+            index: idx,
+            tool_call_id: acc.id,
+            name: acc.name,
+            arguments: tc.function.arguments,
+          } as ToolCallArgsDelta;
         }
       }
 

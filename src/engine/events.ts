@@ -60,6 +60,7 @@ export interface EngineRuntimeEventMap {
   thinking_delta: { text: string };
   content_delta: { text: string };
   tool_call_begin: { name: string; tool_call_id?: string; index?: number };
+  tool_call_args: { tool_call_id: string; name: string; index?: number; arguments: string };
   user_message: { text: string };
   assistant_message: Message;
   tool_catalog_auto_activate: { tools: string[]; source: "user_input" };

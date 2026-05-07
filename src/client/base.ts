@@ -28,6 +28,8 @@ export interface ToolCallBegin extends StreamEvent {
 export interface ToolCallArgsDelta extends StreamEvent {
   type: "tool_call_args";
   index: number;
+  tool_call_id: string;
+  name: string;
   arguments: string;
 }
 

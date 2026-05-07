@@ -2,6 +2,7 @@
 
 import type {
   EngineRuntimeEvent,
+  EngineRuntimeEventMap,
   PrefixInvalidatedEventData,
   ToolProgressRuntimeEvent,
   ToolResultRuntimeEvent,
@@ -110,6 +111,10 @@ export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRu
       const toolCall = sanitizeToolCall(item.data);
       return toolCall ? { type: "tool_call", data: toolCall, artifact_ids: item.artifact_ids } : null;
     }
+    case "tool_call_args": {
+      const toolCallArgs = sanitizeToolCallArgs(item.data);
+      return toolCallArgs ? { type: "tool_call_args", data: toolCallArgs, artifact_ids: item.artifact_ids } : null;
+    }
     case "approval_required": {
       const tool = asString(data?.tool);
       if (!tool) return null;
@@ -197,6 +202,20 @@ function sanitizeToolResult(value: unknown): ToolResult | null {
   };
 }
 
+function sanitizeToolCallArgs(value: unknown): EngineRuntimeEventMap["tool_call_args"] | null {
+  const data = asRecord(value);
+  const toolCallId = asString(data?.tool_call_id);
+  const name = asString(data?.name);
+  const argumentsText = asString(data?.arguments);
+  if (!toolCallId || !name || argumentsText === undefined) return null;
+  return {
+    tool_call_id: toolCallId,
+    name,
+    index: typeof data?.index === "number" ? data.index : undefined,
+    arguments: argumentsText,
+  };
+}
+
 function sanitizeToolProgress(value: unknown): ToolProgressRuntimeEvent["data"] | null {
   const data = asRecord(value);
   const progress = asRecord(data?.progress);
@@ -278,14 +297,14 @@ function sanitizeMessage(value: unknown): Message | null {
   if (role !== "system" && role !== "user" && role !== "assistant" && role !== "tool") return null;
   return {
     role,
-    content: typeof data.content === "string" || data.content === null ? data.content : null,
-    tool_calls: Array.isArray(data.tool_calls)
+    content: typeof data?.content === "string" || data?.content === null ? data.content : null,
+    tool_calls: Array.isArray(data?.tool_calls)
       ? data.tool_calls.map(sanitizeToolCall).filter((toolCall): toolCall is ToolCall => !!toolCall)
       : null,
-    tool_call_id: typeof data.tool_call_id === "string" || data.tool_call_id === null ? data.tool_call_id : null,
-    name: typeof data.name === "string" || data.name === null ? data.name : null,
-    reasoning_content: typeof data.reasoning_content === "string" || data.reasoning_content === null ? data.reasoning_content : null,
-    is_error: typeof data.is_error === "boolean" || data.is_error === null ? data.is_error : null,
+    tool_call_id: typeof data?.tool_call_id === "string" || data?.tool_call_id === null ? data.tool_call_id : null,
+    name: typeof data?.name === "string" || data?.name === null ? data.name : null,
+    reasoning_content: typeof data?.reasoning_content === "string" || data?.reasoning_content === null ? data.reasoning_content : null,
+    is_error: typeof data?.is_error === "boolean" || data?.is_error === null ? data.is_error : null,
   };
 }
 

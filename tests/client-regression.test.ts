@@ -50,6 +50,23 @@ describe("DeepSeekClient", () => {
     });
   });
 
+  it("emits tool_call_args deltas with tool call identity", async () => {
+    createMock.mockResolvedValueOnce(streamFrom([
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "write", arguments: "{\"path\"" } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: ":\"src/app.ts\"}" } }] }, finish_reason: "tool_calls" }] },
+      { choices: [], usage: { total_tokens: 1 } },
+    ]));
+    const client = new DeepSeekClient({ apiKey: "key", baseUrl: "http://localhost", model: "deepseek-v4-pro" });
+
+    const events = await collect(client.send([{ role: "user", content: "hello" }] as any));
+    const argEvents = events.filter(event => event.type === "tool_call_args");
+
+    expect(argEvents).toEqual([
+      expect.objectContaining({ tool_call_id: "call_1", name: "write", arguments: "{\"path\"" }),
+      expect.objectContaining({ tool_call_id: "call_1", name: "write", arguments: ":\"src/app.ts\"}" }),
+    ]);
+  });
+
   it("passes reasoning_effort through to the API request", async () => {
     createMock.mockResolvedValueOnce(streamFrom([{ choices: [], usage: { total_tokens: 0 } }]));
     const client = new DeepSeekClient({ apiKey: "key", baseUrl: "http://localhost", model: "deepseek-v4-pro" });

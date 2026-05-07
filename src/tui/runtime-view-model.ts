@@ -6,6 +6,7 @@ import { renderMarkdown } from "../ui/markdown.js";
 import { p } from "../ui/palette.js";
 import * as r from "../ui/renderer.js";
 import { AssistantStream } from "./assistant-stream.js";
+import { defaultToolActivityLabel, describeToolActivity, describeToolActivityFromArgsStream } from "./tool-activity.js";
 import { ActiveToolLines } from "./tool-lines.js";
 import { Transcript } from "./transcript.js";
 import { sessionMessagesToRuntimeEvents } from "./runtime-replay.js";
@@ -78,6 +79,9 @@ export class TuiRuntimeViewModel {
   private readonly activeToolLines = new ActiveToolLines();
   private readonly assistantStream = new AssistantStream();
   private readonly renderedToolCalls = new Set<string>();
+  private readonly activeToolNames = new Map<string, string>();
+  private readonly activeToolLabels = new Map<string, string>();
+  private readonly toolArgumentStreams = new Map<string, string>();
   private inThinking = false;
   private thinkingBuf = "";
   private thinkingStartedAt = 0;
@@ -118,6 +122,9 @@ export class TuiRuntimeViewModel {
     this.finishThinkingStatus();
     this.assistantStream.reset();
     this.activeToolLines.clear();
+    this.activeToolNames.clear();
+    this.activeToolLabels.clear();
+    this.toolArgumentStreams.clear();
     this.renderedToolCalls.clear();
     this.inThinking = false;
     this.thinkingBuf = "";
@@ -153,6 +160,9 @@ export class TuiRuntimeViewModel {
       this.flushThinkingBody();
       this.assistantStream.reset();
       this.activeToolLines.clear();
+      this.activeToolNames.clear();
+      this.activeToolLabels.clear();
+      this.toolArgumentStreams.clear();
       this.renderedToolCalls.clear();
       this.assistantContentStreamed = false;
       this.thinkingStreamed = false;
@@ -215,16 +225,17 @@ export class TuiRuntimeViewModel {
       case "tool_call_begin":
         this.renderToolCallStart(event.data.name, event.data.tool_call_id || event.data.name);
         break;
+      case "tool_call_args":
+        this.renderToolCallArgs(event.data.tool_call_id, event.data.name, event.data.arguments);
+        break;
       case "tool_call":
-        if (!this.renderedToolCalls.has(event.data.id) && !this.renderedToolCalls.has(event.data.name)) {
-          this.renderToolCallStart(event.data.name, event.data.id || event.data.name);
-        }
+        this.renderToolCall(event.data.id || event.data.name, event.data.name, event.data.arguments);
         break;
       case "approval_required":
         this.renderApprovalRequired(event.data.tool, event.data.args);
         break;
       case "tool_result":
-        this.renderToolResult(event.data.name, event.preview);
+        this.renderToolResult(event.data.name, event.preview, event.data.tool_call_id || event.data.name);
         break;
       case "tool_progress":
         this.renderToolProgress(event);
@@ -242,6 +253,9 @@ export class TuiRuntimeViewModel {
     this.finishThinkingStatus();
     this.assistantStream.reset();
     this.activeToolLines.clear();
+    this.activeToolNames.clear();
+    this.activeToolLabels.clear();
+    this.toolArgumentStreams.clear();
     this.renderedToolCalls.clear();
     this.assistantContentStreamed = false;
     this.thinkingStreamed = false;
@@ -271,16 +285,52 @@ export class TuiRuntimeViewModel {
     if (key) this.renderedToolCalls.add(key);
     this.flushThinkingBody();
     this.assistantStream.reset();
-    this.transcript.append(r.toolCallStatus(name, "running"));
-    this.activeToolLines.start(name, this.transcript.lines.length - 1);
+    const label = defaultToolActivityLabel(name);
+    this.transcript.append(r.toolCallStatus(label, "running"));
+    if (key) {
+      this.activeToolLines.start(key, this.transcript.lines.length - 1);
+      this.activeToolNames.set(key, name);
+      this.activeToolLabels.set(key, label);
+    }
     this.syncActiveToolCount();
     this.autoFollowBottom();
     this.options.renderNow?.();
   }
 
-  private renderToolResult(name: string, preview: string): void {
+  private renderToolCall(toolCallId: string, name: string, args: Record<string, unknown>): void {
+    if (!toolCallId && !name) return;
+    if (toolCallId && name && toolCallId !== name) {
+      this.promoteToolKey(name, toolCallId, name);
+    }
+    if (!this.renderedToolCalls.has(toolCallId) && !this.renderedToolCalls.has(name)) {
+      this.renderToolCallStart(name, toolCallId || name);
+    }
+    this.updateToolActivity(toolCallId || name, name, describeToolActivity(name, args), true);
+    this.toolArgumentStreams.delete(toolCallId);
+  }
+
+  private renderToolCallArgs(toolCallId: string, name: string, chunk: string): void {
+    if (!chunk) return;
+    if (toolCallId && name && toolCallId !== name) {
+      this.promoteToolKey(name, toolCallId, name);
+    }
+    const key = toolCallId || name;
+    const activeName = this.activeToolNames.get(key) || name;
+    if (!key || !activeName) return;
+    const previous = this.toolArgumentStreams.get(key) || "";
+    const next = previous + chunk;
+    this.toolArgumentStreams.set(key, next);
+    const label = describeToolActivityFromArgsStream(activeName, next);
+    if (!label) return;
+    this.updateToolActivity(key, activeName, label, false);
+  }
+
+  private renderToolResult(name: string, preview: string, toolCallId = name): void {
     const line = r.toolCallStatus(name, preview.startsWith("Error:") ? "error" : "success", preview);
-    const activeToolLine = this.activeToolLines.finish(name);
+    const activeToolLine = this.activeToolLines.finish(toolCallId);
+    this.activeToolNames.delete(toolCallId);
+    this.activeToolLabels.delete(toolCallId);
+    this.toolArgumentStreams.delete(toolCallId);
     if (activeToolLine !== undefined) this.transcript.replaceLine(activeToolLine, line);
     else this.transcript.append(line);
     const diffPreview = r.toolDiffPreview(preview);
@@ -294,7 +344,11 @@ export class TuiRuntimeViewModel {
 
   private renderApprovalRequired(name: string, args: Record<string, unknown>): void {
     const line = r.toolCallStatus(name, "denied", `Approval required: ${Object.keys(args).length ? JSON.stringify(args) : "no arguments"}`);
-    const activeToolLine = this.activeToolLines.finish(name);
+    const toolCallId = this.findActiveToolCallIdByName(name) || name;
+    const activeToolLine = this.activeToolLines.finish(toolCallId);
+    this.activeToolNames.delete(toolCallId);
+    this.activeToolLabels.delete(toolCallId);
+    this.toolArgumentStreams.delete(toolCallId);
     if (activeToolLine !== undefined) this.transcript.replaceLine(activeToolLine, line);
     else this.transcript.append(line);
     this.assistantStream.reset();
@@ -308,12 +362,63 @@ export class TuiRuntimeViewModel {
     const message = typeof event.rendered?.preview === "string" && event.rendered.preview
       ? event.rendered.preview
       : event.data.progress.message;
-    const line = r.toolCallStatus(event.data.tool, "running", message);
-    const activeToolLine = this.activeToolLines.current(event.data.tool);
+    const activity = this.currentToolLabel(event.data.tool_call_id, event.data.tool);
+    const line = r.toolCallStatus(activity, "running", message);
+    const activeToolLine = this.activeToolLines.current(event.data.tool_call_id);
     if (activeToolLine !== undefined) this.transcript.replaceLine(activeToolLine, line);
     else this.transcript.append(line);
     this.autoFollowBottom();
     this.options.requestRender?.();
+  }
+
+  private updateToolActivity(toolCallId: string, name: string, label: string, immediate: boolean): void {
+    const activeToolLine = this.activeToolLines.current(toolCallId);
+    if (activeToolLine === undefined) return;
+    this.activeToolNames.set(toolCallId, name);
+    this.activeToolLabels.set(toolCallId, label);
+    this.transcript.replaceLine(activeToolLine, r.toolCallStatus(label, "running"));
+    this.autoFollowBottom();
+    if (immediate) this.options.renderNow?.();
+    else this.options.requestRender?.();
+  }
+
+  private currentToolLabel(toolCallId: string, fallbackName: string): string {
+    const existingLabel = this.activeToolLabels.get(toolCallId);
+    if (existingLabel) return existingLabel;
+    const name = this.activeToolNames.get(toolCallId) || fallbackName;
+    const argsText = this.toolArgumentStreams.get(toolCallId);
+    if (argsText) {
+      const streamed = describeToolActivityFromArgsStream(name, argsText);
+      if (streamed) return streamed;
+    }
+    return defaultToolActivityLabel(name);
+  }
+
+  private promoteToolKey(previousKey: string, nextKey: string, name: string): void {
+    if (!previousKey || !nextKey || previousKey === nextKey) return;
+    if (this.activeToolLines.current(nextKey) !== undefined) return;
+    const line = this.activeToolLines.finish(previousKey);
+    if (line !== undefined) this.activeToolLines.start(nextKey, line);
+    const previousName = this.activeToolNames.get(previousKey);
+    if (previousName !== undefined) this.activeToolNames.delete(previousKey);
+    this.activeToolNames.set(nextKey, previousName || name);
+    const previousLabel = this.activeToolLabels.get(previousKey);
+    if (previousLabel !== undefined) this.activeToolLabels.delete(previousKey);
+    if (previousLabel) this.activeToolLabels.set(nextKey, previousLabel);
+    const argsText = this.toolArgumentStreams.get(previousKey);
+    if (argsText !== undefined) {
+      this.toolArgumentStreams.delete(previousKey);
+      this.toolArgumentStreams.set(nextKey, argsText);
+    }
+    this.renderedToolCalls.delete(previousKey);
+    this.renderedToolCalls.add(nextKey);
+  }
+
+  private findActiveToolCallIdByName(name: string): string | undefined {
+    for (const [toolCallId, toolName] of this.activeToolNames.entries()) {
+      if (toolName === name) return toolCallId;
+    }
+    return undefined;
   }
 
   private renderContextIntervention(data: unknown): void {
@@ -346,6 +451,9 @@ export class TuiRuntimeViewModel {
   private resetRuntimeState(): void {
     this.clearThinkingTimer();
     this.activeToolLines.clear();
+    this.activeToolNames.clear();
+    this.activeToolLabels.clear();
+    this.toolArgumentStreams.clear();
     this.assistantStream.reset();
     this.renderedToolCalls.clear();
     this.inThinking = false;

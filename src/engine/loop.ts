@@ -2,7 +2,7 @@
 
 import type { Config } from "../config.js";
 import type { DeepSeekClient } from "../client/deepseek.js";
-import type { StreamEvent, ContentDelta, ThinkingDelta, ToolCallBegin, StreamDone, UsageTelemetry } from "../client/base.js";
+import type { StreamEvent, ContentDelta, ThinkingDelta, ToolCallBegin, ToolCallArgsDelta, StreamDone, UsageTelemetry } from "../client/base.js";
 import type { BaseMode, UICallbacks } from "../modes/base.js";
 import type { ConversationHistory } from "../session/history.js";
 import type { Message, Session, ToolCall, ToolResult } from "../session/types.js";
@@ -443,6 +443,17 @@ export class Engine {
               name: (event as ToolCallBegin).name,
               tool_call_id: (event as ToolCallBegin).tool_call_id,
               index: (event as ToolCallBegin).index,
+            },
+          });
+          break;
+        case "tool_call_args":
+          await emitRuntimeEvent(callbacks, {
+            type: "tool_call_args",
+            data: {
+              tool_call_id: (event as ToolCallArgsDelta).tool_call_id,
+              name: (event as ToolCallArgsDelta).name,
+              index: (event as ToolCallArgsDelta).index,
+              arguments: (event as ToolCallArgsDelta).arguments,
             },
           });
           break;

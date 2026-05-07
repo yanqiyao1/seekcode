@@ -1,30 +1,27 @@
-/** Tracks active tool-call transcript lines by tool name. */
+/** Tracks active tool-call transcript lines by tool call id. */
 
 export class ActiveToolLines {
-  private readonly byName = new Map<string, number[]>();
+  private readonly byId = new Map<string, number>();
 
-  start(name: string, line: number): void {
-    const lines = this.byName.get(name) ?? [];
-    lines.push(line);
-    this.byName.set(name, lines);
+  start(id: string, line: number): void {
+    this.byId.set(id, line);
   }
 
-  finish(name: string): number | undefined {
-    const lines = this.byName.get(name);
-    const line = lines?.shift();
-    if (!lines?.length) this.byName.delete(name);
+  finish(id: string): number | undefined {
+    const line = this.byId.get(id);
+    if (line !== undefined) this.byId.delete(id);
     return line;
   }
 
-  current(name: string): number | undefined {
-    return this.byName.get(name)?.[0];
+  current(id: string): number | undefined {
+    return this.byId.get(id);
   }
 
   clear(): void {
-    this.byName.clear();
+    this.byId.clear();
   }
 
   get size(): number {
-    return [...this.byName.values()].reduce((sum, lines) => sum + lines.length, 0);
+    return this.byId.size;
   }
 }

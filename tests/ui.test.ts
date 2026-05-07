@@ -345,6 +345,66 @@ describe("TuiRuntimeViewModel", () => {
     view.dispose();
   });
 
+  it("upgrades write tool activity from streamed args before completion", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "write", tool_call_id: "call-write-1" } } as any);
+    expect(stripAnsi(transcript.lines.at(-1)?.text || "")).toContain("Writing file");
+
+    view.handleRuntimeEvent({
+      type: "tool_call_args",
+      data: {
+        tool_call_id: "call-write-1",
+        name: "write",
+        arguments: "{\"path\":\"src/components/ToolPanel.tsx\"",
+      },
+    } as any);
+
+    expect(stripAnsi(transcript.lines.at(-1)?.text || "")).toContain("Writing src/components/ToolPanel.tsx");
+
+    view.handleRuntimeEvent({
+      type: "tool_progress",
+      data: {
+        tool: "write",
+        tool_call_id: "call-write-1",
+        progress: { message: "writing bytes" },
+      },
+    } as any);
+
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+    expect(plain).toContain("Writing src/components/ToolPanel.tsx");
+    expect(plain).toContain("writing bytes");
+  });
+
+  it("keeps concurrent write tool lines associated by tool call id", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "write", tool_call_id: "call-1" } } as any);
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "write", tool_call_id: "call-2" } } as any);
+    view.handleRuntimeEvent({
+      type: "tool_call",
+      data: { id: "call-1", name: "write", arguments: { path: "a.ts", content: "a" } },
+    } as any);
+    view.handleRuntimeEvent({
+      type: "tool_call",
+      data: { id: "call-2", name: "write", arguments: { path: "b.ts", content: "b" } },
+    } as any);
+    view.handleRuntimeEvent({
+      type: "tool_result",
+      data: { tool_call_id: "call-2", name: "write", content: "ok", is_error: false },
+      preview: "Successfully wrote 1 bytes to b.ts",
+    } as any);
+
+    const plainLines = transcript.lines.map(line => stripAnsi(line.text));
+    expect(plainLines.some(line => line.includes("Writing a.ts"))).toBe(true);
+    expect(plainLines.some(line => line.includes("Successfully wrote 1 bytes to b.ts"))).toBe(true);
+    expect(view.activeToolCount).toBe(1);
+  });
+
   it("rebuilds a loaded session transcript without leaking runtime state", () => {
     const transcript = new Transcript();
     const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
@@ -1772,15 +1832,15 @@ describe("TuiLayout", () => {
 });
 
 describe("ActiveToolLines", () => {
-  it("tracks repeated tool names in FIFO order", () => {
+  it("tracks active tool lines by tool call id", () => {
     const lines = new ActiveToolLines();
-    lines.start("read", 3);
-    lines.start("read", 7);
-    lines.start("write", 9);
+    lines.start("call-1", 3);
+    lines.start("call-2", 7);
+    lines.start("call-3", 9);
 
-    expect(lines.finish("read")).toBe(3);
-    expect(lines.finish("read")).toBe(7);
-    expect(lines.finish("read")).toBeUndefined();
-    expect(lines.finish("write")).toBe(9);
+    expect(lines.current("call-2")).toBe(7);
+    expect(lines.finish("call-1")).toBe(3);
+    expect(lines.finish("call-1")).toBeUndefined();
+    expect(lines.finish("call-3")).toBe(9);
   });
 });

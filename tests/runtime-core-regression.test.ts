@@ -72,6 +72,28 @@ describe("runtime replay helpers", () => {
     ]);
   });
 
+  it("converts tool call args runtime items", () => {
+    const event = runtimeItemToEngineRuntimeEvent({
+      type: "tool_call_args",
+      data: {
+        tool_call_id: "call-1",
+        name: "write",
+        index: 0,
+        arguments: "{\"path\":\"a.ts\"",
+      },
+    });
+
+    expect(event).toMatchObject({
+      type: "tool_call_args",
+      data: {
+        tool_call_id: "call-1",
+        name: "write",
+        index: 0,
+        arguments: "{\"path\":\"a.ts\"",
+      },
+    });
+  });
+
   it("skips malformed persisted runtime items instead of stringifying objects into fake replay content", () => {
     const events = runtimeItemsToEngineRuntimeEvents([
       { type: "thinking_delta", data: { text: { nested: true } as any } },
