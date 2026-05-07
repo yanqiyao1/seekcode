@@ -174,6 +174,21 @@ describe("shell tool", () => {
     expect(result).toContain("[exit code: 0]");
   });
 
+  it("resolves relative bash workdirs against the execution workspace context", async () => {
+    registerShellTool();
+    const workspace = join(tmp, "workspace");
+    const nested = join(workspace, "pkg", "src");
+    mkdirSync(nested, { recursive: true });
+
+    const result = await getRegistry().lookup("bash")!.execute(
+      { command: "pwd", workdir: "pkg/src" },
+      { workspacePath: workspace },
+    );
+
+    expect(result).toContain(nested);
+    expect(result).toContain("[exit code: 0]");
+  });
+
   it("starts, polls, and cancels background shell jobs", async () => {
     registerShellTool();
 

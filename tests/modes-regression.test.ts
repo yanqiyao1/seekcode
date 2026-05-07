@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -156,6 +156,8 @@ describe("interaction modes", () => {
       tool("artifact_create", PermissionLevel.ALWAYS_ALLOW, "artifact"),
       tool("task_create", PermissionLevel.ALWAYS_ALLOW, "task"),
       tool("exec_shell_wait", PermissionLevel.ALWAYS_ALLOW, "shell"),
+      tool("tool_enable", PermissionLevel.ALWAYS_ALLOW, "meta"),
+      tool("tool_search", PermissionLevel.ALWAYS_ALLOW, "meta"),
     ];
 
     expect(mode.filterTools(tools).map(item => item.name)).toEqual(["web_search"]);
@@ -369,6 +371,38 @@ describe("sandbox and approval policy", () => {
       { command: "cat ../../../escape.txt", workdir: "pkg/src" },
       workspace,
     ))).toMatchObject({ decision: "deny" });
+  });
+
+  it("allows explicit absolute workspace aliases and symlinked workspace paths without false escape denials", () => {
+    const canonical = join(tmp, "canonical-workspace");
+    const aliasParent = join(tmp, "aliases");
+    const alias = join(aliasParent, "workspace-link");
+    const nested = join(canonical, "pkg");
+    mkdirSync(nested, { recursive: true });
+    mkdirSync(aliasParent, { recursive: true });
+    symlinkSync(canonical, alias, "dir");
+    const config = testConfig({ workspace_boundary: true, trusted_workspaces: [canonical] });
+    const bashTool = tool("bash", PermissionLevel.ASK, "shell");
+    const writeTool = tool("write", PermissionLevel.ASK, "file");
+
+    expect(checkSandboxPolicy(config, ctx(
+      bashTool,
+      "bash",
+      { command: "pwd", workdir: canonical },
+      alias,
+    ))).toMatchObject({ decision: "allow" });
+    expect(checkSandboxPolicy(config, ctx(
+      bashTool,
+      "bash",
+      { command: "pwd", workdir: alias },
+      canonical,
+    ))).toMatchObject({ decision: "allow" });
+    expect(checkSandboxPolicy(config, ctx(
+      writeTool,
+      "write",
+      { path: join(alias, "nested", "note.md") },
+      canonical,
+    ))).toMatchObject({ decision: "allow" });
   });
 
   it("applies approval policy, sandbox mode, and trust boundary consistently", () => {

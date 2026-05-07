@@ -369,6 +369,8 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       cfg.mode = nextModeName(cfg.mode);
       session.mode = cfg.mode;
       modeObj = getMode(cfg.mode);
+      rebuildSystemPrompt();
+      rebuildRuntime();
       return r.promptSymbol(cfg.mode);
     },
     onScroll: scrollTranscript,
@@ -599,6 +601,8 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
             cfg.mode = nextModeName(cfg.mode);
             session.mode = cfg.mode;
             modeObj = getMode(cfg.mode);
+            rebuildSystemPrompt();
+            rebuildRuntime();
             return r.promptSymbol(cfg.mode);
           },
           onScroll: scrollTranscript,
@@ -968,14 +972,20 @@ ${p.blueBold("Commands")}
 
     case "/plan":
       cfg.mode = "plan"; session.mode = "plan";
+      runtime.rebuildSystemPrompt();
+      runtime.rebuildRuntime();
       write(p.modePlan("Switched to Plan mode (read-only)."));
       return true;
     case "/agent":
       cfg.mode = "agent"; session.mode = "agent";
+      runtime.rebuildSystemPrompt();
+      runtime.rebuildRuntime();
       write(p.success("Switched to Agent mode (interactive approval)."));
       return true;
     case "/yolo":
       cfg.mode = "yolo"; session.mode = "yolo";
+      runtime.rebuildSystemPrompt();
+      runtime.rebuildRuntime();
       write(p.warning("Switched to YOLO mode (auto-approved)."));
       return true;
 

@@ -3,6 +3,7 @@
 import { PermissionLevel } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { applyPatch as applyAdvancedPatch, formatPatchResult } from "./patch-advanced.js";
+import { resolvePathAlias } from "./path-resolution.js";
 
 function normalizePatchWorkdir(args: Record<string, unknown>): string | undefined {
   if (typeof args.workdir === "string" && args.workdir.trim()) return args.workdir.trim();
@@ -21,7 +22,10 @@ async function applyPatch(args: Record<string, unknown>): Promise<string> {
     return "Patch failed:\nworkdir must be a string";
   }
   const patch = args.patch;
-  const workdir = workdirInput || process.cwd();
+  const base = typeof args.__workspace_path === "string" && args.__workspace_path.trim()
+    ? args.__workspace_path.trim()
+    : process.cwd();
+  const workdir = workdirInput ? resolvePathAlias(workdirInput, base) : base;
   try {
     const results = applyAdvancedPatch(patch, { workdir });
     const formatted = formatPatchResult(results);

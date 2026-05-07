@@ -5,6 +5,7 @@ import { PermissionLevel, type ToolExecutionContext } from "./base.js";
 import { checkCommand, isCommandReadOnly } from "./exec-policy.js";
 import { getTodoState } from "./plan.js";
 import { getRegistry } from "./registry.js";
+import { resolvePathAlias } from "./path-resolution.js";
 
 function parseType(value: unknown): TaskType {
   const type = typeof value === "string" ? value : "background";
@@ -24,9 +25,10 @@ function normalizeTaskArgAliases(args: Record<string, unknown>): Record<string, 
 }
 
 function resolveWorkdir(args: Record<string, unknown>, context?: ToolExecutionContext): string {
-  if (typeof args.workdir === "string" && args.workdir.trim()) return args.workdir.trim();
-  if (typeof args.cwd === "string" && args.cwd.trim()) return args.cwd.trim();
-  return context?.workspacePath || ".";
+  const base = context?.workspacePath || process.cwd();
+  if (typeof args.workdir === "string" && args.workdir.trim()) return resolvePathAlias(args.workdir.trim(), base);
+  if (typeof args.cwd === "string" && args.cwd.trim()) return resolvePathAlias(args.cwd.trim(), base);
+  return base;
 }
 
 async function taskCreate(args: Record<string, unknown>, context?: ToolExecutionContext): Promise<string> {

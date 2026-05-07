@@ -7,6 +7,7 @@ import { PermissionLevel, type ToolDef } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { diffLines } from "../ui/renderer.js";
 import { writeTextFileAtomic } from "./atomic-write.js";
+import { nearestExistingParent, resolvePathAlias } from "./path-resolution.js";
 
 type FileToolExtras = Partial<Omit<ToolDef, "name" | "description" | "parameters" | "execute" | "permission" | "category" | "parallelOk">>;
 const FILE_DIFF_MAX_LINES = 160;
@@ -22,7 +23,12 @@ function resolveFromRoot(path: string, root: string): string {
 
 function workspaceRoot(args: Record<string, unknown>, fallbackPath?: string): string {
   const explicitRoot = firstPresentString(args, ["root", "workspace", "cwd"]);
-  if (explicitRoot) return explicitRoot.trim();
+  if (explicitRoot) {
+    const base = typeof args.__workspace_path === "string" && args.__workspace_path.trim()
+      ? args.__workspace_path.trim()
+      : process.cwd();
+    return resolvePathAlias(explicitRoot.trim(), base);
+  }
   if (fallbackPath && (String(fallbackPath).startsWith("/") || /^[a-zA-Z]:/.test(String(fallbackPath)))) {
     const resolvedFallback = resolve(String(fallbackPath));
     try {
@@ -57,16 +63,6 @@ function resolveWritablePathInsideRoot(path: string, root: string): string {
     throw new Error(`path escapes root through symlink: ${path}`);
   }
   return target;
-}
-
-function nearestExistingParent(path: string): string {
-  let current = path;
-  while (!existsSync(current)) {
-    const parent = dirname(current);
-    if (parent === current) return parent;
-    current = parent;
-  }
-  return current;
 }
 
 function executeError(message: string): string {

@@ -17,6 +17,7 @@ import { applyToolResultBudget } from "./tool-result-budget.js";
 import { emitRuntimeEvent } from "./events.js";
 import { ImmutablePrefix, PrefixManager, stripPinnedPrefixMessages } from "./prefix.js";
 import { estimateMessagesTokens, projectMessagesForRequest } from "./compact.js";
+import { getMode } from "../modes/base.js";
 
 export type { UICallbacks };
 
@@ -85,6 +86,9 @@ export class Engine {
     let ephemeralMessage: Message | null = null;
 
     try {
+      const activeMode = this.session.mode && this.session.mode !== mode.name
+        ? getMode(this.session.mode)
+        : mode;
       if (options.ephemeralInstructions?.trim()) {
         ephemeralMessage = {
           role: "system",
@@ -104,7 +108,7 @@ export class Engine {
       }
       await emitRuntimeEvent(callbacks, { type: "prefix_pinned", data: this.prefix.metadata });
       const schemas = this.prefix.toolSchemas();
-      const allowedToolNames = new Set(mode.filterTools(this.tools.listActive()).map(tool => tool.name));
+      const allowedToolNames = new Set(activeMode.filterTools(this.tools.listActive()).map(tool => tool.name));
 
       let iterations = 0;
       let lastUsage: UsageTelemetry | null = null;
@@ -134,7 +138,7 @@ export class Engine {
       while (iterations < this.config.max_turns) {
         if (this.interrupted) break;
         iterations++;
-        const approvalPolicy = effectiveApprovalPolicy(this.config, mode);
+        const approvalPolicy = effectiveApprovalPolicy(this.config, activeMode);
 
         const projectedTokens = this.requestTokenCount();
         const capacityDecision = this.capacity.observe(projectedTokens, this.config.context_limit);
@@ -262,7 +266,7 @@ export class Engine {
               } else {
                 approvedAfterMutation = nextSandbox.decision === "allow" && approvalPolicy === "never"
                   ? true
-                  : await mode.checkPermission(nextCtx, callbacks);
+                  : await activeMode.checkPermission(nextCtx, callbacks);
               }
               if (nextSandbox.decision === "ask" && approvalPolicy === "never") approvedAfterMutation = true;
               await emitRuntimeEvent(callbacks, {
@@ -555,7 +559,7 @@ function isAbortLikeError(error: unknown): boolean {
 }
 
 function withWorkspaceDefaults(toolDef: ToolDef, args: Record<string, unknown>, workspacePath: string): Record<string, unknown> {
-  const next = { ...args };
+  const next = { ...args, __workspace_path: workspacePath };
   if (toolDef.name === "apply_patch") {
     const hasPatchRootAlias = [next.workdir, next.cwd, next.root].some(value => typeof value === "string" && value.trim());
     if (!hasPatchRootAlias) next.workdir = workspacePath;

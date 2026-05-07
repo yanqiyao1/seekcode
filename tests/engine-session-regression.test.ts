@@ -259,6 +259,60 @@ describe("AGENTS.md and pinned prefix building", () => {
     expect(prefix.memoryIndex).toContain("Project Context");
     expect(prefix.systemPrompt).toContain("workspace rules");
   });
+
+  it("limits pinned prefixes to plan-safe tools in plan mode", () => {
+    const workspace = join(tmp, "workspace");
+    mkdirSync(workspace, { recursive: true });
+    getRegistry().register({
+      name: "read",
+      description: "Read files",
+      parameters: { type: "object", properties: {} },
+      execute: async () => "ok",
+      permission: "always_allow" as any,
+      category: "file",
+      parallelOk: true,
+      readOnly: true,
+    });
+    getRegistry().register({
+      name: "write",
+      description: "Write files",
+      parameters: { type: "object", properties: {} },
+      execute: async () => "ok",
+      permission: "ask" as any,
+      category: "file",
+      parallelOk: false,
+      destructive: true,
+    });
+    getRegistry().register({
+      name: "bash",
+      description: "Shell",
+      parameters: { type: "object", properties: {} },
+      execute: async () => "ok",
+      permission: "ask" as any,
+      category: "shell",
+      parallelOk: false,
+    });
+    getRegistry().register({
+      name: "tool_enable",
+      description: "Enable tool",
+      parameters: { type: "object", properties: {} },
+      execute: async () => "ok",
+      permission: "always_allow" as any,
+      category: "meta",
+      parallelOk: true,
+    });
+
+    const prefix = buildPinnedPrefix(config({ mode: "plan" as any }), workspace, getRegistry());
+    const names = prefix.toolSchemas().map((schema: any) => schema.function.name);
+
+    expect(names).toContain("read");
+    expect(names).not.toContain("write");
+    expect(names).not.toContain("bash");
+    expect(names).not.toContain("tool_enable");
+    expect(prefix.systemPrompt).not.toContain("**write**");
+    expect(prefix.systemPrompt).not.toContain("**bash**");
+    expect(prefix.systemPrompt).not.toContain("**tool_enable**");
+  });
 });
 
 describe("context compaction and projection", () => {

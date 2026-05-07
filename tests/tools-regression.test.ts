@@ -1179,6 +1179,31 @@ describe("engine", () => {
     expect(result.tool_results[0].content).toContain("boom");
   });
 
+  it("honors session plan mode even if a stale agent mode object is passed to the engine", async () => {
+    registerFileTools();
+    const session = createSession({ workspace_path: tmp, mode: "plan" });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      {
+        type: "done",
+        finish_reason: "tool_calls",
+        usage: null,
+        content: "",
+        reasoning_content: null,
+        tool_calls: [{ id: "call_1", name: "write", arguments: { path: "x.txt", content: "bad" } }],
+      },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig({ mode: "plan" as any }), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+
+    expect(result.tool_results).toHaveLength(1);
+    expect(result.tool_results[0]).toMatchObject({ name: "write", is_error: true });
+    expect(result.tool_results[0].content).toContain("not active");
+  });
+
   it("records unknown tool calls in the turn result", async () => {
     const session = createSession({ workspace_path: tmp });
     const history = new ConversationHistory(session);
@@ -1812,6 +1837,40 @@ describe("engine", () => {
           id: "call_1",
           name: "bash",
           arguments: { command: "pwd", cwd: shellDir },
+        }],
+      },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      requestApproval: async () => true,
+    });
+
+    expect(result.tool_results[0]).toMatchObject({ is_error: false });
+    expect(result.tool_results[0].content).toContain(shellDir);
+  });
+
+  it("resolves relative bash workdirs through the engine against the session workspace", async () => {
+    registerShellTool();
+    const workspace = join(tmp, "workspace");
+    const shellDir = join(workspace, "pkg", "src");
+    mkdirSync(shellDir, { recursive: true });
+
+    const session = createSession({ workspace_path: workspace });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      {
+        type: "done",
+        finish_reason: "tool_calls",
+        usage: null,
+        content: "",
+        reasoning_content: null,
+        tool_calls: [{
+          id: "call_1",
+          name: "bash",
+          arguments: { command: "pwd", workdir: "pkg/src" },
         }],
       },
       { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },

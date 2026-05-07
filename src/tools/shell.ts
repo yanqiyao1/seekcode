@@ -5,6 +5,7 @@ import { PermissionLevel, type ToolExecutionContext } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { checkCommand, isCommandReadOnly } from "./exec-policy.js";
 import { formatJob, getJobManager } from "./jobs.js";
+import { resolvePathAlias } from "./path-resolution.js";
 
 function normalizeShellArgAliases(args: Record<string, unknown>): Record<string, unknown> {
   if (args.workdir !== undefined || args.cwd === undefined) return args;
@@ -12,9 +13,10 @@ function normalizeShellArgAliases(args: Record<string, unknown>): Record<string,
 }
 
 function resolveWorkdir(args: Record<string, unknown>, context?: ToolExecutionContext): string {
-  if (typeof args.workdir === "string" && args.workdir.trim()) return args.workdir.trim();
-  if (typeof args.cwd === "string" && args.cwd.trim()) return args.cwd.trim();
-  return context?.workspacePath || ".";
+  const base = context?.workspacePath || process.cwd();
+  if (typeof args.workdir === "string" && args.workdir.trim()) return resolvePathAlias(args.workdir.trim(), base);
+  if (typeof args.cwd === "string" && args.cwd.trim()) return resolvePathAlias(args.cwd.trim(), base);
+  return base;
 }
 
 async function bash(args: Record<string, unknown>, context?: ToolExecutionContext): Promise<string> {

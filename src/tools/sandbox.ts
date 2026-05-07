@@ -1,10 +1,16 @@
 /** Approval policy, sandbox mode, trust boundary, and workspace boundary checks. */
 
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import type { Config } from "../config.js";
 import type { ApprovalContext } from "./base.js";
 import { isToolDestructive, isToolReadOnly } from "./base.js";
 import { checkCommand, isCommandReadOnly } from "./exec-policy.js";
+import {
+  canonicalizePathOrNearestExisting,
+  canonicalizeWorkspaceBoundary,
+  isPathInsideRoot,
+  resolvePathAlias,
+} from "./path-resolution.js";
 
 export type SandboxDecision = "allow" | "ask" | "deny";
 
@@ -68,10 +74,10 @@ export function checkSandboxPolicy(config: Config, ctx: ApprovalContext): Sandbo
 }
 
 export function isTrustedWorkspace(config: Config, workspacePath: string): boolean {
-  const workspace = resolve(workspacePath || ".");
+  const workspace = canonicalizePathOrNearestExisting(workspacePath || ".");
   return (config.trusted_workspaces || []).some(item => {
-    const trusted = resolve(expandHome(item));
-    return workspace === trusted || workspace.startsWith(`${trusted}/`);
+    const trusted = canonicalizePathOrNearestExisting(expandHome(item));
+    return isPathInsideRoot(workspace, trusted);
   });
 }
 
@@ -92,27 +98,26 @@ function shellWorkdir(ctx: ApprovalContext, workspace: string): string {
     ? ctx.tool_args.workdir
     : ctx.tool_args.cwd;
   if (typeof raw !== "string" || raw.trim() === "") return workspace;
-  return resolve(workspace, raw);
+  return resolvePathAlias(raw, workspace);
 }
 
 function escapesWorkspace(ctx: ApprovalContext, workspace: string): boolean {
   for (const key of FILE_PATH_ARGS) {
     const raw = ctx.tool_args[key];
     if (typeof raw !== "string" || raw.trim() === "") continue;
-    if (!isInsideWorkspace(resolve(workspace, raw), workspace)) return true;
+    if (!isInsideWorkspace(resolvePathAlias(raw, workspace), workspace)) return true;
   }
   if (Array.isArray(ctx.tool_args.files)) {
     for (const raw of ctx.tool_args.files) {
       if (typeof raw !== "string" || raw.trim() === "") continue;
-      if (!isInsideWorkspace(resolve(workspace, raw), workspace)) return true;
+      if (!isInsideWorkspace(resolvePathAlias(raw, workspace), workspace)) return true;
     }
   }
   return false;
 }
 
 function isInsideWorkspace(path: string, workspace: string): boolean {
-  const rel = relative(workspace, path);
-  return rel === "" || (!!rel && !rel.startsWith("..") && !rel.startsWith("/") && !/^[a-zA-Z]:/.test(rel));
+  return canonicalizeWorkspaceBoundary(path, workspace);
 }
 
 function shellCommandEscapesWorkspace(command: string, workspace: string, shellCwd: string): boolean {
@@ -154,7 +159,7 @@ function extractShellPathCandidate(token: string): string | null {
 function resolveShellPath(path: string, shellCwd: string): string {
   if (path === "~" || path.startsWith("~/")) return resolve(expandHome(path));
   if (isAbsolute(path)) return resolve(path);
-  return resolve(shellCwd, path);
+  return resolvePathAlias(path, shellCwd);
 }
 
 function expandHome(path: string): string {

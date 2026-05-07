@@ -46,7 +46,12 @@ const PLAN_ALLOWED_TOOLS = new Set([
 function isPlanAllowedTool(tool: ToolDef): boolean {
   if (tool.category === "shell") return false;
   if (tool.permission !== PermissionLevel.ALWAYS_ALLOW) return false;
-  return PLAN_ALLOWED_TOOLS.has(tool.name) || isToolStaticallyReadOnly(tool);
+  return PLAN_ALLOWED_TOOLS.has(tool.name) || (
+    isToolStaticallyReadOnly(tool)
+    && tool.category !== "meta"
+    && tool.category !== "artifact"
+    && tool.category !== "task"
+  );
 }
 
 export class PlanMode implements BaseMode {

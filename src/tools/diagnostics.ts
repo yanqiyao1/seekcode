@@ -9,6 +9,7 @@ import { getRegistry } from "./registry.js";
 import { createArtifact, getArtifact, listArtifacts, readArtifact } from "../artifacts/store.js";
 import { addMCPServer, getMCPManager, reloadMCPManager, removeMCPServer, setMCPServerEnabled } from "../mcp/manager.js";
 import type { MCPConfig } from "../config.js";
+import { resolvePathAlias } from "./path-resolution.js";
 
 type DiagnosticsToolExtras = Partial<Omit<ToolDef, "name" | "description" | "parameters" | "execute" | "permission" | "category" | "parallelOk">>;
 
@@ -31,9 +32,12 @@ function runWithStatus(command: string, workdir = "."): { output: string; status
 }
 
 function resolveWorkdir(args: Record<string, unknown>): string {
-  if (typeof args.workdir === "string" && args.workdir.trim()) return args.workdir;
-  if (typeof args.cwd === "string" && args.cwd.trim()) return args.cwd;
-  return ".";
+  const base = typeof args.__workspace_path === "string" && args.__workspace_path.trim()
+    ? args.__workspace_path.trim()
+    : process.cwd();
+  if (typeof args.workdir === "string" && args.workdir.trim()) return resolvePathAlias(args.workdir.trim(), base);
+  if (typeof args.cwd === "string" && args.cwd.trim()) return resolvePathAlias(args.cwd.trim(), base);
+  return base;
 }
 
 function validateDiagnosticsWorkdirArgs(args: Record<string, unknown>) {

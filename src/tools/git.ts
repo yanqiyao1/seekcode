@@ -3,6 +3,7 @@
 import { spawnSync } from "node:child_process";
 import { PermissionLevel } from "./base.js";
 import { getRegistry } from "./registry.js";
+import { resolvePathAlias } from "./path-resolution.js";
 
 function runGit(args: string[], workdir = "."): string {
   try {
@@ -27,9 +28,12 @@ function splitFiles(files: unknown): string[] {
 }
 
 function resolveWorkdir(args: Record<string, unknown>): string {
-  if (typeof args.workdir === "string" && args.workdir.trim()) return args.workdir.trim();
-  if (typeof args.cwd === "string" && args.cwd.trim()) return args.cwd.trim();
-  return ".";
+  const base = typeof args.__workspace_path === "string" && args.__workspace_path.trim()
+    ? args.__workspace_path.trim()
+    : process.cwd();
+  if (typeof args.workdir === "string" && args.workdir.trim()) return resolvePathAlias(args.workdir.trim(), base);
+  if (typeof args.cwd === "string" && args.cwd.trim()) return resolvePathAlias(args.cwd.trim(), base);
+  return base;
 }
 
 function normalizeWorkdirArg(args: Record<string, unknown>): { ok: true; workdir?: string } | { ok: false; message: string } {
