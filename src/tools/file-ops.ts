@@ -20,8 +20,8 @@ function resolveFromRoot(path: string, root: string): string {
 }
 
 function workspaceRoot(args: Record<string, unknown>, fallbackPath?: string): string {
-  const explicitRoot = args.root || args.workspace || args.cwd;
-  if (explicitRoot) return String(explicitRoot);
+  const explicitRoot = firstPresentString(args, ["root", "workspace", "cwd"]);
+  if (explicitRoot) return explicitRoot.trim();
   if (fallbackPath && (String(fallbackPath).startsWith("/") || /^[a-zA-Z]:/.test(String(fallbackPath)))) {
     return String(fallbackPath);
   }
@@ -63,22 +63,84 @@ function nearestExistingParent(path: string): string {
   return current;
 }
 
+function executeError(message: string): string {
+  return `Error: ${message}`;
+}
+
+function validateRootAliases(args: Record<string, unknown>): string | null {
+  for (const key of ["root", "workspace", "cwd"]) {
+    const value = args[key];
+    if (value !== undefined && typeof value !== "string") return `${key} must be a string`;
+  }
+  return null;
+}
+
+function validateOptionalNumber(value: unknown, key: string): string | null {
+  if (value === undefined) return null;
+  if (typeof value !== "number" && typeof value !== "string") return `${key} must be a number`;
+  return Number.isFinite(Number(value)) ? null : `${key} must be a number`;
+}
+
+function validateOptionalBoolean(value: unknown, key: string): string | null {
+  if (value === undefined) return null;
+  return typeof value === "boolean" ? null : `${key} must be a boolean`;
+}
+
+function requiredPathInput(args: Record<string, unknown>): { ok: true; args: Record<string, unknown>; path: string } | { ok: false; message: string } {
+  const normalized = normalizePathArg(args);
+  const message = requireString(normalized, "path");
+  return message ? { ok: false, message } : { ok: true, args: normalized, path: normalized.path as string };
+}
+
+function optionalPathInput(
+  args: Record<string, unknown>,
+  defaultPath = ".",
+): { ok: true; args: Record<string, unknown>; path: string } | { ok: false; message: string } {
+  const normalized = normalizePathArg(args);
+  const value = normalized.path;
+  if (value === undefined) return { ok: true, args: normalized, path: defaultPath };
+  if (typeof value !== "string") return { ok: false, message: "path must be a string" };
+  const path = value.trim();
+  return { ok: true, args: normalized, path: path || defaultPath };
+}
+
 async function readFile(args: Record<string, unknown>): Promise<string> {
-  const path = args.path as string;
-  const root = workspaceRoot(args, path);
-  const offset = (args.offset as number) || 0;
-  const limit = (args.limit as number) || 2000;
+  const pathInput = requiredPathInput(args);
+  if (!pathInput.ok) return executeError(pathInput.message);
+  const rootError = validateRootAliases(pathInput.args);
+  if (rootError) return executeError(rootError);
+  const offsetError = validateOptionalNumber(args.offset, "offset");
+  if (offsetError) return executeError(offsetError);
+  const limitError = validateOptionalNumber(args.limit, "limit");
+  if (limitError) return executeError(limitError);
+  const { args: normalized, path } = pathInput;
+  const root = workspaceRoot(normalized, path);
+  const { offset, limit } = normalizeReadWindow(args.offset, args.limit);
   try {
     const content = readFileSync(resolveExistingPathInsideRoot(path, String(root)), "utf-8");
     const lines = content.split("\n");
-    return lines.slice(offset, offset + (limit || lines.length)).join("\n");
+    return lines.slice(offset, offset + limit).join("\n");
   } catch (e: any) { return `Error reading file: ${e.message}`; }
 }
 
+function normalizeReadWindow(offsetValue: unknown, limitValue: unknown): { offset: number; limit: number } {
+  const rawOffset = Number(offsetValue);
+  const rawLimit = Number(limitValue);
+  const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.floor(rawOffset)) : 0;
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 2000;
+  return { offset, limit };
+}
+
 async function writeFile(args: Record<string, unknown>): Promise<string> {
-  const path = args.path as string;
-  const content = args.content as string;
-  const root = workspaceRoot(args, path);
+  const normalized = normalizeWriteArgs(args);
+  const pathError = requireString(normalized, "path");
+  if (pathError) return executeError(pathError);
+  const rootError = validateRootAliases(normalized);
+  if (rootError) return executeError(rootError);
+  if (typeof normalized.content !== "string") return executeError("content must be a string");
+  const path = normalized.path as string;
+  const content = normalized.content;
+  const root = workspaceRoot(normalized, path);
   try {
     const target = resolveWritablePathInsideRoot(path, String(root));
     const oldContent = existsSync(target) ? readFileSync(target, "utf-8") : "";
@@ -94,12 +156,22 @@ async function writeFile(args: Record<string, unknown>): Promise<string> {
 }
 
 async function editFile(args: Record<string, unknown>): Promise<string> {
-  const path = args.path as string;
-  const root = workspaceRoot(args, path);
-  const oldString = args.old_string as string;
-  const newString = args.new_string as string;
+  const normalized = normalizeEditArgs(args);
+  const pathError = requireString(normalized, "path");
+  if (pathError) return executeError(pathError);
+  const rootError = validateRootAliases(normalized);
+  if (rootError) return executeError(rootError);
+  const replaceAllError = validateOptionalBoolean(args.replace_all, "replace_all");
+  if (replaceAllError) return executeError(replaceAllError);
+  if (typeof normalized.old_string !== "string" || !normalized.old_string) {
+    return executeError("old_string must be a non-empty string");
+  }
+  if (typeof normalized.new_string !== "string") return executeError("new_string must be a string");
+  const path = normalized.path as string;
+  const root = workspaceRoot(normalized, path);
+  const oldString = normalized.old_string;
+  const newString = normalized.new_string;
   const replaceAll = (args.replace_all as boolean) || false;
-  if (!oldString) return "Error: old_string must not be empty";
   try {
     const target = resolveExistingPathInsideRoot(path, String(root));
     const content = readFileSync(target, "utf-8");
@@ -118,8 +190,12 @@ async function editFile(args: Record<string, unknown>): Promise<string> {
 }
 
 async function ls(args: Record<string, unknown>): Promise<string> {
-  const path = (args.path as string) || ".";
-  const root = workspaceRoot(args, path);
+  const pathInput = optionalPathInput(args);
+  if (!pathInput.ok) return executeError(pathInput.message);
+  const rootError = validateRootAliases(pathInput.args);
+  if (rootError) return executeError(rootError);
+  const { args: normalized, path } = pathInput;
+  const root = workspaceRoot(normalized, path);
   try {
     const dir = resolveExistingPathInsideRoot(path, root);
     const items = readdirSync(dir, { withFileTypes: true });
@@ -140,11 +216,20 @@ async function ls(args: Record<string, unknown>): Promise<string> {
 }
 
 async function search(args: Record<string, unknown>): Promise<string> {
+  const patternError = requireString(args, "pattern");
+  if (patternError) return executeError(patternError);
+  const pathInput = optionalPathInput(args);
+  if (!pathInput.ok) return executeError(pathInput.message);
+  const rootError = validateRootAliases(pathInput.args);
+  if (rootError) return executeError(rootError);
+  if (args.include !== undefined && typeof args.include !== "string") return executeError("include must be a string");
+  const caseSensitiveError = validateOptionalBoolean(args.case_sensitive, "case_sensitive");
+  if (caseSensitiveError) return executeError(caseSensitiveError);
+  const { args: normalized, path } = pathInput;
   const pattern = args.pattern as string;
-  const path = (args.path as string) || ".";
-  const include = (args.include as string) || "";
-  const caseSensitive = args.case_sensitive !== false;
-  const boundary = workspaceRoot(args, path);
+  const include = typeof normalized.include === "string" ? normalized.include : "";
+  const caseSensitive = normalized.case_sensitive !== false;
+  const boundary = workspaceRoot(normalized, path);
   try {
     const root = resolveExistingPathInsideRoot(path, boundary);
     const grepArgs = ["-rnF"];
@@ -164,9 +249,15 @@ async function search(args: Record<string, unknown>): Promise<string> {
 }
 
 async function glob(args: Record<string, unknown>): Promise<string> {
+  const patternError = requireString(args, "pattern");
+  if (patternError) return executeError(patternError);
+  const pathInput = optionalPathInput(args);
+  if (!pathInput.ok) return executeError(pathInput.message);
+  const rootError = validateRootAliases(pathInput.args);
+  if (rootError) return executeError(rootError);
+  const { args: normalized, path } = pathInput;
   const pattern = args.pattern as string;
-  const path = (args.path as string) || ".";
-  const boundary = workspaceRoot(args, path);
+  const boundary = workspaceRoot(normalized, path);
   try {
     const results: string[] = [];
     const root = resolveExistingPathInsideRoot(path, boundary);
@@ -224,7 +315,7 @@ function requireString(args: Record<string, unknown>, key: string): string | nul
 function firstPresentString(args: Record<string, unknown>, keys: string[]): string | undefined {
   for (const key of keys) {
     const value = args[key];
-    if (typeof value === "string" && value.trim()) return value;
+    if (typeof value === "string" && value.trim()) return value.trim();
   }
   return undefined;
 }
@@ -284,7 +375,14 @@ export function registerFileTools(): void {
     validateInput: (args) => {
       const normalized = normalizePathArg(args);
       const message = requireString(normalized, "path");
-      return message ? { ok: false, message } : { ok: true, args: normalized };
+      if (message) return { ok: false, message };
+      const rootError = validateRootAliases(normalized);
+      if (rootError) return { ok: false, message: rootError };
+      const offsetError = validateOptionalNumber(normalized.offset, "offset");
+      if (offsetError) return { ok: false, message: offsetError };
+      const limitError = validateOptionalNumber(normalized.limit, "limit");
+      if (limitError) return { ok: false, message: limitError };
+      return { ok: true, args: normalized };
     },
   });
   t("write", "Write content to a file.", { path: { type: "string" }, content: { type: "string" }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, ["path", "content"], writeFile, PermissionLevel.ASK, "file", false, {
@@ -297,6 +395,8 @@ export function registerFileTools(): void {
       const normalized = normalizeWriteArgs(args);
       const pathError = requireString(normalized, "path");
       if (pathError) return { ok: false, message: pathError };
+      const rootError = validateRootAliases(normalized);
+      if (rootError) return { ok: false, message: rootError };
       return typeof normalized.content === "string"
         ? { ok: true, args: normalized }
         : { ok: false, message: "content must be a string" };
@@ -314,6 +414,10 @@ export function registerFileTools(): void {
         const message = requireString(normalized, key);
         if (message) return { ok: false, message };
       }
+      const rootError = validateRootAliases(normalized);
+      if (rootError) return { ok: false, message: rootError };
+      const replaceAllError = validateOptionalBoolean(normalized.replace_all, "replace_all");
+      if (replaceAllError) return { ok: false, message: replaceAllError };
       return typeof normalized.new_string === "string"
         ? { ok: true, args: normalized }
         : { ok: false, message: "new_string must be a string" };
@@ -325,6 +429,12 @@ export function registerFileTools(): void {
     readOnly: true,
     resultKind: "text",
     isSearchOrReadCommand: () => ({ isSearch: false, isRead: false, isList: true }),
+    validateInput: (args) => {
+      const pathInput = optionalPathInput(args);
+      if (!pathInput.ok) return { ok: false, message: pathInput.message };
+      const rootError = validateRootAliases(pathInput.args);
+      return rootError ? { ok: false, message: rootError } : { ok: true, args: pathInput.args };
+    },
   });
   t("search", "Search for text using grep.", { pattern: { type: "string" }, path: { type: "string", default: "." }, root: { type: "string", description: "Optional root boundary for symlink safety." }, include: { type: "string", default: "" }, case_sensitive: { type: "boolean", default: true } }, ["pattern"], search, PermissionLevel.ALWAYS_ALLOW, "file", true, {
     aliases: ["grep"],
@@ -336,7 +446,15 @@ export function registerFileTools(): void {
     validateInput: (args) => {
       const normalized = normalizePathArg(args);
       const message = requireString(args, "pattern");
-      return message ? { ok: false, message } : { ok: true, args: normalized };
+      if (message) return { ok: false, message };
+      const rootError = validateRootAliases(normalized);
+      if (rootError) return { ok: false, message: rootError };
+      if (normalized.include !== undefined && typeof normalized.include !== "string") {
+        return { ok: false, message: "include must be a string" };
+      }
+      const caseSensitiveError = validateOptionalBoolean(normalized.case_sensitive, "case_sensitive");
+      if (caseSensitiveError) return { ok: false, message: caseSensitiveError };
+      return { ok: true, args: normalized };
     },
   });
   t("glob", "Find files matching a glob pattern.", { pattern: { type: "string" }, path: { type: "string", default: "." }, root: { type: "string", description: "Optional root boundary for symlink safety." } }, ["pattern"], glob, PermissionLevel.ALWAYS_ALLOW, "file", true, {
@@ -349,7 +467,9 @@ export function registerFileTools(): void {
     validateInput: (args) => {
       const normalized = normalizePathArg(args);
       const message = requireString(args, "pattern");
-      return message ? { ok: false, message } : { ok: true, args: normalized };
+      if (message) return { ok: false, message };
+      const rootError = validateRootAliases(normalized);
+      return rootError ? { ok: false, message: rootError } : { ok: true, args: normalized };
     },
   });
 }

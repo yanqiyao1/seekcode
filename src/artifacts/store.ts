@@ -38,9 +38,11 @@ export function createArtifact(options: CreateArtifactOptions): ArtifactRecord {
   mkdirSync(root, { recursive: true });
   const createdAt = new Date().toISOString();
   const content = typeof options.content === "string" ? Buffer.from(options.content, "utf-8") : options.content;
+  const metadata = normalizeArtifactMetadata(options.metadata);
   const sha256 = createHash("sha256").update(content).digest("hex");
-  const id = `${safeId(options.kind)}_${Date.now().toString(36)}_${sha256.slice(0, 10)}`;
   const extension = safeExtension(options.extension || extname(options.name) || ".txt");
+  const baseId = `${safeId(options.kind)}_${Date.now().toString(36)}_${sha256.slice(0, 10)}`;
+  const id = uniqueArtifactId(root, baseId, extension);
   const path = join(root, `${id}${extension}`);
   const metadataPath = join(root, `${id}.json`);
   const record: ArtifactRecord = {
@@ -52,7 +54,7 @@ export function createArtifact(options: CreateArtifactOptions): ArtifactRecord {
     bytes: content.byteLength,
     sha256,
     created_at: createdAt,
-    metadata: options.metadata || {},
+    metadata,
   };
   writeFileSync(path, content);
   writeFileSync(metadataPath, JSON.stringify(record, null, 2), "utf-8");
@@ -62,6 +64,7 @@ export function createArtifact(options: CreateArtifactOptions): ArtifactRecord {
 export function listArtifacts(limit = 50, kind?: string): ArtifactRecord[] {
   const root = artifactRoot();
   if (!existsSync(root)) return [];
+  const normalizedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(Math.floor(limit), 500)) : 50;
   const records: ArtifactRecord[] = [];
   for (const file of readdirSync(root).filter(name => name.endsWith(".json"))) {
     try {
@@ -75,21 +78,25 @@ export function listArtifacts(limit = 50, kind?: string): ArtifactRecord[] {
   }
   return records
     .sort((a, b) => b.created_at.localeCompare(a.created_at))
-    .slice(0, Math.max(1, Math.min(limit, 500)));
+    .slice(0, normalizedLimit);
 }
 
 export function getArtifact(id: string): ArtifactRecord | undefined {
-  return listArtifacts(500).find(record => record.id === id);
+  const root = artifactRoot();
+  const safeId = sanitizeArtifactLookupId(id);
+  if (!safeId) return undefined;
+  return readArtifactRecord(join(root, `${safeId}.json`));
 }
 
 export function readArtifact(id: string, maxBytes = 200_000): string {
   const record = getArtifact(id);
   if (!record) return `Error: artifact not found: ${id}`;
   try {
+    const limit = Number.isFinite(maxBytes) ? Math.max(0, Math.floor(maxBytes)) : 200_000;
     const stats = statSync(record.path);
     const content = readFileSync(record.path);
-    const truncated = content.byteLength > maxBytes;
-    const slice = truncated ? content.subarray(0, maxBytes) : content;
+    const truncated = content.byteLength > limit;
+    const slice = truncated ? content.subarray(0, limit) : content;
     return [
       JSON.stringify({ ...record, truncated, total_bytes: stats.size }, null, 2),
       "",
@@ -106,12 +113,13 @@ export function linkArtifact(
   targetId: string,
   metadata: Record<string, unknown> = {},
 ): ArtifactLink {
+  const normalizedMetadata = normalizeArtifactMetadata(metadata);
   const link: ArtifactLink = {
     artifact_id: artifactId,
     scope,
     target_id: targetId,
     created_at: new Date().toISOString(),
-    metadata,
+    metadata: normalizedMetadata,
   };
   const links = listArtifactLinks();
   if (!links.some(item => item.artifact_id === artifactId && item.scope === scope && item.target_id === targetId)) {
@@ -123,7 +131,8 @@ export function linkArtifact(
 
 export function listArtifactLinks(filter: Partial<Pick<ArtifactLink, "scope" | "target_id" | "artifact_id">> = {}): ArtifactLink[] {
   try {
-    const links = JSON.parse(readFileSync(artifactIndexPath(), "utf-8")) as ArtifactLink[];
+    const raw = JSON.parse(readFileSync(artifactIndexPath(), "utf-8"));
+    const links = Array.isArray(raw) ? raw.filter(isArtifactLink) : [];
     return links.filter(link => {
       if (filter.scope && link.scope !== filter.scope) return false;
       if (filter.target_id && link.target_id !== filter.target_id) return false;
@@ -146,6 +155,14 @@ export function clearArtifactsForTests(): void {
   try { rmSync(artifactRoot(), { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
+function normalizeArtifactMetadata(value: unknown): Record<string, unknown> {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("metadata must be an object.");
+  }
+  return value as Record<string, unknown>;
+}
+
 function artifactIndexPath(): string {
   return join(artifactRoot(), "index.json");
 }
@@ -161,7 +178,32 @@ function safeId(value: string): string {
 
 function safeExtension(value: string): string {
   const extension = value.startsWith(".") ? value : `.${value}`;
-  return extension.replace(/[^a-zA-Z0-9.]/g, "").slice(0, 16) || ".txt";
+  const sanitized = extension.replace(/[^a-zA-Z0-9.]/g, "").slice(0, 16);
+  return /\.[a-zA-Z0-9]/.test(sanitized) ? sanitized : ".txt";
+}
+
+function uniqueArtifactId(root: string, baseId: string, extension: string): string {
+  let id = baseId;
+  let counter = 0;
+  while (existsSync(join(root, `${id}${extension}`)) || existsSync(join(root, `${id}.json`))) {
+    counter++;
+    id = `${baseId}_${counter}`;
+  }
+  return id;
+}
+
+function sanitizeArtifactLookupId(value: string): string {
+  const tail = String(value || "").split(/[\\/]/).pop() || "";
+  return tail.replace(/[^a-zA-Z0-9._-]/g, "").replace(/^\.+/, "").trim();
+}
+
+function readArtifactRecord(metadataPath: string): ArtifactRecord | undefined {
+  try {
+    const record = JSON.parse(readFileSync(metadataPath, "utf-8")) as ArtifactRecord;
+    return isArtifactRecord(record) ? record : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function isArtifactRecord(value: unknown): value is ArtifactRecord {
@@ -174,4 +216,14 @@ function isArtifactRecord(value: unknown): value is ArtifactRecord {
     && typeof record.created_at === "string"
     && typeof record.sha256 === "string"
     && typeof record.bytes === "number";
+}
+
+function isArtifactLink(value: unknown): value is ArtifactLink {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const link = value as Partial<ArtifactLink>;
+  return typeof link.artifact_id === "string"
+    && typeof link.target_id === "string"
+    && typeof link.created_at === "string"
+    && (link.scope === "session" || link.scope === "turn" || link.scope === "task" || link.scope === "job")
+    && (link.metadata === undefined || (typeof link.metadata === "object" && link.metadata !== null && !Array.isArray(link.metadata)));
 }

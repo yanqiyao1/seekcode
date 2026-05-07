@@ -226,6 +226,8 @@ function loadEnv(): Record<string, unknown> {
     ["DEEPSEEK_FLASH_MODEL", "flash_model"],
     ["DEEPSEEK_MODE", "mode"],
     ["DEEPSEEK_MAX_TOKENS", "max_tokens"],
+    ["DEEPSEEK_MAX_TURNS", "max_turns"],
+    ["DEEPSEEK_CONTEXT_LIMIT", "context_limit"],
     ["DEEPSEEK_REASONING_EFFORT", "reasoning_effort"],
     ["DEEPSEEK_TUI_ALTERNATE_SCREEN", "tui_alternate_screen"],
     ["DEEPSEEK_SKILLS_DIR", "skills_dir"],
@@ -233,6 +235,7 @@ function loadEnv(): Record<string, unknown> {
     ["DEEPSEEK_SKILLS_MAX_INSTALL_SIZE_BYTES", "skills_max_install_size_bytes"],
     ["DEEPSEEK_APPROVAL_POLICY", "approval_policy"],
     ["DEEPSEEK_SANDBOX_MODE", "sandbox_mode"],
+    ["DEEPSEEK_THEME", "theme"],
     ["DEEPSEEK_LSP_DIAGNOSTICS_SEVERITY", "lsp_diagnostics_severity"],
     ["DEEPSEEK_TOOL_CALL_BUDGET_PER_TURN", "tool_call_budget_per_turn"],
     ["DEEPSEEK_TOOL_FAILURE_DEGRADE_THRESHOLD", "tool_failure_degrade_threshold"],
@@ -260,7 +263,10 @@ function loadEnv(): Record<string, unknown> {
   for (const [env, key] of map) {
     const val = process.env[env];
     if (val) {
-      if (["max_tokens", "tool_call_budget_per_turn", "tool_failure_degrade_threshold", "skills_max_install_size_bytes"].includes(key) || key.startsWith("web.") && /_ms$|max_bytes$/.test(key)) {
+      if (
+        ["max_tokens", "max_turns", "context_limit", "tool_call_budget_per_turn", "tool_failure_degrade_threshold", "skills_max_install_size_bytes"].includes(key)
+        || key.startsWith("web.") && /_ms$|max_bytes$/.test(key)
+      ) {
         const parsed = parseInt(val, 10);
         if (Number.isFinite(parsed)) setNested(result, key, parsed);
       } else if (key === "status_items" || key === "web.allowed_domains" || key === "web.blocked_domains" || key === "web.no_proxy") {
@@ -278,6 +284,15 @@ function loadEnv(): Record<string, unknown> {
   }
   if (process.env.DEEPSEEK_LSP_AUTO_DIAGNOSTICS) {
     result.lsp_auto_diagnostics = parseBool(process.env.DEEPSEEK_LSP_AUTO_DIAGNOSTICS);
+  }
+  if (process.env.DEEPSEEK_ROLLBACK_ENABLED) {
+    result.rollback_enabled = parseBool(process.env.DEEPSEEK_ROLLBACK_ENABLED);
+  }
+  if (process.env.DEEPSEEK_COST_TRACKING) {
+    result.cost_tracking = parseBool(process.env.DEEPSEEK_COST_TRACKING);
+  }
+  if (process.env.DEEPSEEK_THINKING_VISIBLE) {
+    result.thinking_visible = parseBool(process.env.DEEPSEEK_THINKING_VISIBLE);
   }
   if (process.env.DEEPSEEK_WEB_ENABLED) {
     setNested(result, "web.enabled", parseBool(process.env.DEEPSEEK_WEB_ENABLED));
@@ -468,7 +483,7 @@ export function explainConfig(cliOverrides: Record<string, unknown> = {}): Confi
   const valuesByKey = new Map<string, Array<{ source: string; value: unknown; path?: string }>>();
   for (const source of sources) {
     const migrated = migrateConfigObject(source.values).config;
-    for (const [key, value] of Object.entries(migrated)) {
+    for (const [key, value] of flattenConfigEntries(migrated)) {
       if (value === undefined || value === null || value === "") continue;
       const list = valuesByKey.get(key) || [];
       list.push({ source: source.source, value, path: source.path });
@@ -609,18 +624,9 @@ function migrateConfigObject(input: Record<string, unknown>): { config: Record<s
     warnings.push(`model ${String(config.model)} is deprecated; provider capability resolution will use deepseek-v4-flash`);
   }
   if (Array.isArray(config.mcp_servers)) {
-    config.mcp_servers = config.mcp_servers.map(server => {
-      if (!server || typeof server !== "object") return server;
-      const record = { ...(server as Record<string, unknown>) };
-      if (!record.transport) {
-        record.transport = record.url ? "sse" : "stdio";
-        actions.push(`defaulted MCP server ${String(record.name || "(unnamed)")} transport`);
-      }
-      if (!Object.prototype.hasOwnProperty.call(record, "enabled")) record.enabled = true;
-      if (!record.args) record.args = [];
-      if (!record.env) record.env = {};
-      return record;
-    });
+    config.mcp_servers = config.mcp_servers
+      .map(server => normalizeMigratedMCPServerRecord(server, actions))
+      .filter((server): server is Record<string, unknown> => !!server);
   }
   if (config.skills && typeof config.skills === "object" && !Array.isArray(config.skills)) {
     const skills = config.skills as Record<string, unknown>;
@@ -635,6 +641,47 @@ function migrateConfigObject(input: Record<string, unknown>): { config: Record<s
     delete config.skills;
   }
   return { config, changed: actions.length > 0, actions, warnings };
+}
+
+function normalizeMCPEnvRecord(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const env: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry === "string") env[key] = entry;
+  }
+  return env;
+}
+
+function normalizeMigratedMCPServerRecord(
+  server: unknown,
+  actions: string[],
+): Record<string, unknown> | null {
+  if (!server || typeof server !== "object" || Array.isArray(server)) return null;
+  const record = { ...(server as Record<string, unknown>) };
+  const name = typeof record.name === "string" && record.name.trim() ? record.name : null;
+  if (!name) return null;
+
+  const url = typeof record.url === "string" && record.url.trim() ? record.url : undefined;
+  const transport = typeof record.transport === "string" && (record.transport === "stdio" || record.transport === "sse")
+    ? record.transport
+    : (url ? "sse" : "stdio");
+
+  if (record.transport !== transport) {
+    actions.push(`defaulted MCP server ${name} transport`);
+  }
+
+  return {
+    ...record,
+    name,
+    transport,
+    command: typeof record.command === "string" && record.command.trim() ? record.command : undefined,
+    args: Array.isArray(record.args)
+      ? record.args.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      : [],
+    url,
+    env: normalizeMCPEnvRecord(record.env),
+    enabled: record.enabled !== false,
+  };
 }
 
 function semanticConfigIssues(config: Record<string, unknown>, source: string, path?: string): ConfigValidationIssue[] {
@@ -683,4 +730,20 @@ function semanticConfigIssues(config: Record<string, unknown>, source: string, p
 
 function stableValue(value: unknown): string {
   return JSON.stringify(value, Object.keys(value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}).sort());
+}
+
+function flattenConfigEntries(
+  value: Record<string, unknown>,
+  prefix = "",
+): Array<[string, unknown]> {
+  const entries: Array<[string, unknown]> = [];
+  for (const [key, child] of Object.entries(value)) {
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (isPlainObject(child)) {
+      entries.push(...flattenConfigEntries(child, path));
+      continue;
+    }
+    entries.push([path, child]);
+  }
+  return entries;
 }

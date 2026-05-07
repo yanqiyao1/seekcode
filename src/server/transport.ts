@@ -132,7 +132,8 @@ export class SSETransport {
   }
 
   async connect(): Promise<void> {
-    if (this.state === "connecting" || this.state === "connected") return;
+    if (this.state === "connected") return;
+    if (this.state === "connecting" && (this.abortController || this.reconnectTimer)) return;
 
     this.transition("connecting");
     this.connectionStart = Date.now();
@@ -186,6 +187,15 @@ export class SSETransport {
           }
         }
       }
+
+      this.clearLivenessTimer();
+      this.abortController = null;
+      if (this.state === "closed") return;
+      if (this.autoReconnect) {
+        this.scheduleReconnect();
+      } else {
+        this.transition("disconnected");
+      }
     } catch (error: any) {
       if (error.name === "AbortError") {
         this.transition("disconnected");
@@ -203,12 +213,13 @@ export class SSETransport {
   }
 
   private resetLiveness(): void {
-    if (this.livenessTimer) clearTimeout(this.livenessTimer);
+    this.clearLivenessTimer();
     this.livenessTimer = setTimeout(() => {
       // No data received within liveness window — reconnect
       this.events.onError?.(new Error("SSE liveness timeout"));
-      this.disconnect();
-      if (this.autoReconnect) {
+      const shouldReconnect = this.autoReconnect;
+      this.dropConnection();
+      if (shouldReconnect) {
         this.scheduleReconnect();
       }
     }, LIVENESS_TIMEOUT_MS);
@@ -225,25 +236,34 @@ export class SSETransport {
     const delay = this.getReconnectDelay(this.reconnectAttempt++);
     this.transition("connecting");
     this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
       this.connect().catch(() => {});
     }, delay);
   }
 
-  disconnect(): void {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
+  private clearLivenessTimer(): void {
     if (this.livenessTimer) {
       clearTimeout(this.livenessTimer);
       this.livenessTimer = null;
     }
+  }
+
+  private dropConnection(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.clearLivenessTimer();
     if (this.abortController) {
       this.abortController.abort();
       this.abortController = null;
     }
-    this.autoReconnect = false;
     this.transition("disconnected");
+  }
+
+  disconnect(): void {
+    this.dropConnection();
+    this.autoReconnect = false;
   }
 
   close(): void {

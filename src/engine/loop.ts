@@ -6,7 +6,7 @@ import type { StreamEvent, ContentDelta, ThinkingDelta, ToolCallBegin, StreamDon
 import type { BaseMode, UICallbacks } from "../modes/base.js";
 import type { ConversationHistory } from "../session/history.js";
 import type { Message, Session, ToolCall, ToolResult } from "../session/types.js";
-import { validateToolInput, type ApprovalContext } from "../tools/base.js";
+import { validateToolInput, type ApprovalContext, type ToolDef } from "../tools/base.js";
 import { ToolRegistry } from "../tools/registry.js";
 import { CapacityController } from "./capacity.js";
 import { LayeredContextManager } from "./context-manager.js";
@@ -236,7 +236,7 @@ export class Engine {
                 await pushToolError(err);
                 return null;
               }
-              return withWorkspaceDefaults(tc.name, validation.args ?? nextArgs, this.session.workspace_path);
+              return withWorkspaceDefaults(toolDef, validation.args ?? nextArgs, this.session.workspace_path);
             };
             const authorizeArgs = async (nextArgs: Record<string, unknown>): Promise<boolean> => {
               const nextCtx: ApprovalContext = {
@@ -275,7 +275,7 @@ export class Engine {
               }
               return true;
             };
-            let args = withWorkspaceDefaults(tc.name, tc.arguments as Record<string, unknown>, this.session.workspace_path);
+            let args = withWorkspaceDefaults(toolDef, tc.arguments as Record<string, unknown>, this.session.workspace_path);
             const normalizedArgs = await normalizeArgs(args);
             if (!normalizedArgs) continue;
             args = normalizedArgs;
@@ -298,7 +298,7 @@ export class Engine {
               continue;
             }
             if (preHook.modified_input) {
-              args = withWorkspaceDefaults(tc.name, { ...args, ...preHook.modified_input }, this.session.workspace_path);
+              args = withWorkspaceDefaults(toolDef, { ...args, ...preHook.modified_input }, this.session.workspace_path);
               const revalidatedArgs = await normalizeArgs(args);
               if (!revalidatedArgs) continue;
               args = revalidatedArgs;
@@ -543,15 +543,35 @@ function isAbortLikeError(error: unknown): boolean {
   return error.name === "AbortError" || /aborted|abort/i.test(error.message);
 }
 
-function withWorkspaceDefaults(toolName: string, args: Record<string, unknown>, workspacePath: string): Record<string, unknown> {
-  if (!["read", "write", "edit", "ls", "search", "glob", "apply_patch"].includes(toolName)) return args;
+function withWorkspaceDefaults(toolDef: ToolDef, args: Record<string, unknown>, workspacePath: string): Record<string, unknown> {
   const next = { ...args };
-  if (toolName === "apply_patch") {
-    if (typeof next.workdir !== "string" || !next.workdir.trim()) next.workdir = workspacePath;
+  if (toolDef.name === "apply_patch") {
+    const hasPatchRootAlias = [next.workdir, next.cwd, next.root].some(value => typeof value === "string" && value.trim());
+    if (!hasPatchRootAlias) next.workdir = workspacePath;
     return next;
   }
-  if (typeof next.root !== "string" || !next.root.trim()) next.root = workspacePath;
+  const properties = toolSchemaProperties(toolDef);
+  if ("root" in properties) {
+    const hasFileRootAlias = [next.root, next.workspace, next.cwd].some(value => typeof value === "string" && value.trim());
+    if (!hasFileRootAlias) next.root = workspacePath;
+    return next;
+  }
+  if ("workdir" in properties) {
+    if ((typeof next.workdir !== "string" || !next.workdir.trim()) && typeof next.cwd === "string" && next.cwd.trim()) {
+      next.workdir = next.cwd;
+    }
+    if (typeof next.workdir !== "string" || !next.workdir.trim()) {
+      next.workdir = workspacePath;
+    }
+  }
   return next;
+}
+
+function toolSchemaProperties(toolDef: ToolDef): Record<string, unknown> {
+  const properties = toolDef.parameters?.properties;
+  return properties && typeof properties === "object" && !Array.isArray(properties)
+    ? properties as Record<string, unknown>
+    : {};
 }
 
 function collectArtifactIds(value: unknown, ids: Set<string>): void {

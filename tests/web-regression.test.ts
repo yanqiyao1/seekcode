@@ -149,6 +149,27 @@ describe("web tools", () => {
     expect(result).toContain("Semantic Scholar abstract");
   });
 
+  it("skips malformed Semantic Scholar years instead of stringifying objects", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
+      data: [
+        {
+          title: "Semantic Scholar Paper",
+          url: "https://www.semanticscholar.org/paper/abc",
+          abstract: "Semantic Scholar abstract",
+          year: { value: 2026 },
+          venue: "ICML",
+        },
+      ],
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "semantic query", engine: "semantic_scholar" });
+
+    expect(result).toContain("Source: Semantic Scholar");
+    expect(result).toContain("Semantic Scholar Paper");
+    expect(result).toContain("ICML - Semantic Scholar abstract");
+    expect(result).not.toContain("[object Object]");
+  });
+
   it("uses PubMed E-utilities search results", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = String(input);
@@ -178,6 +199,36 @@ describe("web tools", () => {
     expect(result).toContain("PubMed Result One");
     expect(result).toContain("https://pubmed.ncbi.nlm.nih.gov/123");
     expect(result).toContain("Nature 2026 Jan");
+  });
+
+  it("skips malformed PubMed ids instead of building fake URLs", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("esearch.fcgi")) {
+        return new Response(JSON.stringify({ esearchresult: { idlist: ["123", { bad: true }] } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.includes("esummary.fcgi")) {
+        expect(url).toContain("id=123");
+        expect(url).not.toContain("%5Bobject+Object%5D");
+        return new Response(JSON.stringify({
+          result: {
+            uids: ["123"],
+            "123": { title: "PubMed Result One", source: "Nature", pubdate: "2026 Jan" },
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "pubmed query", engine: "pubmed", max_results: 2 });
+
+    expect(result).toContain("Source: PubMed");
+    expect(result).toContain("https://pubmed.ncbi.nlm.nih.gov/123");
+    expect(result).not.toContain("[object Object]");
+    expect(result).not.toContain("https://pubmed.ncbi.nlm.nih.gov/[object Object]/");
   });
 
   it("uses Baidu HTML search results when explicitly selected", async () => {
@@ -718,6 +769,50 @@ describe("web tools", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("rejects malformed requested search domains before building a bogus site filter", async () => {
+    getRegistry().clear();
+    registerWebTools();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("", { status: 200 }));
+    const tool = getRegistry().lookup("web_search")!;
+
+    expect(await tool.validateInput?.(
+      { query: "domain filter", domains: [{ nested: true }] as any },
+      { tool_name: "web_search", workspace_path: "/tmp/workspace", tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("domains must be an array of strings"),
+    });
+
+    const result = await tool.execute({
+      query: "domain filter",
+      domains: [{ nested: true }] as any,
+    });
+
+    expect(result).toContain("domains must be an array of strings");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed optional web_search inputs before executing a fallback search", async () => {
+    getRegistry().clear();
+    registerWebTools();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("", { status: 200 }));
+    const tool = getRegistry().lookup("web_search")!;
+
+    expect(await tool.execute({
+      query: "domain filter",
+      max_results: { nested: true } as any,
+    })).toContain("max_results must be a number");
+    expect(await tool.execute({
+      query: "domain filter",
+      json: { nested: true } as any,
+    })).toContain("json must be a boolean");
+    expect(await tool.execute({
+      search_query: [{ q: "domain filter", max_results: { nested: true } as any }],
+    })).toContain("search_query max_results must be a number");
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("blocks direct fetches to blocked domains", async () => {
     getRegistry().clear();
     registerWebTools({ blocked_domains: ["blocked.example"] });
@@ -726,6 +821,39 @@ describe("web tools", () => {
     const result = await getRegistry().lookup("web_fetch")!.execute({ url: "https://blocked.example/page" });
 
     expect(result).toContain("blocked by web.blocked_domains");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed optional web_fetch inputs before issuing a fetch", async () => {
+    getRegistry().clear();
+    registerWebTools();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok", { status: 200 }));
+    const tool = getRegistry().lookup("web_fetch")!;
+
+    expect(await tool.execute({
+      url: "https://example.com/page",
+      max_bytes: { nested: true } as any,
+    })).toContain("max_bytes must be a number");
+    expect(await tool.execute({
+      url: "https://example.com/page",
+      json: { nested: true } as any,
+    })).toContain("json must be a boolean");
+    expect(await tool.execute({
+      url: "https://example.com/page",
+      format: { nested: true } as any,
+    })).toContain("format must be a string");
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("reports unknown ref_id fetches explicitly instead of degrading them to missing-url errors", async () => {
+    getRegistry().clear();
+    registerWebTools();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok", { status: 200 }));
+
+    const result = await getRegistry().lookup("web_fetch")!.execute({ ref_id: "web_missing" });
+
+    expect(result).toContain("unknown ref_id 'web_missing'");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

@@ -1,20 +1,35 @@
 /** Shell execution tool with exec policy integration. */
 
 import { spawn } from "node:child_process";
-import { PermissionLevel } from "./base.js";
+import { PermissionLevel, type ToolExecutionContext } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { checkCommand, isCommandReadOnly } from "./exec-policy.js";
 import { formatJob, getJobManager } from "./jobs.js";
 
-async function bash(args: Record<string, unknown>): Promise<string> {
-  const command = args.command as string;
-  const timeout = (args.timeout as number) || 120000;
-  const workdir = (args.workdir as string) || ".";
-  if (args.background === true) {
+function normalizeShellArgAliases(args: Record<string, unknown>): Record<string, unknown> {
+  if (args.workdir !== undefined || args.cwd === undefined) return args;
+  return { ...args, workdir: args.cwd };
+}
+
+function resolveWorkdir(args: Record<string, unknown>, context?: ToolExecutionContext): string {
+  if (typeof args.workdir === "string" && args.workdir.trim()) return args.workdir.trim();
+  if (typeof args.cwd === "string" && args.cwd.trim()) return args.cwd.trim();
+  return context?.workspacePath || ".";
+}
+
+async function bash(args: Record<string, unknown>, context?: ToolExecutionContext): Promise<string> {
+  const normalized = normalizeShellArgAliases(args);
+  const optionError = validateShellStartOptions(normalized);
+  if (optionError) return `Error: ${optionError}`;
+  const command = commandArg(normalized);
+  if (!command) return "Error: command must be a non-empty string";
+  const timeout = normalizeForegroundTimeout(normalized.timeout);
+  const workdir = resolveWorkdir(normalized, context);
+  if (normalized.background === true) {
     try {
       const job = getJobManager().start(command, workdir, {
-        pty: args.pty !== false,
-        timeoutMs: normalizeTimeout(args.timeout),
+        pty: normalized.pty !== false,
+        timeoutMs: normalizeTimeout(normalized.timeout),
       });
       return `Started background job ${job.id} (pid ${job.pid ?? "unknown"}). Poll with exec_shell_wait or task_shell_wait.`;
     } catch (e: any) {
@@ -63,34 +78,58 @@ async function bash(args: Record<string, unknown>): Promise<string> {
 }
 
 async function execShellWait(args: Record<string, unknown>): Promise<string> {
-  const id = String(args.id || args.job_id || "");
+  const optionError = validateTailChars(args.tail_chars);
+  if (optionError) return `Error: ${optionError}`;
+  const id = typeof args.id === "string"
+    ? args.id.trim()
+    : typeof args.job_id === "string"
+      ? args.job_id.trim()
+      : "";
   if (!id) return "Error: id is required.";
   const job = getJobManager().get(id);
   if (!job) return `Error: job not found: ${id}`;
-  return formatJob(job, (args.tail_chars as number) || 4000);
+  return formatJob(job, normalizeTailChars(args.tail_chars));
 }
 
 async function execShellInteract(args: Record<string, unknown>): Promise<string> {
-  const id = String(args.id || args.job_id || "");
-  const input = String(args.input ?? "");
+  const id = typeof args.id === "string"
+    ? args.id.trim()
+    : typeof args.job_id === "string"
+      ? args.job_id.trim()
+      : "";
   if (!id) return "Error: id is required.";
+  if (typeof args.input !== "string") return "Error: input must be a string";
+  const input = args.input;
   const ok = getJobManager().write(id, input);
   return ok ? `Sent ${input.length} byte(s) to ${id}.` : `Error: job is not running or not found: ${id}`;
 }
 
 async function execShellCancel(args: Record<string, unknown>): Promise<string> {
-  const id = String(args.id || args.job_id || "");
+  const id = typeof args.id === "string"
+    ? args.id.trim()
+    : typeof args.job_id === "string"
+      ? args.job_id.trim()
+      : "";
   if (!id) return "Error: id is required.";
   return getJobManager().cancel(id) ? `Cancelled job ${id}.` : `Error: job is not running or not found: ${id}`;
 }
 
-async function taskShellStart(args: Record<string, unknown>): Promise<string> {
-  return bash({ ...args, background: true });
+async function taskShellStart(args: Record<string, unknown>, context?: ToolExecutionContext): Promise<string> {
+  return bash({ ...args, background: true }, context);
 }
 
 function normalizeTimeout(value: unknown): number | undefined {
   const timeout = Number(value);
   return Number.isFinite(timeout) && timeout > 0 ? timeout : undefined;
+}
+
+function normalizeForegroundTimeout(value: unknown): number {
+  return normalizeTimeout(value) ?? 120_000;
+}
+
+function normalizeTailChars(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 4000;
 }
 
 function killProcessGroup(pid?: number): void {
@@ -113,8 +152,62 @@ function commandArg(args: Record<string, unknown>): string {
   return typeof args.command === "string" ? args.command.trim() : "";
 }
 
+function validateOptionalFiniteNumber(value: unknown, key: "timeout" | "tail_chars"): string | null {
+  if (value === undefined) return null;
+  if (typeof value !== "number" && typeof value !== "string") return `${key} must be a number`;
+  return Number.isFinite(Number(value)) ? null : `${key} must be a number`;
+}
+
+function validateOptionalBoolean(value: unknown, key: "background" | "pty"): string | null {
+  if (value === undefined) return null;
+  return typeof value === "boolean" ? null : `${key} must be a boolean`;
+}
+
+function validateShellStartOptions(args: Record<string, unknown>): string | null {
+  for (const key of ["workdir", "cwd"] as const) {
+    const value = args[key];
+    if (value !== undefined && typeof value !== "string") return `${key} must be a string`;
+  }
+  return validateOptionalFiniteNumber(args.timeout, "timeout")
+    || validateOptionalBoolean(args.background, "background")
+    || validateOptionalBoolean(args.pty, "pty");
+}
+
+function validateTailChars(value: unknown): string | null {
+  return validateOptionalFiniteNumber(value, "tail_chars");
+}
+
 function validateCommand(args: Record<string, unknown>) {
-  return commandArg(args) ? { ok: true } : { ok: false, message: "command must be a non-empty string" };
+  const normalized = normalizeShellArgAliases(args);
+  if (!commandArg(normalized)) return { ok: false as const, message: "command must be a non-empty string" };
+  const optionError = validateShellStartOptions(normalized);
+  return optionError
+    ? { ok: false as const, message: optionError }
+    : {
+        ok: true as const,
+        args: {
+          ...normalized,
+          ...(typeof normalized.workdir === "string" && normalized.workdir.trim()
+            ? { workdir: normalized.workdir.trim() }
+            : {}),
+          ...(normalized.workdir === undefined && typeof normalized.cwd === "string" && normalized.cwd.trim()
+            ? { workdir: normalized.cwd.trim() }
+            : {}),
+        },
+      };
+}
+
+function normalizeJobIdArgs(args: Record<string, unknown>): Record<string, unknown> {
+  if (args.id !== undefined || args.job_id === undefined) return args;
+  return { ...args, id: args.job_id };
+}
+
+function validateJobIdArgs(args: Record<string, unknown>) {
+  const normalized = normalizeJobIdArgs(args);
+  const id = typeof normalized.id === "string" ? normalized.id.trim() : "";
+  return id
+    ? { ok: true as const, args: { ...normalized, id } }
+    : { ok: false as const, message: "id is required." };
 }
 
 function shellPermissions(args: Record<string, unknown>) {
@@ -170,10 +263,16 @@ export function registerShellTool(): void {
   r.register({
     name: "exec_shell_wait",
     description: "Poll a background shell job by id and return status plus output tail.",
-    parameters: { type: "object", properties: { id: { type: "string" }, tail_chars: { type: "integer", default: 4000 } }, required: ["id"] },
+    parameters: { type: "object", properties: { id: { type: "string" }, job_id: { type: "string", description: "Alias for id." }, tail_chars: { type: "integer", default: 4000 } } },
     execute: execShellWait,
     permission: PermissionLevel.ALWAYS_ALLOW,
     readOnly: true,
+    validateInput: (args) => {
+      const validated = validateJobIdArgs(args);
+      if (!validated.ok) return validated;
+      const optionError = validateTailChars(validated.args?.tail_chars);
+      return optionError ? { ok: false as const, message: optionError } : validated;
+    },
     searchHint: "poll background shell output",
     resultKind: "task",
     category: "shell",
@@ -182,9 +281,16 @@ export function registerShellTool(): void {
   r.register({
     name: "exec_shell_interact",
     description: "Send stdin to a running background shell job.",
-    parameters: { type: "object", properties: { id: { type: "string" }, input: { type: "string" } }, required: ["id", "input"] },
+    parameters: { type: "object", properties: { id: { type: "string" }, job_id: { type: "string", description: "Alias for id." }, input: { type: "string" } }, required: ["input"] },
     execute: execShellInteract,
     permission: PermissionLevel.ASK,
+    validateInput: (args) => {
+      const validated = validateJobIdArgs(args);
+      if (!validated.ok) return validated;
+      return typeof validated.args?.input === "string"
+        ? validated
+        : { ok: false, message: "input must be a string" };
+    },
     searchHint: "send stdin to job",
     resultKind: "task",
     category: "shell",
@@ -194,10 +300,11 @@ export function registerShellTool(): void {
   r.register({
     name: "exec_shell_cancel",
     description: "Cancel a running background shell job by id.",
-    parameters: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
+    parameters: { type: "object", properties: { id: { type: "string" }, job_id: { type: "string", description: "Alias for id." } } },
     execute: execShellCancel,
     permission: PermissionLevel.ASK,
     destructive: true,
+    validateInput: validateJobIdArgs,
     searchHint: "cancel shell job",
     resultKind: "task",
     category: "shell",
@@ -221,10 +328,16 @@ export function registerShellTool(): void {
   r.register({
     name: "task_shell_wait",
     description: "Poll a long-running task shell job by id.",
-    parameters: { type: "object", properties: { id: { type: "string" }, tail_chars: { type: "integer", default: 4000 } }, required: ["id"] },
+    parameters: { type: "object", properties: { id: { type: "string" }, job_id: { type: "string", description: "Alias for id." }, tail_chars: { type: "integer", default: 4000 } } },
     execute: execShellWait,
     permission: PermissionLevel.ALWAYS_ALLOW,
     readOnly: true,
+    validateInput: (args) => {
+      const validated = validateJobIdArgs(args);
+      if (!validated.ok) return validated;
+      const optionError = validateTailChars(validated.args?.tail_chars);
+      return optionError ? { ok: false as const, message: optionError } : validated;
+    },
     searchHint: "poll task shell output",
     resultKind: "task",
     category: "shell",

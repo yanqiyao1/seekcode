@@ -134,6 +134,28 @@ describe("DeepSeekClient", () => {
 
     expect(createMock).toHaveBeenLastCalledWith(expect.objectContaining({ max_tokens: 4096 }));
   });
+
+  it("falls back to the default max token budget when max_tokens is invalid", async () => {
+    createMock.mockResolvedValueOnce(streamFrom([{ choices: [], usage: { total_tokens: 0 } }]));
+    const client = new DeepSeekClient({ apiKey: "key", baseUrl: "http://localhost", model: "deepseek-v4-pro" });
+
+    await collect(client.send([{ role: "user", content: "hello" }] as any, null, { max_tokens: Number.NaN }));
+
+    expect(createMock).toHaveBeenLastCalledWith(expect.objectContaining({ max_tokens: 8192 }));
+  });
+
+  it("treats an explicit empty reasoning_effort as default thinking-on behavior", async () => {
+    createMock.mockResolvedValueOnce(streamFrom([{ choices: [], usage: { total_tokens: 0 } }]));
+    const client = new DeepSeekClient({ apiKey: "key", baseUrl: "http://localhost", model: "deepseek-v4-pro" });
+
+    await collect(client.send([{ role: "user", content: "hello" }] as any, null, { reasoning_effort: "", max_tokens: 7 }));
+
+    expect(createMock).toHaveBeenLastCalledWith(expect.objectContaining({
+      reasoning_effort: "high",
+      thinking: { type: "enabled" },
+      max_tokens: 7,
+    }));
+  });
 });
 
 describe("DeepSeek capabilities", () => {

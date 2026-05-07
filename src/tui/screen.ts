@@ -51,8 +51,14 @@ export function termSize(): { rows: number; cols: number } {
 }
 
 export function setup(options: { alternateScreen?: boolean } = {}) {
-  activeAlternateScreen = options.alternateScreen !== false;
-  if (activeAlternateScreen) enterAltScreen();
+  const useAlternateScreen = options.alternateScreen !== false;
+  if (useAlternateScreen && !activeAlternateScreen) {
+    enterAltScreen();
+  }
+  if (!useAlternateScreen && activeAlternateScreen) {
+    // Preserve the active alternate-screen state until teardown restores it.
+  }
+  activeAlternateScreen = activeAlternateScreen || useAlternateScreen;
   hideCursor();
 }
 
@@ -60,7 +66,6 @@ export function teardown(options: { finalNewline?: boolean } = {}) {
   showCursor();
   if (activeAlternateScreen) {
     leaveAltScreen();
-    process.stdout.write(`${CSI}H${CSI}J`);
   } else {
     process.stdout.write(`${CSI}0m${options.finalNewline === false ? "" : "\r\n"}`);
   }

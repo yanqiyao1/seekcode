@@ -71,8 +71,13 @@ async function getGoal(): Promise<string> {
 // ── create_goal ──────────────────────────────────────────────
 
 async function createGoal(args: Record<string, unknown>): Promise<string> {
-  const objective = args.objective as string;
-  const tokenBudget = (args.token_budget as number) || null;
+  const objective = typeof args.objective === "string" ? args.objective : "";
+  const rawTokenBudget = args.token_budget;
+  const tokenBudget = rawTokenBudget === undefined || rawTokenBudget === null
+    ? null
+    : typeof rawTokenBudget === "number"
+      ? rawTokenBudget
+      : Number.NaN;
 
   if (activeGoal) {
     return `Error: A goal is already active: "${activeGoal.objective}". Use update_goal to change status, or complete/abandon the current goal first.`;
@@ -82,14 +87,14 @@ async function createGoal(args: Record<string, unknown>): Promise<string> {
     return "Error: objective is required. Provide a concrete, verifiable goal description.";
   }
 
-  if (tokenBudget && tokenBudget <= 0) {
+  if (tokenBudget !== null && (!Number.isFinite(tokenBudget) || tokenBudget <= 0 || !Number.isInteger(tokenBudget))) {
     return "Error: token_budget must be a positive integer or omitted for unlimited.";
   }
 
   const now = Date.now();
   activeGoal = {
     objective: objective.trim(),
-    token_budget: tokenBudget,
+    token_budget: tokenBudget === null ? null : Math.floor(tokenBudget),
     created_at: now,
     started_at: now,
     tokens_used: 0,
@@ -115,13 +120,17 @@ async function updateGoal(args: Record<string, unknown>): Promise<string> {
     return "No active goal. Use create_goal to set an objective first.";
   }
 
-  const status = args.status as string | undefined;
+  const status = typeof args.status === "string" ? args.status.trim() : undefined;
   if (!status) {
     return "Error: status is required. Use 'complete' to mark the goal achieved.";
   }
 
+  if (args.result !== undefined && typeof args.result !== "string") {
+    return "Error: result must be a string.";
+  }
+
   if (status === "complete") {
-    const result = (args.result as string) || "";
+    const result = typeof args.result === "string" ? args.result : "";
     activeGoal.status = "complete";
     activeGoal.result = result;
     activeGoal.elapsed_ms = Date.now() - goalStartTime;
@@ -187,6 +196,16 @@ export function registerGoalTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: false,
+    validateInput: (args) => {
+      const objective = typeof args.objective === "string" ? args.objective.trim() : "";
+      if (!objective) return { ok: false as const, message: "objective is required. Provide a concrete, verifiable goal description." };
+      if (args.token_budget !== undefined && args.token_budget !== null) {
+        if (typeof args.token_budget !== "number" || !Number.isFinite(args.token_budget) || args.token_budget <= 0 || !Number.isInteger(args.token_budget)) {
+          return { ok: false as const, message: "token_budget must be a positive integer or omitted for unlimited." };
+        }
+      }
+      return { ok: true as const, args: { ...args, objective } };
+    },
     searchHint: "create session goal",
     resultKind: "text",
   });
@@ -206,6 +225,19 @@ export function registerGoalTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: false,
+    validateInput: (args) => {
+      if (typeof args.status !== "string" || !args.status.trim()) {
+        return { ok: false as const, message: "status is required. Use 'complete' to mark the goal achieved." };
+      }
+      const status = args.status.trim();
+      if (!["complete", "abandon"].includes(status)) {
+        return { ok: false as const, message: "status must be 'complete' or 'abandon'." };
+      }
+      if (args.result !== undefined && typeof args.result !== "string") {
+        return { ok: false as const, message: "result must be a string." };
+      }
+      return { ok: true as const, args: { ...args, status } };
+    },
     searchHint: "complete session goal",
     resultKind: "text",
   });

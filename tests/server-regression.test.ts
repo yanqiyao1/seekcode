@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -95,6 +95,52 @@ describe("HTTP/SSE server", () => {
     expect(items.items.find(item => item.type === "tool_result")?.data).toMatchObject({ name: "read", is_error: false });
   });
 
+  it("rejects malformed chat request bodies before creating turns or entering the engine path", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { session_id: string; thread_id: string };
+
+    const invalidJson = await app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{",
+    });
+    const nonString = await app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: { nested: true } }),
+    });
+    const blank = await app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "   " }),
+    });
+
+    expect(invalidJson.status).toBe(400);
+    expect(await invalidJson.json()).toMatchObject({ error: "invalid JSON body" });
+    expect(nonString.status).toBe(400);
+    expect(await nonString.json()).toMatchObject({ error: "message must be a string" });
+    expect(blank.status).toBe(400);
+    expect(await blank.json()).toMatchObject({ error: "message required" });
+    expect(getRuntimeRecord(created.thread_id)!.turns).toHaveLength(0);
+  });
+
+  it("rejects array chat bodies instead of treating them like object payloads with a missing message field", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { session_id: string; thread_id: string };
+
+    const arrayBody = await app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(["bad"]),
+    });
+
+    expect(arrayBody.status).toBe(400);
+    expect(await arrayBody.json()).toMatchObject({ error: "invalid JSON body" });
+    expect(getRuntimeRecord(created.thread_id)!.turns).toHaveLength(0);
+  });
+
   it("exposes session/thread runtime APIs including replay, fork, resume, and delete", async () => {
     process.env.DEEPSEEK_API_KEY = "test";
     const app = createApp();
@@ -147,6 +193,200 @@ describe("HTTP/SSE server", () => {
     expect(record.config.model).toBe("deepseek-v4-flash");
     expect(record.prefix?.hash).toBe(created.prefix_hash);
     expect(record.prefix?.systemPrompt).toContain("## YOLO Mode");
+  });
+
+  it("rejects malformed create-thread overrides instead of persisting non-string runtime config state", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+
+    const badModel = await app.request("/v1/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: { nested: true } }),
+    });
+    const badMode = await app.request("/v1/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: 7 }),
+    });
+    const badWorkspace = await app.request("/v1/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace: { nested: true } }),
+    });
+    const blankModel = await app.request("/v1/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "   " }),
+    });
+    const badModeName = await app.request("/v1/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "debug" }),
+    });
+    const blankWorkspace = await app.request("/v1/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace: "   " }),
+    });
+
+    expect(badModel.status).toBe(400);
+    expect(await badModel.json()).toMatchObject({ error: "model must be a string" });
+    expect(badMode.status).toBe(400);
+    expect(await badMode.json()).toMatchObject({ error: "mode must be a string" });
+    expect(badWorkspace.status).toBe(400);
+    expect(await badWorkspace.json()).toMatchObject({ error: "workspace must be a string" });
+    expect(blankModel.status).toBe(400);
+    expect(await blankModel.json()).toMatchObject({ error: "model must be a non-empty string" });
+    expect(badModeName.status).toBe(400);
+    expect(await badModeName.json()).toMatchObject({ error: "mode must be one of plan, agent, or yolo" });
+    expect(blankWorkspace.status).toBe(400);
+    expect(await blankWorkspace.json()).toMatchObject({ error: "workspace must be a non-empty string" });
+  });
+
+  it("rejects invalid JSON for thread creation instead of silently creating a default thread", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+
+    const invalidJson = await app.request("/v1/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{",
+    });
+    const threads = await (await app.request("/v1/threads")).json() as { threads: Array<{ id: string }> };
+
+    expect(invalidJson.status).toBe(400);
+    expect(await invalidJson.json()).toMatchObject({ error: "invalid JSON body" });
+    expect(threads.threads).toEqual([]);
+  });
+
+  it("rejects array bodies for thread creation instead of treating them like empty object payloads", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+
+    const arrayBody = await app.request("/v1/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(["bad"]),
+    });
+    const threads = await (await app.request("/v1/threads")).json() as { threads: Array<{ id: string }> };
+
+    expect(arrayBody.status).toBe(400);
+    expect(await arrayBody.json()).toMatchObject({ error: "invalid JSON body" });
+    expect(threads.threads).toEqual([]);
+  });
+
+  it("rejects malformed thread patch fields instead of returning a misleading successful update", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+
+    const badArchived = await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ archived: "yes" }),
+    });
+    const badMode = await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: 7 }),
+    });
+    const badModel = await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: { nested: true } }),
+    });
+    const badWorkspace = await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace: { nested: true } }),
+    });
+    const blankModel = await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "   " }),
+    });
+    const badModeName = await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "debug" }),
+    });
+    const blankWorkspace = await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace: "   " }),
+    });
+
+    expect(badArchived.status).toBe(400);
+    expect(await badArchived.json()).toMatchObject({ error: "archived must be a boolean" });
+    expect(badMode.status).toBe(400);
+    expect(await badMode.json()).toMatchObject({ error: "mode must be a string" });
+    expect(badModel.status).toBe(400);
+    expect(await badModel.json()).toMatchObject({ error: "model must be a string" });
+    expect(badWorkspace.status).toBe(400);
+    expect(await badWorkspace.json()).toMatchObject({ error: "workspace must be a string" });
+    expect(blankModel.status).toBe(400);
+    expect(await blankModel.json()).toMatchObject({ error: "model must be a non-empty string" });
+    expect(badModeName.status).toBe(400);
+    expect(await badModeName.json()).toMatchObject({ error: "mode must be one of plan, agent, or yolo" });
+    expect(blankWorkspace.status).toBe(400);
+    expect(await blankWorkspace.json()).toMatchObject({ error: "workspace must be a non-empty string" });
+  });
+
+  it("rejects invalid JSON for thread patches instead of treating it like an empty successful update", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const before = getRuntimeRecord(created.thread_id)!.thread.updated_at;
+
+    const invalidJson = await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: "{",
+    });
+    const after = getRuntimeRecord(created.thread_id)!.thread.updated_at;
+
+    expect(invalidJson.status).toBe(400);
+    expect(await invalidJson.json()).toMatchObject({ error: "invalid JSON body" });
+    expect(after).toBe(before);
+  });
+
+  it("rejects array bodies for thread patches instead of accepting a no-op update", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const before = getRuntimeRecord(created.thread_id)!.thread.updated_at;
+
+    const arrayBody = await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(["bad"]),
+    });
+    const after = getRuntimeRecord(created.thread_id)!.thread.updated_at;
+
+    expect(arrayBody.status).toBe(400);
+    expect(await arrayBody.json()).toMatchObject({ error: "invalid JSON body" });
+    expect(after).toBe(before);
+  });
+
+  it("falls back to default list and replay bounds when numeric query params are invalid", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+
+    const sessionA = await (await app.request("/v1/session", { method: "POST" })).json() as { session_id: string; thread_id: string };
+    const sessionB = await (await app.request("/v1/session", { method: "POST" })).json() as { session_id: string; thread_id: string };
+    appendEvent(getRuntimeRecord(sessionA.thread_id)!, "custom.one", { ok: 1 });
+    appendRuntimeItem(getRuntimeRecord(sessionA.thread_id)!, "custom_item", { ok: 1 });
+
+    const sessions = await (await app.request("/v1/sessions?limit=bogus")).json() as { sessions: Array<{ id: string }> };
+    const threads = await (await app.request("/v1/threads?limit=bogus")).json() as { threads: Array<{ id: string }> };
+    const events = await (await app.request(`/v1/threads/${sessionA.thread_id}/events?since_seq=bogus`)).json() as { events: Array<{ event: string }> };
+    const items = await (await app.request(`/v1/threads/${sessionA.thread_id}/items?since_seq=bogus`)).json() as { items: Array<{ type: string }> };
+
+    expect(sessions.sessions.map(session => session.id)).toEqual(expect.arrayContaining([sessionA.session_id, sessionB.session_id]));
+    expect(threads.threads.map(thread => thread.id)).toEqual(expect.arrayContaining([sessionA.thread_id, sessionB.thread_id]));
+    expect(events.events.map(event => event.event)).toEqual(expect.arrayContaining(["thread.started", "custom.one", "item.custom_item"]));
+    expect(items.items.map(item => item.type)).toContain("custom_item");
   });
 
   it("rebuilds prefix when thread mode changes so prompt behavior matches runtime mode", async () => {
@@ -214,6 +454,65 @@ describe("HTTP/SSE server", () => {
     expect(events.events.map(event => event.event)).toEqual(expect.arrayContaining(["custom.event", "item.artifact_link", "turn.interrupted"]));
     expect(items.items.some(item => item.type === "artifact_link" && item.artifact_ids.includes("log_m123456_deadbeef00"))).toBe(true);
     expect(resumed.thread_id).toBe(created.thread_id);
+  });
+
+  it("skips malformed persisted event and item lines instead of dropping the whole replay stream", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const created = await createResp.json() as { session_id: string; thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+
+    appendEvent(record, "custom.keep", { ok: true });
+    appendRuntimeItem(record, "keep_item", { ok: true });
+
+    const eventsFile = join(tmp, "events", `${created.thread_id}.jsonl`);
+    const itemsFile = join(tmp, "items", `${created.thread_id}.jsonl`);
+    writeFileSync(eventsFile, `${readFileSync(eventsFile, "utf-8")}not json\n`, "utf-8");
+    writeFileSync(itemsFile, `${readFileSync(itemsFile, "utf-8")}{"broken":\n`, "utf-8");
+
+    reloadRuntimeStoreForTests();
+
+    const events = await (await app.request(`/v1/threads/${created.thread_id}/events?since_seq=0`)).json() as {
+      events: Array<{ event: string }>;
+    };
+    const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as {
+      items: Array<{ type: string }>;
+    };
+
+    expect(events.events.map(event => event.event)).toEqual(expect.arrayContaining(["thread.started", "custom.keep", "item.keep_item"]));
+    expect(items.items.map(item => item.type)).toContain("keep_item");
+  });
+
+  it("skips malformed persisted runtime thread records instead of reloading fake thread metadata", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const validThread = getRuntimeRecord(created.thread_id)!.thread;
+
+    writeFileSync(join(tmp, "threads", "broken.json"), JSON.stringify({
+      config: { model: "deepseek-v4-pro" },
+      session: { id: "broken-session" },
+      thread: {
+        id: { nested: true },
+        session_id: "broken-session",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        model: "deepseek-v4-pro",
+        mode: "agent",
+        workspace: tmp,
+        archived: false,
+      },
+      turns: [],
+    }, null, 2), "utf-8");
+
+    reloadRuntimeStoreForTests();
+
+    const threads = await (await app.request("/v1/threads")).json() as { threads: Array<{ id: string }> };
+
+    expect(threads.threads.map(thread => thread.id)).toContain(validThread.id);
+    expect(threads.threads.map(thread => thread.id)).not.toContain("broken");
+    expect(getRuntimeRecord("broken")).toBeUndefined();
   });
 
   it("forks sessions with independent thinking, turn, and artifact state", async () => {

@@ -63,6 +63,7 @@ const DEFAULT_RULES: Rule[] = [
   { type: "regex", pattern: ">\\s*/dev/sd[a-z]", decision: "deny", justification: "write to raw block device" },
   { type: "regex", pattern: "\\bmkfs(?:\\.|\\s)", decision: "deny", justification: "filesystem format" },
   { type: "regex", pattern: "\\bdd\\s+if=", decision: "deny", justification: "raw device copy" },
+  { type: "regex", pattern: ":\\(\\)\\s*\\{\\s*:\\|:&\\s*\\};:", decision: "deny", justification: "fork bomb" },
   { type: "regex", pattern: ":\\{\\s*:\\|:&\\s*\\};:", decision: "deny", justification: "fork bomb" },
   { type: "regex", pattern: "\\bchmod\\s+(-R\\s+)?777\\b", decision: "deny", justification: "world-writable permissions" },
 ];
@@ -114,6 +115,9 @@ export function checkCommand(command: string): PolicyResult {
   if (customAllow) return { decision: "allow", justification: customAllow.justification || "custom allow rule matched" };
 
   if (parsed.error) return { decision: "ask", justification: parsed.error };
+  if (parsed.tokens.length && parsed.tokens[parsed.tokens.length - 1]?.kind !== "word") {
+    return { decision: "ask", justification: "trailing shell operator requires approval" };
+  }
 
   const suspicious = SUSPICIOUS_SHELL_PATTERNS.find(item => item.pattern.test(raw));
   if (suspicious) return { decision: "ask", justification: `${suspicious.reason} requires approval` };
@@ -267,16 +271,30 @@ function checkFind(args: string[]): PolicyResult {
   const executes = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
   const valueFlags = new Set([
     "-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-type", "-maxdepth", "-mindepth",
-    "-size", "-mtime", "-mmin", "-newer", "-user", "-group", "-perm", "-prune", "-printf",
+    "-size", "-mtime", "-mmin", "-newer", "-user", "-group", "-perm", "-printf",
   ]);
+  const noValueFlags = new Set(["-print", "-print0", "-ls", "-empty", "-readable", "-writable", "-executable", "-and", "-or", "-not", "-prune"]);
+  const hyphenValuesAllowed = new Set(["-maxdepth", "-mindepth", "-size", "-mtime", "-mmin", "-perm"]);
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     if (destructive.has(arg)) return { decision: "deny", justification: `find ${arg} mutates files` };
     if (executes.has(arg)) return { decision: "ask", justification: `find ${arg} executes commands` };
-    if (arg.startsWith("-") && !valueFlags.has(arg) && !["-print", "-print0", "-ls", "-empty", "-readable", "-writable", "-executable", "-and", "-or", "-not"].includes(arg)) {
+    if (arg.startsWith("-") && !valueFlags.has(arg) && !noValueFlags.has(arg)) {
       return { decision: "ask", justification: `find flag ${arg} is not allowlisted` };
     }
-    if (valueFlags.has(arg)) i++;
+    if (valueFlags.has(arg)) {
+      const next = args[i + 1];
+      if (next === undefined) return { decision: "ask", justification: `find flag ${arg} expects a value` };
+      if (destructive.has(next)) return { decision: "deny", justification: `find ${next} mutates files` };
+      if (executes.has(next)) return { decision: "ask", justification: `find ${next} executes commands` };
+      if (next === "--" || valueFlags.has(next) || noValueFlags.has(next)) {
+        return { decision: "ask", justification: `find flag ${arg} has ambiguous value ${next}` };
+      }
+      if (next.startsWith("-") && !hyphenValuesAllowed.has(arg)) {
+        return { decision: "ask", justification: `find flag ${arg} has ambiguous value ${next}` };
+      }
+      i++;
+    }
   }
   return { decision: "allow", justification: "find expression is read-only" };
 }
@@ -320,9 +338,32 @@ function checkGitBranch(args: string[]): PolicyResult {
     shortNone: "larvv",
   });
   if (flags.decision !== "allow") return flags;
-  const positionals = args.filter(arg => arg !== "--" && !arg.startsWith("-") && !isValueForPreviousFlag(args, arg));
+  const positionals = gitBranchPositionals(args);
   if (positionals.length && !listMode) return { decision: "ask", justification: "git branch with positional names may create branches" };
   return { decision: "allow", justification: "git branch query is read-only" };
+}
+
+function gitBranchPositionals(args: string[]): string[] {
+  const flagsWithValues = new Set(["--format", "--sort", "--points-at"]);
+  const queryFlagsWithOptionalValues = new Set(["--merged", "--no-merged", "--contains", "--no-contains"]);
+  const positionals: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === "--") continue;
+    if (flagsWithValues.has(arg)) {
+      index++;
+      continue;
+    }
+    if (queryFlagsWithOptionalValues.has(arg)) {
+      const next = args[index + 1];
+      if (next !== undefined && next !== "--" && !next.startsWith("-")) index++;
+      continue;
+    }
+    if (arg.startsWith("--")) continue;
+    if (arg.startsWith("-")) continue;
+    positionals.push(arg);
+  }
+  return positionals;
 }
 
 function gitCommonFlags(extra: FlagSpec): FlagSpec {
@@ -533,11 +574,4 @@ function normalizeCommand(command: string): string {
 
 function isEnvAssignment(value: string): boolean {
   return /^[a-zA-Z_][a-zA-Z0-9_]*=.*/.test(value);
-}
-
-function isValueForPreviousFlag(args: string[], value: string): boolean {
-  const index = args.indexOf(value);
-  if (index <= 0) return false;
-  const previous = args[index - 1]!;
-  return ["--format", "--sort", "--points-at"].includes(previous);
 }

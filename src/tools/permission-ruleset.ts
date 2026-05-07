@@ -63,7 +63,7 @@ const defaultRules: PermissionRule[] = [
 
   // Destructive — always deny
   { permission: "bash", pattern: "rm -rf /*", action: "deny" },
-  { permission: "bash", pattern: "> /dev/sd*", action: "deny" },
+  { permission: "bash", pattern: "*> /dev/sd*", action: "deny" },
   { permission: "bash", pattern: "mkfs.*", action: "deny" },
   { permission: "bash", pattern: "dd if=* of=/dev/*", action: "deny" },
   { permission: "bash", pattern: "chmod 777 *", action: "deny" },

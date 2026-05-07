@@ -38,25 +38,38 @@ export function clearAgentState(): void {
   nextAgentId = 1;
 }
 
+function validateOptionalFiniteNumber(value: unknown, key: "timeout_ms" | "max_turns"): string | null {
+  if (value === undefined) return null;
+  if (typeof value !== "number" || !Number.isFinite(value)) return `${key} must be a number.`;
+  return null;
+}
+
 // ── spawn_agent ──────────────────────────────────────────────
 
 async function spawnAgent(args: Record<string, unknown>): Promise<string> {
-  const task = args.task as string;
-  const taskName = (args.task_name as string) || `agent-${nextAgentId}`;
-  const systemPrompt = (args.system_prompt as string) || "";
-  const maxTurns = (args.max_turns as number) || 15;
-  const timeout = Math.max(
-    10_000,
-    Math.min((args.timeout_ms as number) || 120_000, 600_000),
-  );
+  const task = typeof args.task === "string" ? args.task.trim() : "";
+  const taskName = typeof args.task_name === "string" && args.task_name.trim()
+    ? args.task_name.trim()
+    : `agent-${nextAgentId}`;
+  if (args.system_prompt !== undefined && typeof args.system_prompt !== "string") return "Error: system_prompt must be a string.";
+  const systemPrompt = typeof args.system_prompt === "string" ? args.system_prompt.trim() : "";
+  const maxTurns = normalizeMaxTurns(args.max_turns);
+  const timeout = normalizeTimeoutMs(args.timeout_ms);
 
   if (!task) return "Error: task is required.";
+  if (args.api_key !== undefined && typeof args.api_key !== "string") return "Error: api_key must be a string.";
+  if (args.base_url !== undefined && typeof args.base_url !== "string") return "Error: base_url must be a string.";
+  if (args.model !== undefined && typeof args.model !== "string") return "Error: model must be a string.";
+  const timeoutError = validateOptionalFiniteNumber(args.timeout_ms, "timeout_ms");
+  if (timeoutError) return `Error: ${timeoutError}`;
+  const maxTurnsError = validateOptionalFiniteNumber(args.max_turns, "max_turns");
+  if (maxTurnsError) return `Error: ${maxTurnsError}`;
 
-  const apiKey = (args.api_key as string) ||
+  const apiKey = (typeof args.api_key === "string" ? args.api_key.trim() : "") ||
     process.env.DEEPSEEK_API_KEY || "";
-  const baseUrl = (args.base_url as string) ||
+  const baseUrl = (typeof args.base_url === "string" ? args.base_url.trim() : "") ||
     process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
-  const model = (args.model as string) ||
+  const model = (typeof args.model === "string" && args.model.trim() ? args.model.trim() : "") ||
     process.env.DEEPSEEK_MODEL || "deepseek-chat";
 
   const agentId = `agent_${nextAgentId++}`;
@@ -72,6 +85,12 @@ async function spawnAgent(args: Record<string, unknown>): Promise<string> {
   runningAgents.set(agentId, record);
 
   const client = new OpenAI({ apiKey, baseURL: baseUrl });
+  const abortController = new AbortController();
+  let timedOut = false;
+  const timeoutTimer = setTimeout(() => {
+    timedOut = true;
+    abortController.abort();
+  }, timeout);
 
   const sysPrompt = systemPrompt || (
     "You are a specialized sub-agent. Complete the given task thoroughly and " +
@@ -89,7 +108,7 @@ async function spawnAgent(args: Record<string, unknown>): Promise<string> {
     for (let i = 0; i < maxTurns; i++) {
       const resp = await client.chat.completions.create({
         model, messages, max_tokens: 4096,
-      });
+      }, { signal: abortController.signal } as any);
       content = resp.choices[0]?.message?.content || "";
       const finish = resp.choices[0]?.finish_reason || "";
 
@@ -111,11 +130,27 @@ async function spawnAgent(args: Record<string, unknown>): Promise<string> {
     const dur = ((record.completed_at - record.started_at) / 1000).toFixed(1);
     return formatAgentDone(agentId, nickname, "done", content || "Completed without output.", dur);
   } catch (e: any) {
+    const message = timedOut ? `timed out after ${timeout}ms` : e.message;
     record.status = "error";
-    record.error = e.message;
+    record.error = message;
     record.completed_at = Date.now();
-    return formatAgentDone(agentId, nickname, "error", e.message, "0");
+    const dur = ((record.completed_at - record.started_at) / 1000).toFixed(1);
+    return formatAgentDone(agentId, nickname, "error", message, dur);
+  } finally {
+    clearTimeout(timeoutTimer);
   }
+}
+
+function normalizeTimeoutMs(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 120_000;
+  return Math.max(10_000, Math.min(Math.floor(parsed), 600_000));
+}
+
+function normalizeMaxTurns(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 15;
+  return Math.max(1, Math.floor(parsed));
 }
 
 function formatAgentDone(
@@ -139,11 +174,20 @@ function formatAgentDone(
 // ── agent_status ─────────────────────────────────────────────
 
 async function agentStatus(args: Record<string, unknown>): Promise<string> {
-  const agentId = args.agent_id as string | undefined;
+  if (args.agent_id !== undefined && typeof args.agent_id !== "string") {
+    return "Error: agent_id must be a string.";
+  }
+  if (args.nickname !== undefined && typeof args.nickname !== "string") {
+    return "Error: nickname must be a string.";
+  }
+  const agentId = typeof args.agent_id === "string" ? args.agent_id.trim() : "";
+  const nickname = typeof args.nickname === "string" ? args.nickname.trim() : "";
 
-  if (agentId) {
-    const agent = runningAgents.get(agentId);
-    if (!agent) return `Agent not found: ${agentId}`;
+  if (agentId || nickname) {
+    const agent = agentId
+      ? runningAgents.get(agentId)
+      : [...runningAgents.values()].find(item => item.task_name.replace(/[^a-z0-9_]/gi, "_").slice(0, 40) === nickname);
+    if (!agent) return `Agent not found: ${agentId || nickname}`;
     return formatAgentStatus(agent);
   }
 
@@ -171,6 +215,25 @@ function formatAgentStatus(agent: AgentRecord): string {
     agent.result ? `Result: ${agent.result.slice(0, 500)}` : "",
     agent.error ? `Error: ${agent.error}` : "",
   ].filter(Boolean).join("\n");
+}
+
+function validateAgentStatusArgs(args: Record<string, unknown>) {
+  if (args.agent_id !== undefined && typeof args.agent_id !== "string") {
+    return { ok: false as const, message: "agent_id must be a string." };
+  }
+  if (args.nickname !== undefined && typeof args.nickname !== "string") {
+    return { ok: false as const, message: "nickname must be a string." };
+  }
+  const agentId = typeof args.agent_id === "string" ? args.agent_id.trim() : undefined;
+  const nickname = typeof args.nickname === "string" ? args.nickname.trim() : undefined;
+  return {
+    ok: true as const,
+    args: {
+      ...args,
+      ...(agentId ? { agent_id: agentId } : {}),
+      ...(nickname ? { nickname } : {}),
+    },
+  };
 }
 
 // ── Registration ─────────────────────────────────────────────
@@ -209,6 +272,21 @@ export function registerSubAgentTool(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: true,
+    validateInput: (args) => {
+      const task = typeof args.task === "string" ? args.task.trim() : "";
+      if (!task) return { ok: false as const, message: "task is required." };
+      if (args.system_prompt !== undefined && typeof args.system_prompt !== "string") {
+        return { ok: false as const, message: "system_prompt must be a string." };
+      }
+      if (args.api_key !== undefined && typeof args.api_key !== "string") return { ok: false as const, message: "api_key must be a string." };
+      if (args.base_url !== undefined && typeof args.base_url !== "string") return { ok: false as const, message: "base_url must be a string." };
+      if (args.model !== undefined && typeof args.model !== "string") return { ok: false as const, message: "model must be a string." };
+      const timeoutError = validateOptionalFiniteNumber(args.timeout_ms, "timeout_ms");
+      if (timeoutError) return { ok: false as const, message: timeoutError };
+      const maxTurnsError = validateOptionalFiniteNumber(args.max_turns, "max_turns");
+      if (maxTurnsError) return { ok: false as const, message: maxTurnsError };
+      return { ok: true as const, args: { ...args, task } };
+    },
   });
 
   // Keep old sub_agent for backwards compat (wraps spawn_agent)
@@ -225,9 +303,10 @@ export function registerSubAgentTool(): void {
       required: ["task"],
     },
     execute: async (args: Record<string, unknown>) => {
+      const task = typeof args.task === "string" ? args.task : "";
       return spawnAgent({
-        task: args.task,
-        task_name: (args.task as string).slice(0, 40),
+        task,
+        task_name: task.slice(0, 40),
         system_prompt: args.system_prompt,
         max_turns: args.max_turns,
       });
@@ -235,6 +314,16 @@ export function registerSubAgentTool(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: true,
+    validateInput: (args) => {
+      const task = typeof args.task === "string" ? args.task.trim() : "";
+      if (!task) return { ok: false as const, message: "task is required." };
+      if (args.system_prompt !== undefined && typeof args.system_prompt !== "string") {
+        return { ok: false as const, message: "system_prompt must be a string." };
+      }
+      const maxTurnsError = validateOptionalFiniteNumber(args.max_turns, "max_turns");
+      if (maxTurnsError) return { ok: false as const, message: maxTurnsError };
+      return { ok: true as const, args: { ...args, task } };
+    },
   });
 
   r.register({
@@ -244,11 +333,13 @@ export function registerSubAgentTool(): void {
       type: "object",
       properties: {
         agent_id: { type: "string", description: "Specific agent ID, or omit for all" },
+        nickname: { type: "string", description: "Specific agent nickname, or omit for all" },
       },
     },
     execute: agentStatus,
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: true,
+    validateInput: validateAgentStatusArgs,
   });
 }

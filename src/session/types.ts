@@ -48,9 +48,12 @@ export function toolCallFromApi(tc: Record<string, unknown>): ToolCall {
   if (typeof args === "string") {
     try { args = JSON.parse(args); } catch { args = {}; }
   }
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    args = {};
+  }
   return {
-    id: (tc.id as string) || "",
-    name: (fn.name as string) || "",
+    id: typeof tc.id === "string" ? tc.id : "",
+    name: typeof fn.name === "string" ? fn.name : "",
     arguments: args as Record<string, unknown>,
   };
 }

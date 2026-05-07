@@ -4,11 +4,13 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { PermissionLevel } from "./base.js";
+import { PermissionLevel, type ToolDef } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { createArtifact, getArtifact, listArtifacts, readArtifact } from "../artifacts/store.js";
 import { addMCPServer, getMCPManager, reloadMCPManager, removeMCPServer, setMCPServerEnabled } from "../mcp/manager.js";
 import type { MCPConfig } from "../config.js";
+
+type DiagnosticsToolExtras = Partial<Omit<ToolDef, "name" | "description" | "parameters" | "execute" | "permission" | "category" | "parallelOk">>;
 
 function run(command: string, workdir = "."): string {
   const result = spawnSync("bash", ["-c", command], { cwd: workdir, encoding: "utf-8", timeout: 60_000, maxBuffer: 10 * 1024 * 1024 });
@@ -28,8 +30,28 @@ function runWithStatus(command: string, workdir = "."): { output: string; status
   return { output: [result.stdout, result.stderr].filter(Boolean).join("").trim(), status: result.status ?? null };
 }
 
+function resolveWorkdir(args: Record<string, unknown>): string {
+  if (typeof args.workdir === "string" && args.workdir.trim()) return args.workdir;
+  if (typeof args.cwd === "string" && args.cwd.trim()) return args.cwd;
+  return ".";
+}
+
+function validateDiagnosticsWorkdirArgs(args: Record<string, unknown>) {
+  const workdirInput = args.workdir ?? args.cwd;
+  if (workdirInput !== undefined && typeof workdirInput !== "string") {
+    return { ok: false as const, message: "workdir must be a string." };
+  }
+  if (typeof workdirInput === "string" && workdirInput.trim()) {
+    return { ok: true as const, args: { ...args, workdir: workdirInput.trim() } };
+  }
+  return { ok: true as const, args };
+}
+
 async function diagnostics(args: Record<string, unknown>): Promise<string> {
-  const workdir = String(args.workdir || ".");
+  const validated = validateDiagnosticsWorkdirArgs(args);
+  if (!validated.ok) return `Error: ${validated.message}`;
+  const normalized = validated.args;
+  const workdir = resolveWorkdir(normalized);
   const info = {
     cwd: resolve(workdir),
     node: process.version,
@@ -42,51 +64,61 @@ async function diagnostics(args: Record<string, unknown>): Promise<string> {
 }
 
 async function githubIssueContext(args: Record<string, unknown>): Promise<string> {
-  const issue = String(args.issue || args.number || args.url || "");
+  const issueValue = [args.issue, args.number, args.url].find(value => typeof value === "string" && value.trim()) as string | undefined;
+  const issue = issueValue?.trim();
   if (!issue) return "Error: issue, number, or url is required.";
-  const output = run(`gh issue view ${JSON.stringify(issue)} --json number,title,state,author,body,url,comments`, String(args.workdir || "."));
+  const output = run(`gh issue view ${JSON.stringify(issue)} --json number,title,state,author,body,url,comments`, resolveWorkdir(args));
   const artifact = createArtifact({ kind: "github_issue", name: `issue-${safeName(issue)}.json`, content: output, extension: ".json", metadata: { issue } });
   return withArtifact(output, artifact.id);
 }
 
 async function githubPrContext(args: Record<string, unknown>): Promise<string> {
-  const pr = String(args.pr || args.number || args.url || "");
+  const prValue = [args.pr, args.number, args.url].find(value => typeof value === "string" && value.trim()) as string | undefined;
+  const pr = prValue?.trim();
   if (!pr) return "Error: pr, number, or url is required.";
   const includeDiff = args.diff === true;
-  const base = run(`gh pr view ${JSON.stringify(pr)} --json number,title,state,author,body,url,comments,headRefName,baseRefName`, String(args.workdir || "."));
-  const output = includeDiff ? `${base}\n\n[diff]\n${run(`gh pr diff ${JSON.stringify(pr)} --patch`, String(args.workdir || "."))}` : base;
+  const workdir = resolveWorkdir(args);
+  const base = run(`gh pr view ${JSON.stringify(pr)} --json number,title,state,author,body,url,comments,headRefName,baseRefName`, workdir);
+  const output = includeDiff ? `${base}\n\n[diff]\n${run(`gh pr diff ${JSON.stringify(pr)} --patch`, workdir)}` : base;
   const artifact = createArtifact({ kind: "github_pr", name: `pr-${safeName(pr)}.${includeDiff ? "txt" : "json"}`, content: output, metadata: { pr, includeDiff } });
   return withArtifact(output, artifact.id);
 }
 
 async function githubComment(args: Record<string, unknown>): Promise<string> {
-  const target = String(args.issue || args.pr || args.number || args.url || "");
-  const body = String(args.body || "");
+  const targetValue = [args.target, args.issue, args.pr, args.number, args.url]
+    .find(value => typeof value === "string" && value.trim()) as string | undefined;
+  const target = targetValue?.trim();
+  const body = typeof args.body === "string" ? args.body.trim() : "";
   if (!target || !body) return "Error: target and body are required.";
   const guard = githubMutationGuard(args, { requireClean: args.allow_dirty !== true });
   if (guard) return guard;
-  const evidence = verifyGithubTarget(target, String(args.workdir || "."));
+  const workdir = resolveWorkdir(args);
+  const evidence = verifyGithubTarget(target, workdir);
   if (evidence.startsWith("Error:")) return evidence;
   const artifact = createArtifact({ kind: "github_evidence", name: `comment-${safeName(target)}.json`, content: evidence, extension: ".json", metadata: { target, action: "comment" } });
-  return run(`gh issue comment ${JSON.stringify(target)} --body ${JSON.stringify(body)}`, String(args.workdir || "."));
+  return run(`gh issue comment ${JSON.stringify(target)} --body ${JSON.stringify(body)}`, workdir);
 }
 
 async function githubCloseIssue(args: Record<string, unknown>): Promise<string> {
-  const issue = String(args.issue || args.number || args.url || "");
-  const reason = String(args.reason || "");
+  const issueValue = [args.issue, args.number, args.url].find(value => typeof value === "string" && value.trim()) as string | undefined;
+  const issue = issueValue?.trim();
+  const reason = typeof args.reason === "string" ? args.reason.trim() : "";
   if (!issue || !reason.trim()) return "Error: issue and reason are required.";
   const guard = githubMutationGuard(args, { requireClean: args.allow_dirty !== true });
   if (guard) return guard;
-  const evidence = verifyGithubTarget(issue, String(args.workdir || "."));
+  const workdir = resolveWorkdir(args);
+  const evidence = verifyGithubTarget(issue, workdir);
   if (evidence.startsWith("Error:")) return evidence;
   createArtifact({ kind: "github_evidence", name: `close-${safeName(issue)}.json`, content: evidence, extension: ".json", metadata: { issue, action: "close" } });
-  return run(`gh issue close ${JSON.stringify(issue)} --comment ${JSON.stringify(reason)}`, String(args.workdir || "."));
+  return run(`gh issue close ${JSON.stringify(issue)} --comment ${JSON.stringify(reason)}`, workdir);
 }
 
 const ATTEMPT_DIR = join(tmpdir(), "seek-code-pr-attempts");
 
 async function prAttemptRecord(args: Record<string, unknown>): Promise<string> {
-  const workdir = String(args.workdir || ".");
+  const validated = validateDiagnosticsWorkdirArgs(args);
+  if (!validated.ok) return `Error: ${validated.message}`;
+  const workdir = resolveWorkdir(validated.args);
   const id = `attempt_${Date.now().toString(36)}`;
   const patch = runRaw("git diff --binary", workdir);
   const status = runRaw("git status --porcelain=v1", workdir);
@@ -103,7 +135,7 @@ async function prAttemptList(): Promise<string> {
 }
 
 async function prAttemptRead(args: Record<string, unknown>): Promise<string> {
-  const id = String(args.id || "").replace(/\.patch$/, "");
+  const id = typeof args.id === "string" ? args.id.replace(/\.patch$/, "").trim() : "";
   if (!id) return "Error: id is required.";
   const artifact = getArtifact(id);
   if (artifact) return readArtifact(id);
@@ -112,18 +144,21 @@ async function prAttemptRead(args: Record<string, unknown>): Promise<string> {
 }
 
 async function prAttemptPreflight(args: Record<string, unknown>): Promise<string> {
-  const id = String(args.id || "").replace(/\.patch$/, "");
+  const id = typeof args.id === "string" ? args.id.replace(/\.patch$/, "").trim() : "";
   if (!id) return "Error: id is required.";
   const artifact = getArtifact(id);
   const file = artifact?.path || join(ATTEMPT_DIR, `${id}.patch`);
   if (!existsSync(file)) return `Error: attempt not found: ${id}`;
-  return run(`git apply --check ${JSON.stringify(file)}`, String(args.workdir || "."));
+  return run(`git apply --check ${JSON.stringify(file)}`, resolveWorkdir(args));
 }
 
 async function prAttemptBranch(args: Record<string, unknown>): Promise<string> {
-  const workdir = String(args.workdir || ".");
-  const name = String(args.branch || `seek-code/${Date.now().toString(36)}`).replace(/[^a-zA-Z0-9._/-]/g, "-");
-  const base = args.base ? String(args.base) : "";
+  const workdir = resolveWorkdir(args);
+  if (args.branch !== undefined && typeof args.branch !== "string") return "Error: branch must be a string.";
+  if (args.base !== undefined && typeof args.base !== "string") return "Error: base must be a string.";
+  const requestedBranch = typeof args.branch === "string" ? args.branch.trim() : "";
+  const name = (requestedBranch || `seek-code/${Date.now().toString(36)}`).replace(/[^a-zA-Z0-9._/-]/g, "-");
+  const base = typeof args.base === "string" ? args.base.trim() : "";
   const guard = ensureGitRepo(workdir);
   if (guard) return guard;
   const output = run(`git checkout ${base ? JSON.stringify(base) : ""} -b ${JSON.stringify(name)} 2>&1`, workdir);
@@ -132,8 +167,12 @@ async function prAttemptBranch(args: Record<string, unknown>): Promise<string> {
 }
 
 async function prAttemptGate(args: Record<string, unknown>): Promise<string> {
-  const workdir = String(args.workdir || ".");
-  const command = String(args.command || args.gate || "");
+  const workdir = resolveWorkdir(args);
+  const command = typeof args.command === "string"
+    ? args.command.trim()
+    : typeof args.gate === "string"
+      ? args.gate.trim()
+      : "";
   if (!command) return "Error: command is required.";
   const result = runWithStatus(command, workdir);
   const passed = result.status === 0;
@@ -143,12 +182,18 @@ async function prAttemptGate(args: Record<string, unknown>): Promise<string> {
 }
 
 async function prAttemptPushDraft(args: Record<string, unknown>): Promise<string> {
-  const workdir = String(args.workdir || ".");
-  const title = String(args.title || "Seek Code draft PR");
-  const body = String(args.body || "Created by Seek Code.");
-  const branch = String(args.branch || run("git branch --show-current", workdir)).trim();
+  const validated = validateDiagnosticsWorkdirArgs(args);
+  if (!validated.ok) return `Error: ${validated.message}`;
+  const normalized = validated.args;
+  const workdir = resolveWorkdir(normalized);
+  if (normalized.title !== undefined && typeof normalized.title !== "string") return "Error: title must be a string.";
+  if (normalized.body !== undefined && typeof normalized.body !== "string") return "Error: body must be a string.";
+  if (normalized.branch !== undefined && typeof normalized.branch !== "string") return "Error: branch must be a string.";
+  const title = typeof normalized.title === "string" ? normalized.title : "Seek Code draft PR";
+  const body = typeof normalized.body === "string" ? normalized.body : "Created by Seek Code.";
+  const branch = (typeof normalized.branch === "string" ? normalized.branch : run("git branch --show-current", workdir)).trim();
   if (!branch) return "Error: branch is required or current branch cannot be detected.";
-  const guard = githubMutationGuard(args, { requireClean: args.allow_dirty !== true });
+  const guard = githubMutationGuard(normalized, { requireClean: normalized.allow_dirty !== true });
   if (guard) return guard;
   const push = run(`git push -u origin ${JSON.stringify(branch)} 2>&1`, workdir);
   const create = run(`gh pr create --draft --title ${JSON.stringify(title)} --body ${JSON.stringify(body)} 2>&1`, workdir);
@@ -157,8 +202,9 @@ async function prAttemptPushDraft(args: Record<string, unknown>): Promise<string
 }
 
 async function prAttemptReviewSync(args: Record<string, unknown>): Promise<string> {
-  const workdir = String(args.workdir || ".");
-  const pr = String(args.pr || args.number || args.url || "");
+  const workdir = resolveWorkdir(args);
+  const prValue = [args.pr, args.number, args.url].find(value => typeof value === "string" && value.trim()) as string | undefined;
+  const pr = prValue?.trim();
   if (!pr) return "Error: pr, number, or url is required.";
   if (!commandExists("gh")) return "Error: GitHub CLI 'gh' is required.";
   const comments = run(`gh pr view ${JSON.stringify(pr)} --json comments,reviews,reviewDecision,url 2>&1`, workdir);
@@ -167,9 +213,14 @@ async function prAttemptReviewSync(args: Record<string, unknown>): Promise<strin
 }
 
 async function prAttemptRollback(args: Record<string, unknown>): Promise<string> {
-  const workdir = String(args.workdir || ".");
-  const branch = String(args.branch || "");
-  const target = String(args.target || "HEAD");
+  const validated = validateDiagnosticsWorkdirArgs(args);
+  if (!validated.ok) return `Error: ${validated.message}`;
+  const normalized = validated.args;
+  const workdir = resolveWorkdir(normalized);
+  if (normalized.branch !== undefined && typeof normalized.branch !== "string") return "Error: branch must be a string.";
+  if (normalized.target !== undefined && typeof normalized.target !== "string") return "Error: target must be a string.";
+  const branch = typeof normalized.branch === "string" ? normalized.branch : "";
+  const target = typeof normalized.target === "string" ? normalized.target : "HEAD";
   const guard = ensureGitRepo(workdir);
   if (guard) return guard;
   const before = run("git status --porcelain=v1 && git rev-parse --abbrev-ref HEAD && git rev-parse HEAD", workdir);
@@ -192,12 +243,13 @@ interface Automation {
 const automations = new Map<string, Automation>();
 
 async function automationCreate(args: Record<string, unknown>): Promise<string> {
-  const prompt = String(args.prompt || "");
+  const prompt = typeof args.prompt === "string" ? args.prompt : "";
   if (!prompt.trim()) return "Error: prompt is required.";
+  if (args.schedule !== undefined && typeof args.schedule !== "string") return "Error: schedule must be a string.";
   const automation: Automation = {
     id: `auto_${Date.now().toString(36)}`,
     prompt,
-    schedule: args.schedule ? String(args.schedule) : undefined,
+    schedule: args.schedule,
     paused: false,
     created_at: new Date().toISOString(),
   };
@@ -210,21 +262,31 @@ async function automationList(): Promise<string> {
 }
 
 async function automationRead(args: Record<string, unknown>): Promise<string> {
-  const automation = automations.get(String(args.id || ""));
-  return automation ? JSON.stringify(automation, null, 2) : `Error: automation not found: ${args.id}`;
+  const id = typeof args.id === "string" ? args.id.trim() : "";
+  if (!id) return "Error: id is required.";
+  const automation = automations.get(id);
+  return automation ? JSON.stringify(automation, null, 2) : `Error: automation not found: ${id}`;
 }
 
 async function automationUpdate(args: Record<string, unknown>): Promise<string> {
-  const id = String(args.id || "");
+  const id = typeof args.id === "string" ? args.id.trim() : "";
+  if (!id) return "Error: id is required.";
   const automation = automations.get(id);
   if (!automation) return `Error: automation not found: ${id}`;
-  if (args.prompt !== undefined) automation.prompt = String(args.prompt);
-  if (args.schedule !== undefined) automation.schedule = String(args.schedule);
+  if (args.prompt !== undefined) {
+    if (typeof args.prompt !== "string" || !args.prompt.trim()) return "Error: prompt is required.";
+    automation.prompt = args.prompt;
+  }
+  if (args.schedule !== undefined) {
+    if (typeof args.schedule !== "string") return "Error: schedule must be a string.";
+    automation.schedule = args.schedule;
+  }
   return JSON.stringify(automation, null, 2);
 }
 
 async function automationStatus(args: Record<string, unknown>, paused: boolean): Promise<string> {
-  const id = String(args.id || "");
+  const id = typeof args.id === "string" ? args.id.trim() : "";
+  if (!id) return "Error: id is required.";
   const automation = automations.get(id);
   if (!automation) return `Error: automation not found: ${id}`;
   automation.paused = paused;
@@ -232,13 +294,16 @@ async function automationStatus(args: Record<string, unknown>, paused: boolean):
 }
 
 async function automationDelete(args: Record<string, unknown>): Promise<string> {
-  const id = String(args.id || "");
+  const id = typeof args.id === "string" ? args.id.trim() : "";
+  if (!id) return "Error: id is required.";
   return automations.delete(id) ? `Deleted automation ${id}.` : `Error: automation not found: ${id}`;
 }
 
 async function automationRun(args: Record<string, unknown>): Promise<string> {
-  const automation = automations.get(String(args.id || ""));
-  if (!automation) return `Error: automation not found: ${args.id}`;
+  const id = typeof args.id === "string" ? args.id.trim() : "";
+  if (!id) return "Error: id is required.";
+  const automation = automations.get(id);
+  if (!automation) return `Error: automation not found: ${id}`;
   const { getTaskManager } = await import("../engine/task-lifecycle.js");
   const task = getTaskManager().createTask("background", `Automation: ${automation.prompt}`);
   getTaskManager().startTask(task.id);
@@ -246,7 +311,7 @@ async function automationRun(args: Record<string, unknown>): Promise<string> {
 }
 
 async function mcpManager(args: Record<string, unknown>): Promise<string> {
-  const action = String(args.action || "list");
+  const action = normalizeMCPAction(args.action);
   try {
     if (action === "list") return JSON.stringify(getMCPManager().list(), null, 2);
     if (action === "reload") {
@@ -254,11 +319,12 @@ async function mcpManager(args: Record<string, unknown>): Promise<string> {
       return JSON.stringify({ reloaded: true, servers: manager.list() }, null, 2);
     }
     if (action === "health") {
-      const name = args.name ? String(args.name) : undefined;
+      const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : undefined;
+      if (args.name !== undefined && !name) return "Error: name is required.";
       return JSON.stringify(await getMCPManager().healthCheck(name), null, 2);
     }
     if (action === "reconnect") {
-      const name = String(args.name || "");
+      const name = typeof args.name === "string" ? args.name.trim() : "";
       if (!name) return "Error: name is required.";
       const server = getMCPManager().list().find(item => item.name === name);
       if (!server) return `Error: MCP server not found: ${name}`;
@@ -270,13 +336,13 @@ async function mcpManager(args: Record<string, unknown>): Promise<string> {
       return JSON.stringify({ added: server.name, servers }, null, 2);
     }
     if (action === "enable" || action === "disable") {
-      const name = String(args.name || "");
+      const name = typeof args.name === "string" ? args.name.trim() : "";
       if (!name) return "Error: name is required.";
       const servers = setMCPServerEnabled(name, action === "enable");
       return JSON.stringify({ name, enabled: action === "enable", servers }, null, 2);
     }
     if (action === "remove" || action === "delete") {
-      const name = String(args.name || "");
+      const name = typeof args.name === "string" ? args.name.trim() : "";
       if (!name) return "Error: name is required.";
       const servers = removeMCPServer(name);
       return JSON.stringify({ removed: name, servers }, null, 2);
@@ -288,10 +354,18 @@ async function mcpManager(args: Record<string, unknown>): Promise<string> {
 }
 
 async function lspDiagnostics(args: Record<string, unknown>): Promise<string> {
-  const workdir = String(args.workdir || ".");
-  const language = String(args.language || detectLanguage(workdir));
+  const workdir = resolveWorkdir(args);
+  if (args.language !== undefined && typeof args.language !== "string") return "Error: language must be a string.";
+  if (args.min_severity !== undefined && typeof args.min_severity !== "string") return "Error: min_severity must be a string.";
+  if (args.severity !== undefined && typeof args.severity !== "string") return "Error: min_severity must be a string.";
+  if (args.files !== undefined && !isStringListInput(args.files)) return "Error: files must be a string or array of strings.";
+  const language = typeof args.language === "string" ? args.language : detectLanguage(workdir);
   const files = normalizeFiles(args.files);
-  const minSeverity = String(args.min_severity || args.severity || "all");
+  const minSeverity = typeof args.min_severity === "string"
+    ? args.min_severity
+    : typeof args.severity === "string"
+      ? args.severity
+      : "all";
   const command = diagnosticCommand(language, workdir);
   if (!command) return `Error: unsupported language '${language}'. Supported: typescript, python, go, rust.`;
   const output = run(command, workdir);
@@ -338,6 +412,179 @@ export function clearAutomationState(): void {
   if (existsSync(ATTEMPT_DIR)) rmSync(ATTEMPT_DIR, { recursive: true, force: true });
 }
 
+function normalizeGithubTargetArgs(args: Record<string, unknown>, key: "issue" | "pr" | "target"): Record<string, unknown> {
+  const normalized = { ...args };
+  const candidates = [args[key], args.issue, args.pr, args.number, args.url];
+  const target = candidates.find(value => typeof value === "string" && value.trim()) as string | undefined;
+  if (target) normalized[key] = target;
+  return normalized;
+}
+
+function validateGithubCommentArgs(args: Record<string, unknown>) {
+  const workdirValidated = validateDiagnosticsWorkdirArgs(args);
+  if (!workdirValidated.ok) return workdirValidated;
+  const normalizedArgs = workdirValidated.args;
+  const normalized = normalizeGithubTargetArgs(normalizedArgs, "target");
+  const target = typeof normalized.target === "string" ? normalized.target.trim() : "";
+  const body = typeof normalized.body === "string" ? normalized.body.trim() : "";
+  if (!target) return { ok: false as const, message: "issue, pr, number, or url is required." };
+  if (!body) return { ok: false as const, message: "body is required." };
+  return { ok: true as const, args: { ...normalized, target, body } };
+}
+
+function validateGithubIssueArgs(args: Record<string, unknown>) {
+  const workdirValidated = validateDiagnosticsWorkdirArgs(args);
+  if (!workdirValidated.ok) return workdirValidated;
+  const normalized = normalizeGithubTargetArgs(workdirValidated.args, "issue");
+  const issue = typeof normalized.issue === "string" ? normalized.issue.trim() : "";
+  return issue
+    ? { ok: true as const, args: { ...normalized, issue } }
+    : { ok: false as const, message: "issue, number, or url is required." };
+}
+
+function validateGithubPrArgs(args: Record<string, unknown>) {
+  const workdirValidated = validateDiagnosticsWorkdirArgs(args);
+  if (!workdirValidated.ok) return workdirValidated;
+  const normalized = normalizeGithubTargetArgs(workdirValidated.args, "pr");
+  const pr = typeof normalized.pr === "string" ? normalized.pr.trim() : "";
+  return pr
+    ? { ok: true as const, args: { ...normalized, pr } }
+    : { ok: false as const, message: "pr, number, or url is required." };
+}
+
+function validateGithubCloseArgs(args: Record<string, unknown>) {
+  const workdirValidated = validateDiagnosticsWorkdirArgs(args);
+  if (!workdirValidated.ok) return workdirValidated;
+  const normalized = normalizeGithubTargetArgs(workdirValidated.args, "issue");
+  const issue = typeof normalized.issue === "string" ? normalized.issue.trim() : "";
+  const reason = typeof normalized.reason === "string" ? normalized.reason.trim() : "";
+  if (!issue) return { ok: false as const, message: "issue, number, or url is required." };
+  if (!reason) return { ok: false as const, message: "reason is required." };
+  return { ok: true as const, args: { ...normalized, issue, reason } };
+}
+
+function validatePrAttemptGateArgs(args: Record<string, unknown>) {
+  const workdirValidated = validateDiagnosticsWorkdirArgs(args);
+  if (!workdirValidated.ok) return workdirValidated;
+  const normalizedArgs = workdirValidated.args;
+  const command = typeof normalizedArgs.command === "string"
+    ? normalizedArgs.command.trim()
+    : typeof normalizedArgs.gate === "string"
+      ? normalizedArgs.gate.trim()
+      : "";
+  return command
+    ? { ok: true as const, args: { ...normalizedArgs, command } }
+    : { ok: false as const, message: "command is required." };
+}
+
+function validatePrAttemptBranchArgs(args: Record<string, unknown>) {
+  const workdirValidated = validateDiagnosticsWorkdirArgs(args);
+  if (!workdirValidated.ok) return workdirValidated;
+  const normalizedArgs = workdirValidated.args;
+  if (normalizedArgs.branch !== undefined) {
+    if (typeof normalizedArgs.branch !== "string") return { ok: false as const, message: "branch must be a string." };
+    const branch = normalizedArgs.branch.trim();
+    if (!branch) return { ok: false as const, message: "branch must be a non-empty string." };
+    if (normalizedArgs.base === undefined) return { ok: true as const, args: { ...normalizedArgs, branch } };
+  }
+  if (normalizedArgs.base !== undefined) {
+    if (typeof normalizedArgs.base !== "string") return { ok: false as const, message: "base must be a string." };
+    const base = normalizedArgs.base.trim();
+    if (!base) return { ok: false as const, message: "base must be a non-empty string." };
+    return normalizedArgs.branch === undefined
+      ? { ok: true as const, args: { ...normalizedArgs, base } }
+      : { ok: true as const, args: { ...normalizedArgs, branch: (normalizedArgs.branch as string).trim(), base } };
+  }
+  return { ok: true as const, args: normalizedArgs };
+}
+
+function validatePrAttemptPushDraftArgs(args: Record<string, unknown>) {
+  const workdirValidated = validateDiagnosticsWorkdirArgs(args);
+  if (!workdirValidated.ok) return workdirValidated;
+  const normalizedArgs = workdirValidated.args;
+  const normalized = { ...normalizedArgs };
+  for (const key of ["title", "body", "branch"] as const) {
+    const value = normalized[key];
+    if (value !== undefined && typeof value !== "string") {
+      return { ok: false as const, message: `${key} must be a string.` };
+    }
+    if (typeof value === "string") normalized[key] = value.trim();
+  }
+  return { ok: true as const, args: normalized };
+}
+
+function validatePrAttemptRollbackArgs(args: Record<string, unknown>) {
+  const workdirValidated = validateDiagnosticsWorkdirArgs(args);
+  if (!workdirValidated.ok) return workdirValidated;
+  const normalizedArgs = workdirValidated.args;
+  const normalized = { ...normalizedArgs };
+  for (const key of ["branch", "target"] as const) {
+    const value = normalized[key];
+    if (value !== undefined && typeof value !== "string") {
+      return { ok: false as const, message: `${key} must be a string.` };
+    }
+    if (typeof value === "string") normalized[key] = value.trim();
+  }
+  return { ok: true as const, args: normalized };
+}
+
+function validateIdArgs(args: Record<string, unknown>) {
+  const workdirValidated = validateDiagnosticsWorkdirArgs(args);
+  if (!workdirValidated.ok) return workdirValidated;
+  const normalizedArgs = workdirValidated.args;
+  const id = typeof normalizedArgs.id === "string" ? normalizedArgs.id.trim() : "";
+  return id
+    ? { ok: true as const, args: { ...normalizedArgs, id } }
+    : { ok: false as const, message: "id is required." };
+}
+
+function validatePromptArgs(args: Record<string, unknown>) {
+  const workdirValidated = validateDiagnosticsWorkdirArgs(args);
+  if (!workdirValidated.ok) return workdirValidated;
+  const normalizedArgs = workdirValidated.args;
+  const prompt = typeof normalizedArgs.prompt === "string" ? normalizedArgs.prompt.trim() : "";
+  if (!prompt) return { ok: false as const, message: "prompt is required." };
+  if (normalizedArgs.schedule !== undefined && typeof normalizedArgs.schedule !== "string") {
+    return { ok: false as const, message: "schedule must be a string." };
+  }
+  return { ok: true as const, args: { ...normalizedArgs, prompt } };
+}
+
+function validateAutomationUpdateArgs(args: Record<string, unknown>) {
+  const validated = validateIdArgs(args);
+  if (!validated.ok) return validated;
+  if (validated.args.prompt !== undefined) {
+    if (typeof validated.args.prompt !== "string" || !validated.args.prompt.trim()) return { ok: false as const, message: "prompt is required." };
+  }
+  if (validated.args.schedule !== undefined && typeof validated.args.schedule !== "string") {
+    return { ok: false as const, message: "schedule must be a string." };
+  }
+  return validated;
+}
+
+function isStringListInput(value: unknown): boolean {
+  return typeof value === "string" || (Array.isArray(value) && value.every(item => typeof item === "string"));
+}
+
+function validateLspDiagnosticsArgs(args: Record<string, unknown>) {
+  const workdirValidated = validateDiagnosticsWorkdirArgs(args);
+  if (!workdirValidated.ok) return workdirValidated;
+  const normalizedArgs = workdirValidated.args;
+  if (normalizedArgs.language !== undefined && typeof normalizedArgs.language !== "string") {
+    return { ok: false as const, message: "language must be a string." };
+  }
+  if (normalizedArgs.min_severity !== undefined && typeof normalizedArgs.min_severity !== "string") {
+    return { ok: false as const, message: "min_severity must be a string." };
+  }
+  if (normalizedArgs.severity !== undefined && typeof normalizedArgs.severity !== "string") {
+    return { ok: false as const, message: "min_severity must be a string." };
+  }
+  if (normalizedArgs.files !== undefined && !isStringListInput(normalizedArgs.files)) {
+    return { ok: false as const, message: "files must be a string or array of strings." };
+  }
+  return { ok: true as const, args: normalizedArgs };
+}
+
 export function registerDiagnosticsTools(): void {
   const registry = getRegistry();
   const add = (
@@ -346,15 +593,18 @@ export function registerDiagnosticsTools(): void {
     execute: (args: Record<string, unknown>) => Promise<string>,
     permission = PermissionLevel.ALWAYS_ALLOW,
     deferLoading = true,
+    parameters: Record<string, unknown> = { type: "object", properties: {} },
+    extra: DiagnosticsToolExtras = {},
   ) => registry.register({
     name,
     description,
-    parameters: { type: "object", properties: {} },
+    parameters,
     execute,
     permission,
     category: name.startsWith("github") ? "github" : name.startsWith("automation") ? "automation" : "diagnostics",
     parallelOk: true,
     deferLoading,
+    ...extra,
   });
 
   registry.register({
@@ -365,28 +615,164 @@ export function registerDiagnosticsTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "diagnostics",
     parallelOk: true,
+    validateInput: validateDiagnosticsWorkdirArgs,
   });
-  add("github_issue_context", "Read GitHub issue context via gh.", githubIssueContext);
-  add("github_pr_context", "Read GitHub PR context via gh.", githubPrContext);
-  add("github_comment", "Comment on a GitHub issue or PR via gh.", githubComment, PermissionLevel.ASK);
-  add("github_close_issue", "Close a GitHub issue via gh with a required reason.", githubCloseIssue, PermissionLevel.ASK);
-  add("pr_attempt_record", "Record current git diff as a PR attempt patch.", prAttemptRecord);
+  add("github_issue_context", "Read GitHub issue context via gh.", githubIssueContext, PermissionLevel.ALWAYS_ALLOW, true, {
+    type: "object",
+    properties: {
+      issue: { type: "string" },
+      number: { type: "string" },
+      url: { type: "string" },
+      workdir: { type: "string", default: "." },
+    },
+  }, { validateInput: validateGithubIssueArgs });
+  add("github_pr_context", "Read GitHub PR context via gh.", githubPrContext, PermissionLevel.ALWAYS_ALLOW, true, {
+    type: "object",
+    properties: {
+      pr: { type: "string" },
+      number: { type: "string" },
+      url: { type: "string" },
+      diff: { type: "boolean", default: false },
+      workdir: { type: "string", default: "." },
+    },
+  }, { validateInput: validateGithubPrArgs });
+  add(
+    "github_comment",
+    "Comment on a GitHub issue or PR via gh.",
+    githubComment,
+    PermissionLevel.ASK,
+    true,
+    {
+      type: "object",
+      properties: {
+        target: { type: "string" },
+        issue: { type: "string" },
+        pr: { type: "string" },
+        number: { type: "string" },
+        url: { type: "string" },
+        body: { type: "string" },
+        workdir: { type: "string", default: "." },
+        allow_dirty: { type: "boolean", default: false },
+      },
+    },
+    { validateInput: validateGithubCommentArgs },
+  );
+  add("github_close_issue", "Close a GitHub issue via gh with a required reason.", githubCloseIssue, PermissionLevel.ASK, true, {
+    type: "object",
+    properties: {
+      issue: { type: "string" },
+      number: { type: "string" },
+      url: { type: "string" },
+      reason: { type: "string" },
+      workdir: { type: "string", default: "." },
+      allow_dirty: { type: "boolean", default: false },
+    },
+  }, { validateInput: validateGithubCloseArgs });
+  add("pr_attempt_record", "Record current git diff as a PR attempt patch.", prAttemptRecord, PermissionLevel.ALWAYS_ALLOW, true, {
+    type: "object",
+    properties: {
+      workdir: { type: "string", default: "." },
+    },
+  }, { validateInput: validateDiagnosticsWorkdirArgs });
   add("pr_attempt_list", "List recorded PR attempt patches.", prAttemptList);
-  add("pr_attempt_read", "Read a PR attempt patch.", prAttemptRead);
-  add("pr_attempt_preflight", "Run git apply --check for a PR attempt patch.", prAttemptPreflight);
-  add("pr_attempt_branch", "Create a branch for a PR attempt.", prAttemptBranch, PermissionLevel.ASK);
-  add("pr_attempt_gate", "Run a PR attempt verification gate and archive evidence.", prAttemptGate, PermissionLevel.ASK);
-  add("pr_attempt_push_draft", "Push current branch and create a draft GitHub PR.", prAttemptPushDraft, PermissionLevel.ASK);
-  add("pr_attempt_review_sync", "Sync GitHub PR review comments into an artifact.", prAttemptReviewSync);
-  add("pr_attempt_rollback", "Rollback a PR attempt branch or current branch to a target revision.", prAttemptRollback, PermissionLevel.ASK);
-  add("automation_create", "Create an automation record.", automationCreate, PermissionLevel.ASK);
+  add("pr_attempt_read", "Read a PR attempt patch.", prAttemptRead, PermissionLevel.ALWAYS_ALLOW, true, {
+    type: "object",
+    properties: { id: { type: "string" } },
+  }, { validateInput: validateIdArgs });
+  add("pr_attempt_preflight", "Run git apply --check for a PR attempt patch.", prAttemptPreflight, PermissionLevel.ALWAYS_ALLOW, true, {
+    type: "object",
+    properties: {
+      id: { type: "string" },
+      workdir: { type: "string", default: "." },
+    },
+  }, { validateInput: validateIdArgs });
+  add("pr_attempt_branch", "Create a branch for a PR attempt.", prAttemptBranch, PermissionLevel.ASK, true, {
+    type: "object",
+    properties: {
+      branch: { type: "string" },
+      base: { type: "string" },
+      workdir: { type: "string", default: "." },
+    },
+  }, { validateInput: validatePrAttemptBranchArgs });
+  add(
+    "pr_attempt_gate",
+    "Run a PR attempt verification gate and archive evidence.",
+    prAttemptGate,
+    PermissionLevel.ASK,
+    true,
+    {
+      type: "object",
+      properties: {
+        command: { type: "string" },
+        gate: { type: "string", description: "Alias for command." },
+        workdir: { type: "string", default: "." },
+      },
+    },
+    { validateInput: validatePrAttemptGateArgs },
+  );
+  add("pr_attempt_push_draft", "Push current branch and create a draft GitHub PR.", prAttemptPushDraft, PermissionLevel.ASK, true, {
+    type: "object",
+    properties: {
+      branch: { type: "string" },
+      title: { type: "string" },
+      body: { type: "string" },
+      workdir: { type: "string", default: "." },
+      allow_dirty: { type: "boolean", default: false },
+    },
+  }, { validateInput: validatePrAttemptPushDraftArgs });
+  add("pr_attempt_review_sync", "Sync GitHub PR review comments into an artifact.", prAttemptReviewSync, PermissionLevel.ALWAYS_ALLOW, true, {
+    type: "object",
+    properties: {
+      pr: { type: "string" },
+      number: { type: "string" },
+      url: { type: "string" },
+      workdir: { type: "string", default: "." },
+    },
+  }, { validateInput: validateGithubPrArgs });
+  add("pr_attempt_rollback", "Rollback a PR attempt branch or current branch to a target revision.", prAttemptRollback, PermissionLevel.ASK, true, {
+    type: "object",
+    properties: {
+      branch: { type: "string" },
+      target: { type: "string", default: "HEAD" },
+      workdir: { type: "string", default: "." },
+    },
+  }, { validateInput: validatePrAttemptRollbackArgs });
+  add("automation_create", "Create an automation record.", automationCreate, PermissionLevel.ASK, true, {
+    type: "object",
+    properties: {
+      prompt: { type: "string" },
+      schedule: { type: "string" },
+    },
+  }, { validateInput: validatePromptArgs });
   add("automation_list", "List automation records.", automationList);
-  add("automation_read", "Read an automation record.", automationRead);
-  add("automation_update", "Update an automation record.", automationUpdate, PermissionLevel.ASK);
-  add("automation_pause", "Pause an automation.", args => automationStatus(args, true), PermissionLevel.ASK);
-  add("automation_resume", "Resume an automation.", args => automationStatus(args, false), PermissionLevel.ASK);
-  add("automation_delete", "Delete an automation.", automationDelete, PermissionLevel.ASK);
-  add("automation_run", "Run an automation by creating a durable task.", automationRun, PermissionLevel.ASK);
+  add("automation_read", "Read an automation record.", automationRead, PermissionLevel.ALWAYS_ALLOW, true, {
+    type: "object",
+    properties: { id: { type: "string" } },
+  }, { validateInput: validateIdArgs });
+  add("automation_update", "Update an automation record.", automationUpdate, PermissionLevel.ASK, true, {
+    type: "object",
+    properties: {
+      id: { type: "string" },
+      prompt: { type: "string" },
+      schedule: { type: "string" },
+    },
+  }, { validateInput: validateAutomationUpdateArgs });
+  add("automation_pause", "Pause an automation.", args => automationStatus(args, true), PermissionLevel.ASK, true, {
+    type: "object",
+    properties: { id: { type: "string" } },
+  }, { validateInput: validateIdArgs });
+  add("automation_resume", "Resume an automation.", args => automationStatus(args, false), PermissionLevel.ASK, true, {
+    type: "object",
+    properties: { id: { type: "string" } },
+  }, { validateInput: validateIdArgs });
+  add("automation_delete", "Delete an automation.", automationDelete, PermissionLevel.ASK, true, {
+    type: "object",
+    properties: { id: { type: "string" } },
+  }, { validateInput: validateIdArgs });
+  add("automation_run", "Run an automation by creating a durable task.", automationRun, PermissionLevel.ASK, true, {
+    type: "object",
+    properties: { id: { type: "string" } },
+  }, { validateInput: validateIdArgs });
   registry.register({
     name: "mcp_manager",
     description: "Manage MCP servers: list, add, enable, disable, remove, reload. Writes user config for persistent changes.",
@@ -407,6 +793,7 @@ export function registerDiagnosticsTools(): void {
     permission: PermissionLevel.ASK,
     category: "mcp",
     parallelOk: false,
+    validateInput: validateMCPManagerArgs,
   });
   registry.register({
     name: "lsp_diagnostics",
@@ -424,11 +811,12 @@ export function registerDiagnosticsTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "diagnostics",
     parallelOk: true,
+    validateInput: validateLspDiagnosticsArgs,
   });
 }
 
 function githubMutationGuard(args: Record<string, unknown>, options: { requireClean: boolean }): string | null {
-  const workdir = String(args.workdir || ".");
+  const workdir = resolveWorkdir(args);
   const status = runRaw("git status --porcelain=v1 2>&1", workdir);
   if (/fatal: not a git repository/i.test(status)) return "Error: GitHub mutations require a git repository workdir.";
   if (options.requireClean && status.trim()) {
@@ -459,21 +847,86 @@ function verifyGithubTarget(target: string, workdir: string): string {
 }
 
 function parseMCPServer(args: Record<string, unknown>): MCPConfig {
-  const name = String(args.name || "").trim();
+  const name = typeof args.name === "string" ? args.name.trim() : "";
   if (!name) throw new Error("name is required.");
-  const transport = String(args.transport || (args.url ? "sse" : "stdio")) as MCPConfig["transport"];
+  const env = parseMCPEnv(args.env);
+  const rawTransport = typeof args.transport === "string" ? args.transport.trim().toLowerCase() : undefined;
+  if (args.transport !== undefined) {
+    if (typeof args.transport !== "string") throw new Error("transport must be a string.");
+    if (rawTransport !== "stdio" && rawTransport !== "sse") throw new Error("transport must be stdio or sse.");
+  }
+  const transport = normalizeMCPTransport(args.transport, args.url);
+  if (args.enabled !== undefined && typeof args.enabled !== "boolean") {
+    throw new Error("enabled must be a boolean.");
+  }
   const server: MCPConfig = {
     name,
     transport,
-    command: args.command ? String(args.command) : undefined,
-    args: Array.isArray(args.args) ? args.args.map(String) : args.args ? String(args.args).split(/\s+/).filter(Boolean) : [],
-    url: args.url ? String(args.url) : undefined,
-    env: typeof args.env === "object" && args.env !== null ? args.env as Record<string, string> : {},
+    command: typeof args.command === "string" && args.command.trim() ? args.command : undefined,
+    args: Array.isArray(args.args)
+      ? args.args.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      : typeof args.args === "string"
+      ? args.args.split(/\s+/).filter(Boolean)
+      : [],
+    url: typeof args.url === "string" && args.url.trim() ? args.url : undefined,
+    env,
     enabled: args.enabled !== false,
   };
   if (server.transport === "stdio" && !server.command) throw new Error("command is required for stdio MCP servers.");
   if (server.transport === "sse" && !server.url) throw new Error("url is required for SSE MCP servers.");
   return server;
+}
+
+function parseMCPEnv(value: unknown): Record<string, string> {
+  if (value === undefined || value === null) return {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("env must be an object with string values.");
+  }
+  const env: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry !== "string") throw new Error("env must be an object with string values.");
+    env[key] = entry;
+  }
+  return env;
+}
+
+function normalizeMCPAction(value: unknown): string {
+  return typeof value === "string" && value.trim() ? value.trim().toLowerCase() : "list";
+}
+
+function normalizeMCPTransport(value: unknown, url: unknown): MCPConfig["transport"] {
+  const transport = typeof value === "string" && value.trim()
+    ? value.trim().toLowerCase()
+    : (typeof url === "string" && url.trim() ? "sse" : "stdio");
+  if (transport === "stdio" || transport === "sse") return transport;
+  return "stdio";
+}
+
+function validateMCPManagerArgs(args: Record<string, unknown>) {
+  const action = normalizeMCPAction(args.action);
+  if (action === "list" || action === "reload") return { ok: true as const, args: { ...args, action } };
+  if (action === "health") {
+    if (args.name === undefined) return { ok: true as const, args: { ...args, action } };
+    const name = typeof args.name === "string" ? args.name.trim() : "";
+    return name
+      ? { ok: true as const, args: { ...args, action, name } }
+      : { ok: false as const, message: "name is required." };
+  }
+  if (["enable", "disable", "remove", "delete", "reconnect"].includes(action)) {
+    const name = typeof args.name === "string" ? args.name.trim() : "";
+    return name
+      ? { ok: true as const, args: { ...args, action, name } }
+      : { ok: false as const, message: "name is required." };
+  }
+  if (action === "add") {
+    try {
+      const server = parseMCPServer(args);
+      return { ok: true as const, args: { ...args, action, ...server } };
+    } catch (error: any) {
+      return { ok: false as const, message: error.message || "invalid MCP server configuration" };
+    }
+  }
+  return { ok: false as const, message: "unsupported MCP action" };
 }
 
 function diagnosticCommand(language: string, workdir: string): string | null {
@@ -524,14 +977,7 @@ function parseDiagnostics(output: string, language: string): ParsedDiagnostic[] 
   if (language === "python") {
     try {
       const parsed = JSON.parse(output) as { generalDiagnostics?: Array<any> };
-      return (parsed.generalDiagnostics || []).map(item => ({
-        file: String(item.file || ""),
-        line: typeof item.range?.start?.line === "number" ? item.range.start.line + 1 : undefined,
-        column: typeof item.range?.start?.character === "number" ? item.range.start.character + 1 : undefined,
-        severity: normalizeSeverity(item.severity),
-        message: String(item.message || ""),
-        code: item.rule ? String(item.rule) : undefined,
-      }));
+      return parsePythonDiagnostics(parsed.generalDiagnostics);
     } catch {
       // fall through to regex parser
     }
@@ -565,6 +1011,54 @@ function parseDiagnostics(output: string, language: string): ParsedDiagnostic[] 
     }
   }
   return diagnostics;
+}
+
+function parsePythonDiagnostics(value: unknown): ParsedDiagnostic[] {
+  if (!Array.isArray(value)) return [];
+  const diagnostics: ParsedDiagnostic[] = [];
+  for (const item of value) {
+    const diagnostic = parsePythonDiagnostic(item);
+    if (diagnostic) diagnostics.push(diagnostic);
+  }
+  return diagnostics;
+}
+
+function parsePythonDiagnostic(value: unknown): ParsedDiagnostic | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const file = typeof record.file === "string" && record.file.trim() ? record.file : null;
+  const message = typeof record.message === "string" && record.message.trim() ? record.message : null;
+  const code = optionalDiagnosticString(record.rule);
+  if (!file || !message || code === undefined) return null;
+
+  const line = typeof record.range === "object" && record.range && !Array.isArray(record.range)
+    && typeof (record.range as { start?: unknown }).start === "object"
+    && (record.range as { start?: unknown }).start
+    && !Array.isArray((record.range as { start?: unknown }).start)
+    && typeof ((record.range as { start?: { line?: unknown } }).start?.line) === "number"
+    ? ((record.range as { start?: { line?: number } }).start!.line! + 1)
+    : undefined;
+  const column = typeof record.range === "object" && record.range && !Array.isArray(record.range)
+    && typeof (record.range as { start?: unknown }).start === "object"
+    && (record.range as { start?: unknown }).start
+    && !Array.isArray((record.range as { start?: unknown }).start)
+    && typeof ((record.range as { start?: { character?: unknown } }).start?.character) === "number"
+    ? ((record.range as { start?: { character?: number } }).start!.character! + 1)
+    : undefined;
+
+  return {
+    file,
+    ...(line !== undefined ? { line } : {}),
+    ...(column !== undefined ? { column } : {}),
+    severity: normalizeSeverity(record.severity),
+    message,
+    ...(code !== null ? { code } : {}),
+  };
+}
+
+function optionalDiagnosticString(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "string" ? value : undefined;
 }
 
 function filterDiagnostics(

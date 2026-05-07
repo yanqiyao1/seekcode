@@ -1,0 +1,388 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const createMock = vi.fn();
+
+vi.mock("openai", () => ({
+  default: vi.fn().mockImplementation(() => ({
+    chat: { completions: { create: createMock } },
+  })),
+}));
+
+const { getRegistry } = await import("../src/tools/registry.js");
+const { registerSubAgentTool, clearAgentState } = await import("../src/tools/sub-agent.js");
+const { registerRLMTool } = await import("../src/tools/rlm-query.js");
+
+beforeEach(() => {
+  getRegistry().clear();
+  clearAgentState();
+  createMock.mockReset();
+});
+
+afterEach(() => {
+  getRegistry().clear();
+  clearAgentState();
+  vi.useRealTimers();
+});
+
+describe("meta tool regressions", () => {
+  it("enforces spawn_agent timeout_ms instead of hanging until the upstream client returns", async () => {
+    vi.useFakeTimers();
+    createMock.mockImplementation((_request, options) => new Promise((_resolve, reject) => {
+      const signal = options?.signal as AbortSignal | undefined;
+      signal?.addEventListener("abort", () => {
+        reject(new DOMException("Request aborted", "AbortError"));
+      }, { once: true });
+    }));
+    registerSubAgentTool();
+
+    const run = getRegistry().lookup("spawn_agent")!.execute({
+      task: "wait forever",
+      timeout_ms: 10_000,
+    });
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    const result = await run;
+
+    expect(result).toContain("<deepseek:subagent.error>");
+    expect(result).toContain("timed out after 10000ms");
+  });
+
+  it("clamps non-positive spawn_agent timeout_ms to the documented minimum", async () => {
+    vi.useFakeTimers();
+    createMock.mockImplementation((_request, options) => new Promise((_resolve, reject) => {
+      const signal = options?.signal as AbortSignal | undefined;
+      signal?.addEventListener("abort", () => {
+        reject(new DOMException("Request aborted", "AbortError"));
+      }, { once: true });
+    }));
+    registerSubAgentTool();
+
+    const run = getRegistry().lookup("spawn_agent")!.execute({
+      task: "min timeout clamp",
+      timeout_ms: 0,
+    });
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    const result = await run;
+
+    expect(result).toContain("timed out after 10000ms");
+  });
+
+  it("coerces non-positive spawn_agent max_turns to one turn instead of defaulting to fifteen", async () => {
+    createMock.mockResolvedValue({
+      choices: [{ message: { content: "partial" }, finish_reason: "length" }],
+    });
+    registerSubAgentTool();
+
+    const result = await getRegistry().lookup("spawn_agent")!.execute({
+      task: "single turn only",
+      max_turns: 0,
+    });
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(result).toContain("<deepseek:subagent.done>");
+    expect(result).toContain("partial");
+  });
+
+  it("returns a normal task-required error for legacy sub_agent when task is missing", async () => {
+    registerSubAgentTool();
+
+    expect(await getRegistry().lookup("sub_agent")!.validateInput?.(
+      {},
+      { tool_name: "sub_agent", workspace_path: "/tmp/workspace", tool_def: getRegistry().lookup("sub_agent")! },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("task is required"),
+    });
+
+    await expect(getRegistry().lookup("sub_agent")!.execute({})).resolves.toBe("Error: task is required.");
+  });
+
+  it("rejects malformed legacy sub_agent controls during validation instead of deferring failure to execution", async () => {
+    registerSubAgentTool();
+    const tool = getRegistry().lookup("sub_agent")!;
+
+    expect(await tool.validateInput?.(
+      { task: "legacy task", system_prompt: { nested: true } as any },
+      { tool_name: "sub_agent", workspace_path: "/tmp/workspace", tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("system_prompt must be a string"),
+    });
+    expect(await tool.validateInput?.(
+      { task: "legacy task", max_turns: { nested: true } as any },
+      { tool_name: "sub_agent", workspace_path: "/tmp/workspace", tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("max_turns must be a number"),
+    });
+
+    expect(await tool.execute({ task: "legacy task", system_prompt: { nested: true } as any })).toBe("Error: system_prompt must be a string.");
+    expect(await tool.execute({ task: "legacy task", max_turns: { nested: true } as any })).toBe("Error: max_turns must be a number.");
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-string spawn_agent tasks without sending malformed content upstream", async () => {
+    registerSubAgentTool();
+
+    const result = await getRegistry().lookup("spawn_agent")!.execute({
+      task: { prompt: "not a string" } as any,
+    });
+
+    expect(result).toBe("Error: task is required.");
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects whitespace-only spawn_agent tasks before calling upstream", async () => {
+    registerSubAgentTool();
+
+    const result = await getRegistry().lookup("spawn_agent")!.execute({
+      task: "   ",
+    });
+
+    expect(result).toBe("Error: task is required.");
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("tolerates non-string spawn_agent task_name values without crashing", async () => {
+    createMock.mockResolvedValue({
+      choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+    });
+    registerSubAgentTool();
+
+    const result = await getRegistry().lookup("spawn_agent")!.execute({
+      task: "coerce name",
+      task_name: 42,
+    });
+
+    expect(result).toContain("<deepseek:subagent.done>");
+    expect(result).toContain("nickname: agent_");
+  });
+
+  it("trims spawn_agent task names and ignores blank string overrides instead of sending whitespace upstream", async () => {
+    createMock.mockResolvedValue({
+      choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+    });
+    registerSubAgentTool();
+    const oldModel = process.env.DEEPSEEK_MODEL;
+    process.env.DEEPSEEK_MODEL = "env-model";
+
+    try {
+      const result = await getRegistry().lookup("spawn_agent")!.execute({
+        task: "trim spawn config",
+        task_name: "  padded name  ",
+        system_prompt: "   ",
+        model: "   ",
+      });
+
+      expect(result).toContain("<deepseek:subagent.done>");
+      expect(result).toContain("nickname: padded_name");
+
+      const request = createMock.mock.calls[0]?.[0] as { model: string; messages: Array<{ role: string; content: string }> };
+      expect(request.model).toBe("env-model");
+      expect(request.messages[0]?.role).toBe("system");
+      expect(request.messages[0]?.content).toContain("You are a specialized sub-agent.");
+    } finally {
+      if (oldModel === undefined) delete process.env.DEEPSEEK_MODEL;
+      else process.env.DEEPSEEK_MODEL = oldModel;
+    }
+  });
+
+  it("rejects non-string spawn_agent client overrides before constructing malformed upstream config", async () => {
+    registerSubAgentTool();
+
+    expect(await getRegistry().lookup("spawn_agent")!.execute({
+      task: "bad system prompt",
+      system_prompt: { nested: true } as any,
+    })).toBe("Error: system_prompt must be a string.");
+    expect(await getRegistry().lookup("spawn_agent")!.execute({
+      task: "bad api key",
+      api_key: { nested: true } as any,
+    })).toBe("Error: api_key must be a string.");
+    expect(await getRegistry().lookup("spawn_agent")!.execute({
+      task: "bad base url",
+      base_url: { nested: true } as any,
+    })).toBe("Error: base_url must be a string.");
+    expect(await getRegistry().lookup("spawn_agent")!.execute({
+      task: "bad model",
+      model: { nested: true } as any,
+    })).toBe("Error: model must be a string.");
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed spawn_agent numeric controls instead of silently defaulting them", async () => {
+    registerSubAgentTool();
+    const tool = getRegistry().lookup("spawn_agent")!;
+
+    expect(await tool.validateInput?.(
+      { task: "bad system prompt", system_prompt: { nested: true } as any },
+      { tool_name: "spawn_agent", workspace_path: "/tmp/workspace", tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("system_prompt must be a string"),
+    });
+    expect(await tool.validateInput?.(
+      { task: "bad timeout", timeout_ms: { nested: true } as any },
+      { tool_name: "spawn_agent", workspace_path: "/tmp/workspace", tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("timeout_ms must be a number"),
+    });
+    expect(await tool.validateInput?.(
+      { task: "bad turns", max_turns: { nested: true } as any },
+      { tool_name: "spawn_agent", workspace_path: "/tmp/workspace", tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("max_turns must be a number"),
+    });
+
+    expect(await tool.execute({ task: "bad system prompt", system_prompt: { nested: true } as any })).toBe("Error: system_prompt must be a string.");
+    expect(await tool.execute({ task: "bad timeout", timeout_ms: { nested: true } as any })).toBe("Error: timeout_ms must be a number.");
+    expect(await tool.execute({ task: "bad turns", max_turns: { nested: true } as any })).toBe("Error: max_turns must be a number.");
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-string agent_status selectors instead of stringifying objects into fake ids", async () => {
+    registerSubAgentTool();
+    const tool = getRegistry().lookup("agent_status")!;
+
+    expect(await tool.validateInput?.(
+      { agent_id: { nested: true } as any },
+      { tool_name: "agent_status", workspace_path: "/tmp/workspace", tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("agent_id must be a string"),
+    });
+    expect(await tool.validateInput?.(
+      { nickname: { nested: true } as any },
+      { tool_name: "agent_status", workspace_path: "/tmp/workspace", tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("nickname must be a string"),
+    });
+
+    const result = await getRegistry().lookup("agent_status")!.execute({
+      agent_id: { nested: true } as any,
+    });
+
+    expect(result).toBe("Error: agent_id must be a string.");
+    expect(await getRegistry().lookup("agent_status")!.execute({
+      nickname: { nested: true } as any,
+    })).toBe("Error: nickname must be a string.");
+  });
+
+  it("finds spawned agents by nickname as well as by id", async () => {
+    createMock.mockResolvedValue({
+      choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+    });
+    registerSubAgentTool();
+
+    const spawned = await getRegistry().lookup("spawn_agent")!.execute({
+      task: "check status lookup",
+      task_name: "status lookup",
+    });
+    const nickname = spawned.match(/nickname:\s+([^\n]+)/)?.[1]?.trim();
+
+    expect(nickname).toBe("status_lookup");
+    expect(await getRegistry().lookup("agent_status")!.execute({
+      nickname,
+    })).toContain("status lookup");
+  });
+
+  it("limits rlm_query fan-out to max_children", async () => {
+    createMock.mockResolvedValue({
+      choices: [{ message: { content: "ok" } }],
+    });
+    registerRLMTool();
+
+    const result = await getRegistry().lookup("rlm_query")!.execute({
+      prompts: JSON.stringify([
+        { id: "q1", prompt: "one" },
+        { id: "q2", prompt: "two" },
+        { id: "q3", prompt: "three" },
+      ]),
+      max_children: 2,
+    });
+
+    const parsed = JSON.parse(result) as Array<{ id: string; result: string }>;
+
+    expect(parsed).toHaveLength(2);
+    expect(parsed.map(item => item.id)).toEqual(["q1", "q2"]);
+  });
+
+  it("coerces non-positive rlm_query max_children to the minimum instead of defaulting to eight", async () => {
+    createMock.mockResolvedValue({
+      choices: [{ message: { content: "ok" } }],
+    });
+    registerRLMTool();
+
+    const result = await getRegistry().lookup("rlm_query")!.execute({
+      prompts: JSON.stringify([
+        { id: "q1", prompt: "one" },
+        { id: "q2", prompt: "two" },
+      ]),
+      max_children: 0,
+    });
+
+    const parsed = JSON.parse(result) as Array<{ id: string; result: string }>;
+
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]?.id).toBe("q1");
+  });
+
+  it("rejects malformed rlm_query prompt entries before calling the API", async () => {
+    registerRLMTool();
+
+    const result = await getRegistry().lookup("rlm_query")!.execute({
+      prompts: JSON.stringify([{ id: "q1" }, { prompt: "missing id" }]),
+    });
+
+    expect(result).toContain("each prompt entry must include non-empty id and prompt strings");
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed rlm_query prompt entries during validation instead of deferring them to execution", async () => {
+    registerRLMTool();
+    const tool = getRegistry().lookup("rlm_query")!;
+
+    expect(await tool.validateInput?.(
+      { prompts: JSON.stringify([{ id: "q1" }, { prompt: "missing id" }]) },
+      { tool_name: "rlm_query", workspace_path: "/tmp/workspace", tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("each prompt entry must include non-empty id and prompt strings"),
+    });
+  });
+
+  it("rejects non-string rlm_query prompts before attempting JSON parsing", async () => {
+    registerRLMTool();
+
+    const result = await getRegistry().lookup("rlm_query")!.execute({
+      prompts: { nested: true } as any,
+    });
+
+    expect(result).toContain("prompts must be valid JSON array");
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed rlm_query max_children values instead of silently defaulting fan-out", async () => {
+    registerRLMTool();
+    const tool = getRegistry().lookup("rlm_query")!;
+
+    expect(await tool.validateInput?.(
+      { prompts: JSON.stringify([{ id: "q1", prompt: "one" }]), max_children: { nested: true } as any },
+      { tool_name: "rlm_query", workspace_path: "/tmp/workspace", tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("max_children must be a number"),
+    });
+
+    const result = await tool.execute({
+      prompts: JSON.stringify([{ id: "q1", prompt: "one" }]),
+      max_children: { nested: true } as any,
+    });
+
+    expect(result).toContain("max_children must be a number");
+    expect(createMock).not.toHaveBeenCalled();
+  });
+});

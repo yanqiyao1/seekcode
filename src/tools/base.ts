@@ -164,6 +164,14 @@ export function isToolStaticallyReadOnly(tool: ToolDef): boolean {
   return tool.readOnly === true;
 }
 
+export function isToolStaticallyDestructive(tool: ToolDef): boolean {
+  return tool.destructive === true;
+}
+
+export function isToolStaticallyConcurrencySafe(tool: ToolDef): boolean {
+  return tool.concurrencySafe === true;
+}
+
 function resolveCapability(
   value: ToolCapability | undefined,
   args: Record<string, unknown>,

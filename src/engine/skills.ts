@@ -462,12 +462,12 @@ export async function fetchRegistrySkills(
     .map((item: Record<string, unknown>) => {
       const record = item as Record<string, unknown>;
       return {
-        name: String(record.name || ""),
-        description: record.description ? String(record.description) : undefined,
-        source: record.source ? String(record.source) : undefined,
-        spec: record.spec ? String(record.spec) : undefined,
-        url: record.url ? String(record.url) : undefined,
-        repo: record.repo ? String(record.repo) : undefined,
+        name: typeof record.name === "string" ? record.name : "",
+        description: typeof record.description === "string" ? record.description : undefined,
+        source: typeof record.source === "string" ? record.source : undefined,
+        spec: typeof record.spec === "string" ? record.spec : undefined,
+        url: typeof record.url === "string" ? record.url : undefined,
+        repo: typeof record.repo === "string" ? record.repo : undefined,
       };
     })
     .filter((skill: RemoteSkill) => !!skill.name);
@@ -698,8 +698,10 @@ interface InstallMarker {
 function readInstallMarker(dir: string): InstallMarker | null {
   try {
     const parsed = JSON.parse(readFileSync(join(dir, INSTALLED_FROM_MARKER), "utf-8"));
-    if (!parsed.source || !parsed.checksum) return null;
-    return { source: String(parsed.source), checksum: String(parsed.checksum) };
+    if (!parsed || typeof parsed !== "object") return null;
+    if (typeof parsed.source !== "string" || !parsed.source) return null;
+    if (typeof parsed.checksum !== "string" || !parsed.checksum) return null;
+    return { source: parsed.source, checksum: parsed.checksum };
   } catch {
     return null;
   }

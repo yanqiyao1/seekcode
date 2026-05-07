@@ -40,6 +40,11 @@ export class MCPManager {
   }
 
   async connectOne(serverCfg: MCPConfig): Promise<string> {
+    if (serverCfg.enabled === false) {
+      await this.disconnectOne(serverCfg.name);
+      this.statuses.set(serverCfg.name, { status: "disabled" });
+      return "disabled";
+    }
     await this.disconnectOne(serverCfg.name);
     const client = new MCPClient(serverCfg);
     const log = createArtifact({
@@ -77,6 +82,7 @@ export class MCPManager {
       this.statuses.set(serverCfg.name, { status: "connected", message, tool_count: tools.length, failure_count: this.statuses.get(serverCfg.name)?.failure_count || 0, log_artifact_id: log.id });
       return message;
     } catch (e: any) {
+      await client.disconnect().catch(() => undefined);
       const message = `failed: ${e.message}`;
       const previous = this.statuses.get(serverCfg.name);
       this.statuses.set(serverCfg.name, { status: "failed", message, failure_count: (previous?.failure_count || 0) + 1, log_artifact_id: log.id, stderr_tail: client.getStderrTail() });
@@ -164,13 +170,18 @@ export class MCPManager {
 
   async disconnectOne(name: string): Promise<boolean> {
     const client = this.clients.get(name);
-    if (!client) return false;
-    await client.disconnect();
-    this.clients.delete(name);
-    this.toolFingerprints.delete(name);
     const timer = this.reconnectTimers.get(name);
     if (timer) clearTimeout(timer);
     this.reconnectTimers.delete(name);
+    if (!client) {
+      unregisterMCPTools(name);
+      this.toolFingerprints.delete(name);
+      this.statuses.set(name, { status: "configured" });
+      return false;
+    }
+    await client.disconnect();
+    this.clients.delete(name);
+    this.toolFingerprints.delete(name);
     unregisterMCPTools(name);
     this.statuses.set(name, { status: "configured" });
     return true;
@@ -282,13 +293,40 @@ function unregisterMCPTools(serverName: string): void {
 }
 
 function normalizeServers(value: unknown): MCPConfig[] {
-  return Array.isArray(value) ? value.map(item => ({
-    name: String((item as any).name || ""),
-    transport: ((item as any).transport || "stdio") as MCPConfig["transport"],
-    command: (item as any).command ? String((item as any).command) : undefined,
-    args: Array.isArray((item as any).args) ? (item as any).args.map(String) : [],
-    url: (item as any).url ? String((item as any).url) : undefined,
-    env: typeof (item as any).env === "object" && (item as any).env ? (item as any).env as Record<string, string> : {},
-    enabled: (item as any).enabled !== false,
-  })).filter(server => server.name) : [];
+  if (!Array.isArray(value)) return [];
+  const servers: MCPConfig[] = [];
+  for (const item of value) {
+    const server = normalizeServerRecord(item);
+    if (server) servers.push(server);
+  }
+  return servers;
+}
+
+function normalizeServerEnv(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const env: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry === "string") env[key] = entry;
+  }
+  return env;
+}
+
+function normalizeServerRecord(value: unknown): MCPConfig | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const name = typeof record.name === "string" && record.name.trim() ? record.name : null;
+  if (!name) return null;
+  const url = typeof record.url === "string" && record.url.trim() ? record.url : undefined;
+  const transport: MCPConfig["transport"] = record.transport === "sse" ? "sse" : "stdio";
+  return {
+    name,
+    transport,
+    command: typeof record.command === "string" && record.command.trim() ? record.command : undefined,
+    args: Array.isArray(record.args)
+      ? record.args.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+      : [],
+    url,
+    env: normalizeServerEnv(record.env),
+    enabled: record.enabled !== false,
+  };
 }

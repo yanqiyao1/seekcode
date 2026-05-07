@@ -1,6 +1,14 @@
 /** Global tool registry singleton. */
 
-import { isToolConcurrencySafe, isToolDestructive, isToolReadOnly, type ToolDef } from "./base.js";
+import {
+  isToolConcurrencySafe,
+  isToolDestructive,
+  isToolReadOnly,
+  isToolStaticallyConcurrencySafe,
+  isToolStaticallyDestructive,
+  isToolStaticallyReadOnly,
+  type ToolDef,
+} from "./base.js";
 import { toolToOpenAISchema } from "./base.js";
 
 const ALWAYS_ACTIVE_TOOLS = new Set([
@@ -108,12 +116,13 @@ export class ToolRegistry {
     const normalized = text.toLowerCase();
     const activated: string[] = [];
     for (const tool of this.listAll()) {
+      if (activated.length >= 8) break;
       if (this.activeToolNames.has(tool.name) || this.disabledReasons.has(tool.name)) continue;
       const haystack = toolSearchText(tool);
       if (!haystack.split(/[_\s-]+/).some(term => term.length >= 4 && normalized.includes(term))) continue;
       if (this.activate(tool.name)) activated.push(tool.name);
     }
-    return activated.slice(0, 8);
+    return activated;
   }
 
   recordCall(name: string, ok: boolean, durationMs: number): ToolStats {
@@ -168,9 +177,9 @@ export class ToolRegistry {
       }),
       active: this.activeToolNames.has(tool.name),
       disabled_reason: this.disabledReasons.get(tool.name),
-      read_only: isToolReadOnly(tool),
-      destructive: isToolDestructive(tool),
-      concurrency_safe: isToolConcurrencySafe(tool),
+      read_only: isToolStaticallyReadOnly(tool),
+      destructive: isToolStaticallyDestructive(tool),
+      concurrency_safe: isToolStaticallyConcurrencySafe(tool),
       search_hint: tool.searchHint,
       max_result_size_chars: tool.maxResultSizeChars,
     }));
@@ -267,8 +276,8 @@ function toolSearchText(tool: ToolDef): string {
     tool.description,
     tool.category,
     tool.resultKind || "",
-    isToolReadOnly(tool) ? "read-only readonly safe" : "",
-    isToolDestructive(tool) ? "destructive mutating mutation" : "",
+    isToolStaticallyReadOnly(tool) ? "read-only readonly safe" : "",
+    isToolStaticallyDestructive(tool) ? "destructive mutating mutation" : "",
     JSON.stringify(tool.parameters),
   ].join(" ").toLowerCase();
 }

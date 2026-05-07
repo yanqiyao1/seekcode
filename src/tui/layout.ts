@@ -34,7 +34,7 @@ export class TuiLayout {
   visibleTranscriptRows(options: LayoutRenderOptions, rows: number, cols: number): number {
     const size = { rows: Math.max(6, rows), cols: Math.max(20, cols) };
     const completionLines = (options.completions ?? []).slice(0, this.completionLimit(options, size.rows));
-    const inputLines = this.inputLines(options.prompt, options.input ?? "", size.cols);
+    const inputLines = this.inputRows(options.prompt, options.input ?? "", options.cursor ?? (options.input ?? "").length, size.cols);
     const statusRows = options.statusLine ? 1 : 0;
     const reservedRows = 2 + statusRows + completionLines.length + inputLines.length;
     const maxTranscriptRows = Math.max(0, size.rows - reservedRows);
@@ -74,7 +74,10 @@ export class TuiLayout {
     const [dividerLine = "", statusLine = ""] = options.footer.split("\n").slice(0, 2);
 
     const completionLines = (options.completions ?? []).slice(0, this.completionLimit(options, size.rows));
-    const inputLines = this.inputLines(options.prompt, options.input ?? "", size.cols);
+    const inputValue = options.input ?? "";
+    const inputCursor = options.cursor ?? inputValue.length;
+    const inputView = this.inputView(options.prompt, inputValue, inputCursor, size.cols);
+    const inputLines = inputView.rows;
     const transcriptRows = this.visibleTranscriptRows(options, size.rows, size.cols);
     const fixedStatusLine = options.statusLine ? fitAnsi(options.statusLine, size.cols) : null;
 
@@ -91,8 +94,8 @@ export class TuiLayout {
 
     const cursor = this.cursorPosition(
       options.prompt,
-      options.input ?? "",
-      options.cursor ?? 0,
+      inputValue,
+      inputCursor,
       size.cols,
       inputBottomRow,
     );
@@ -111,7 +114,10 @@ export class TuiLayout {
     this.lastInlineWidth = size.cols;
 
     const completionLines = (options.completions ?? []).slice(0, this.completionLimit(options, size.rows));
-    const inputLines = this.inputLines(options.prompt, options.input ?? "", size.cols);
+    const inputValue = options.input ?? "";
+    const inputCursor = options.cursor ?? inputValue.length;
+    const inputView = this.inputView(options.prompt, inputValue, inputCursor, size.cols);
+    const inputLines = inputView.rows;
     const transcriptRows = this.visibleTranscriptRows(options, size.rows, size.cols);
     const totalWrappedRows = this.transcript.desiredHeight(size.cols);
     const fixedStatusLine = options.statusLine ? fitAnsi(options.statusLine, size.cols) : null;
@@ -154,8 +160,8 @@ export class TuiLayout {
     const inputBottomRow = transcriptOutput.length + 1 + completionLines.length + (fixedStatusLine ? 1 : 0) + inputLines.length;
     const cursor = this.cursorPosition(
       options.prompt,
-      options.input ?? "",
-      options.cursor ?? 0,
+      inputValue,
+      inputCursor,
       size.cols,
       inputBottomRow,
     );
@@ -181,32 +187,16 @@ export class TuiLayout {
     if (this.lastInlineRows > 1) process.stdout.write(`\x1b[${this.lastInlineRows - 1}A`);
   }
 
-  private inputLines(prompt: string, input: string, cols: number): string[] {
-    const rows: string[] = [];
-    const logicalLines = input.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-    for (let index = 0; index < logicalLines.length; index++) {
-      const prefix = index === 0 ? prompt : " ".repeat(visibleLength(prompt));
-      rows.push(...wrapAnsiLine(prefix + logicalLines[index], cols));
-    }
-    return rows.slice(-3);
+  private inputRows(prompt: string, input: string, cursor: number, cols: number): string[] {
+    return this.inputView(prompt, input, cursor, cols).rows;
   }
 
   cursorPosition(prompt: string, input: string, cursor: number, cols: number, rows: number): { row: number; col: number } {
-    const beforeCursor = input.slice(0, cursor).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    const logicalBeforeCursor = beforeCursor.split("\n");
-    let promptInputRows = 0;
-    for (let index = 0; index < logicalBeforeCursor.length; index++) {
-      const prefix = index === 0 ? prompt : " ".repeat(visibleLength(prompt));
-      promptInputRows += wrapAnsiLine(prefix + logicalBeforeCursor[index], cols).length;
-    }
-
-    const promptWidth = visibleLength(prompt);
-    const currentLogicalLine = logicalBeforeCursor.at(-1) ?? "";
-    const width = promptWidth + visibleLength(currentLogicalLine);
-    const visibleRows = Math.min(3, Math.max(1, promptInputRows));
-    const row = rows - visibleRows + Math.min(visibleRows, Math.max(1, promptInputRows));
-    const col = (width % cols) + 1;
-    return { row, col };
+    const view = this.inputView(prompt, input, cursor, cols);
+    return {
+      row: rows - view.rows.length + view.cursorRow,
+      col: view.cursorCol,
+    };
   }
 
   private maxCompletions(rows: number): number {
@@ -216,5 +206,40 @@ export class TuiLayout {
   private completionLimit(options: LayoutRenderOptions, rows: number): number {
     if (options.completionLimit === undefined) return this.maxCompletions(rows);
     return Math.max(0, Math.min(Math.floor(options.completionLimit), rows - 3));
+  }
+
+  private inputView(prompt: string, input: string, cursor: number, cols: number): { rows: string[]; cursorRow: number; cursorCol: number } {
+    const normalizedInput = input.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const logicalLines = normalizedInput.split("\n");
+    const promptPadding = " ".repeat(visibleLength(prompt));
+    const allRows: string[] = [];
+    for (let index = 0; index < logicalLines.length; index++) {
+      const prefix = index === 0 ? prompt : promptPadding;
+      allRows.push(...wrapAnsiLine(prefix + logicalLines[index], cols));
+    }
+
+    const safeCursor = Math.max(0, Math.min(cursor, input.length));
+    const beforeCursor = input.slice(0, safeCursor).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const logicalBeforeCursor = beforeCursor.split("\n");
+    let cursorRowAbsolute = 0;
+    for (let index = 0; index < logicalBeforeCursor.length; index++) {
+      const prefix = index === 0 ? prompt : promptPadding;
+      cursorRowAbsolute += wrapAnsiLine(prefix + logicalBeforeCursor[index], cols).length;
+    }
+
+    const promptWidth = visibleLength(prompt);
+    const currentLogicalLine = logicalBeforeCursor.at(-1) ?? "";
+    const width = promptWidth + visibleLength(currentLogicalLine);
+    const cursorCol = (width % cols) + 1;
+
+    const visibleCount = Math.min(3, Math.max(1, allRows.length));
+    const maxStart = Math.max(0, allRows.length - visibleCount);
+    const windowStart = Math.min(Math.max(0, cursorRowAbsolute - visibleCount), maxStart);
+
+    return {
+      rows: allRows.slice(windowStart, windowStart + visibleCount),
+      cursorRow: Math.max(1, cursorRowAbsolute - windowStart),
+      cursorCol,
+    };
   }
 }

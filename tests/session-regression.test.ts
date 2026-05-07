@@ -248,6 +248,51 @@ describe("session store", () => {
       arguments: { command: "echo hi" },
     }]);
   });
+
+  it("skips malformed persisted session string fields instead of rehydrating [object Object] content and artifact ids", () => {
+    const sessionsDir = join(tmp, "seekcode", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "malformed-session.json"), JSON.stringify({
+      ...createSession({ id: "ignored-by-fallback" }),
+      id: { nested: true },
+      title: "Malformed persisted session",
+      messages: [
+        { role: "user", content: { nested: true } },
+        {
+          role: "assistant",
+          content: "kept",
+          tool_calls: [{ id: "call_1", name: "read", arguments: { path: "ok.txt" } }],
+        },
+      ],
+      turns: [
+        {
+          index: 1,
+          user_message: "hi",
+          assistant_messages: [{ role: "assistant", content: { nested: true } }],
+          tool_calls: [],
+          tool_results: [{ tool_call_id: "call_1", name: "read", content: { nested: true }, is_error: false }],
+          artifact_ids: ["art-1", { nested: true }, ""],
+        },
+      ],
+      artifact_index: {
+        session: ["art-1", { nested: true }, ""],
+        "turn:1": [{ nested: true }],
+      },
+    }), "utf-8");
+
+    const loaded = loadSession("malformed-session")!;
+
+    expect(loaded.id).toBe("malformed-session");
+    expect(loaded.messages).toEqual([
+      { role: "user", content: null, tool_calls: null, tool_call_id: null, name: null, reasoning_content: null, is_error: null },
+      expect.objectContaining({ role: "assistant", content: "kept" }),
+    ]);
+    expect(loaded.turns[0].assistant_messages[0].content).toBeNull();
+    expect(loaded.turns[0].tool_results[0].content).toBe("");
+    expect(loaded.turns[0].artifact_ids).toEqual(["art-1"]);
+    expect(loaded.artifact_index).toEqual({ session: ["art-1"], "turn:1": [] });
+    expect(JSON.stringify(loaded)).not.toContain("[object Object]");
+  });
 });
 
 describe("API serialization", () => {

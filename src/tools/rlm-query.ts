@@ -6,13 +6,50 @@ import { getRegistry } from "./registry.js";
 
 interface RLMQuery { id: string; prompt: string; system?: string; }
 
+function validateOptionalFiniteNumber(value: unknown, key: "max_children"): string | null {
+  if (value === undefined) return null;
+  if (typeof value !== "number" || !Number.isFinite(value)) return `${key} must be a number.`;
+  return null;
+}
+
+function parsePrompts(promptsStr: string): { queries?: RLMQuery[]; error?: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(promptsStr);
+  } catch {
+    return { error: "Error: prompts must be valid JSON array" };
+  }
+  if (!Array.isArray(parsed)) return { error: "Error: prompts must be a JSON array" };
+  const queries: RLMQuery[] = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== "object") {
+      return { error: "Error: each prompt entry must include non-empty id and prompt strings" };
+    }
+    const record = entry as Record<string, unknown>;
+    const id = typeof record.id === "string" ? record.id.trim() : "";
+    const prompt = typeof record.prompt === "string" ? record.prompt.trim() : "";
+    if (!id || !prompt) {
+      return { error: "Error: each prompt entry must include non-empty id and prompt strings" };
+    }
+    queries.push({
+      id,
+      prompt,
+      ...(typeof record.system === "string" ? { system: record.system } : {}),
+    });
+  }
+  return { queries };
+}
+
 async function rlmQuery(args: Record<string, unknown>): Promise<string> {
-  const promptsStr = args.prompts as string;
-  const maxChildren = Math.max(1, Math.min((args.max_children as number) || 8, 16));
-  let queries: RLMQuery[];
-  try { queries = JSON.parse(promptsStr); } catch { return "Error: prompts must be valid JSON array"; }
-  if (!Array.isArray(queries)) return "Error: prompts must be a JSON array";
-  queries = queries.slice(0, 16);
+  if (typeof args.prompts !== "string") return "Error: prompts must be valid JSON array";
+  const maxChildrenError = validateOptionalFiniteNumber(args.max_children, "max_children");
+  if (maxChildrenError) return `Error: ${maxChildrenError}`;
+  const promptsStr = args.prompts;
+  const maxChildren = normalizeMaxChildren(args.max_children);
+  const parsed = parsePrompts(promptsStr);
+  if (parsed.error) return parsed.error;
+  let queries = parsed.queries!;
+  queries = queries.slice(0, maxChildren);
 
   const apiKey = process.env.DEEPSEEK_API_KEY || "";
   const baseUrl = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
@@ -33,10 +70,24 @@ async function rlmQuery(args: Record<string, unknown>): Promise<string> {
   return JSON.stringify(results, null, 2);
 }
 
+function normalizeMaxChildren(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 8;
+  return Math.max(1, Math.min(Math.floor(parsed), 16));
+}
+
 export function registerRLMTool(): void {
   getRegistry().register({
     name: "rlm_query", description: "Fan out parallel reasoning queries (1-16 children) to a fast model.",
     parameters: { type: "object", properties: { prompts: { type: "string", description: "JSON array of {id, prompt, system?}" }, max_children: { type: "integer", default: 8 } }, required: ["prompts"] },
     execute: rlmQuery, permission: PermissionLevel.ALWAYS_ALLOW, category: "meta", parallelOk: true,
+    validateInput: (args) => {
+      if (typeof args.prompts !== "string") return { ok: false as const, message: "prompts must be valid JSON array" };
+      const maxChildrenError = validateOptionalFiniteNumber(args.max_children, "max_children");
+      if (maxChildrenError) return { ok: false as const, message: maxChildrenError };
+      const parsed = parsePrompts(args.prompts);
+      if (parsed.error) return { ok: false as const, message: parsed.error.replace(/^Error:\s*/, "") };
+      return { ok: true as const, args };
+    },
   });
 }

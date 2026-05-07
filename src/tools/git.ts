@@ -15,18 +15,112 @@ function runGit(args: string[], workdir = "."): string {
 
 function splitFiles(files: unknown): string[] {
   if (!files) return [];
-  if (Array.isArray(files)) return files.map(String).filter(Boolean);
-  const value = String(files).trim();
+  if (Array.isArray(files)) {
+    return files
+      .filter((value): value is string => typeof value === "string")
+      .map(value => value.trim())
+      .filter(Boolean);
+  }
+  if (typeof files !== "string") return [];
+  const value = files.trim();
   return value ? [value] : [];
 }
 
-async function gitStatus(a: Record<string, unknown>): Promise<string> { return runGit(["status", "--short"], (a.workdir as string) || "."); }
-async function gitDiff(a: Record<string, unknown>): Promise<string> {
-  const args = ["diff"]; if (a.staged) args.push("--staged"); args.push("--", ...splitFiles(a.files));
-  return runGit(args, (a.workdir as string) || ".");
+function resolveWorkdir(args: Record<string, unknown>): string {
+  if (typeof args.workdir === "string" && args.workdir.trim()) return args.workdir.trim();
+  if (typeof args.cwd === "string" && args.cwd.trim()) return args.cwd.trim();
+  return ".";
 }
-async function gitLog(a: Record<string, unknown>): Promise<string> { return runGit(["log", `-${a.n || 10}`, "--oneline", "--decorate"], (a.workdir as string) || "."); }
-async function gitBranch(a: Record<string, unknown>): Promise<string> { return runGit(["branch", "--list"], (a.workdir as string) || "."); }
+
+function normalizeWorkdirArg(args: Record<string, unknown>): { ok: true; workdir?: string } | { ok: false; message: string } {
+  const workdir = args.workdir ?? args.cwd;
+  if (workdir !== undefined && typeof workdir !== "string") return { ok: false, message: "workdir must be a string" };
+  if (typeof workdir === "string" && workdir.trim()) return { ok: true, workdir: workdir.trim() };
+  return { ok: true };
+}
+
+function normalizeFilesArg(files: unknown): { ok: true; files: string[] } | { ok: false; message: string } {
+  if (files === undefined) return { ok: true, files: [] };
+  if (typeof files === "string") {
+    const value = files.trim();
+    return { ok: true, files: value ? [value] : [] };
+  }
+  if (!Array.isArray(files) || files.some(value => typeof value !== "string")) {
+    return { ok: false, message: "files must be a string or array of strings" };
+  }
+  return {
+    ok: true,
+    files: files.map(value => value.trim()).filter(Boolean),
+  };
+}
+
+function normalizePositiveIntArg(value: unknown, key: string): { ok: true; value?: number } | { ok: false; message: string } {
+  if (value === undefined) return { ok: true };
+  const parsed = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+  if (!Number.isInteger(parsed) || parsed <= 0) return { ok: false, message: `${key} must be a positive integer` };
+  return { ok: true, value: parsed };
+}
+
+function normalizeBooleanArg(value: unknown, key: string): { ok: true; value?: boolean } | { ok: false; message: string } {
+  if (value === undefined) return { ok: true };
+  return typeof value === "boolean"
+    ? { ok: true, value }
+    : { ok: false, message: `${key} must be a boolean` };
+}
+
+function validateGitArgs(
+  args: Record<string, unknown>,
+  options: { files?: boolean; n?: boolean; staged?: boolean } = {},
+): { ok: true; args: Record<string, unknown> } | { ok: false; message: string } {
+  const workdir = normalizeWorkdirArg(args);
+  if (!workdir.ok) return workdir;
+  const normalized: Record<string, unknown> = { ...args };
+  if (workdir.workdir !== undefined) normalized.workdir = workdir.workdir;
+
+  if (options.files) {
+    const files = normalizeFilesArg(args.files);
+    if (!files.ok) return files;
+    if (args.files !== undefined) normalized.files = Array.isArray(args.files) ? files.files : files.files[0] || "";
+  }
+
+  if (options.n) {
+    const count = normalizePositiveIntArg(args.n, "n");
+    if (!count.ok) return count;
+    if (count.value !== undefined) normalized.n = count.value;
+  }
+
+  if (options.staged) {
+    const staged = normalizeBooleanArg(args.staged, "staged");
+    if (!staged.ok) return staged;
+    if (staged.value !== undefined) normalized.staged = staged.value;
+  }
+
+  return { ok: true, args: normalized };
+}
+
+async function gitStatus(a: Record<string, unknown>): Promise<string> {
+  const normalized = validateGitArgs(a);
+  if (!normalized.ok) return `Error: ${normalized.message}`;
+  return runGit(["status", "--short"], resolveWorkdir(normalized.args));
+}
+async function gitDiff(a: Record<string, unknown>): Promise<string> {
+  const normalized = validateGitArgs(a, { files: true, staged: true });
+  if (!normalized.ok) return `Error: ${normalized.message}`;
+  const args = ["diff"];
+  if (normalized.args.staged === true) args.push("--staged");
+  args.push("--", ...splitFiles(normalized.args.files));
+  return runGit(args, resolveWorkdir(normalized.args));
+}
+async function gitLog(a: Record<string, unknown>): Promise<string> {
+  const normalized = validateGitArgs(a, { n: true });
+  if (!normalized.ok) return `Error: ${normalized.message}`;
+  return runGit(["log", `-${normalized.args.n || 10}`, "--oneline", "--decorate"], resolveWorkdir(normalized.args));
+}
+async function gitBranch(a: Record<string, unknown>): Promise<string> {
+  const normalized = validateGitArgs(a);
+  if (!normalized.ok) return `Error: ${normalized.message}`;
+  return runGit(["branch", "--list"], resolveWorkdir(normalized.args));
+}
 
 export function registerGitTools(): void {
   const r = getRegistry();
@@ -35,13 +129,27 @@ export function registerGitTools(): void {
     parameters: { type: "object", properties: { workdir: { type: "string", default: "." } } },
     execute: gitStatus, permission: PermissionLevel.ALWAYS_ALLOW, category: "git", parallelOk: true,
     readOnly: true, searchHint: "working tree status", resultKind: "text",
+    validateInput: (args) => validateGitArgs(args),
     isSearchOrReadCommand: () => ({ isSearch: false, isRead: true, isList: true }),
   });
   r.register({
     name: "git_diff", description: "Show git diff.",
-    parameters: { type: "object", properties: { staged: { type: "boolean", default: false }, files: { type: "string", default: "" }, workdir: { type: "string", default: "." } } },
+    parameters: {
+      type: "object",
+      properties: {
+        staged: { type: "boolean", default: false },
+        files: {
+          oneOf: [
+            { type: "string", default: "" },
+            { type: "array", items: { type: "string" } },
+          ],
+        },
+        workdir: { type: "string", default: "." },
+      },
+    },
     execute: gitDiff, permission: PermissionLevel.ALWAYS_ALLOW, category: "git", parallelOk: true,
     readOnly: true, searchHint: "diff local changes", resultKind: "diff", maxResultSizeChars: 100_000,
+    validateInput: (args) => validateGitArgs(args, { files: true, staged: true }),
     isSearchOrReadCommand: () => ({ isSearch: false, isRead: true }),
   });
   r.register({
@@ -49,6 +157,7 @@ export function registerGitTools(): void {
     parameters: { type: "object", properties: { n: { type: "integer", default: 10 }, workdir: { type: "string", default: "." } } },
     execute: gitLog, permission: PermissionLevel.ALWAYS_ALLOW, category: "git", parallelOk: true,
     readOnly: true, searchHint: "commit history", resultKind: "text",
+    validateInput: (args) => validateGitArgs(args, { n: true }),
     isSearchOrReadCommand: () => ({ isSearch: false, isRead: true, isList: true }),
   });
   r.register({
@@ -56,6 +165,7 @@ export function registerGitTools(): void {
     parameters: { type: "object", properties: { workdir: { type: "string", default: "." } } },
     execute: gitBranch, permission: PermissionLevel.ALWAYS_ALLOW, category: "git", parallelOk: true,
     readOnly: true, searchHint: "list branches", resultKind: "text",
+    validateInput: (args) => validateGitArgs(args),
     isSearchOrReadCommand: () => ({ isSearch: false, isRead: false, isList: true }),
   });
 }

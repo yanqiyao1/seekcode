@@ -40,6 +40,7 @@ import { clearPlanState, formatTodoState } from "./tools/plan.js";
 import { clearGoalState } from "./tools/goal.js";
 import { clearAgentState } from "./tools/sub-agent.js";
 import { getApprovalCache, clearApprovalCache, DenialReason } from "./tools/approval-cache.js";
+import { applyApprovalChoice } from "./tools/approval-session.js";
 import { getTaskManager, clearTaskManager } from "./engine/task-lifecycle.js";
 import {
   activateSkill,
@@ -50,7 +51,7 @@ import {
   uninstallSkill,
   updateSkill,
 } from "./engine/skills.js";
-import { checkPermission, rememberAlwaysAllow, rememberAlwaysDeny, clearAll as clearPermissions, getAllRules, getSessionMemory } from "./tools/permission-ruleset.js";
+import { checkPermission, rememberAlwaysAllow, clearAll as clearPermissions, getAllRules, getSessionMemory } from "./tools/permission-ruleset.js";
 
 // Register all tools
 import { registerFileTools } from "./tools/file-ops.js";
@@ -528,16 +529,14 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
           }
 
           if (choice === "always") {
-            cache.rememberApproval(toolName, "always", args as Record<string, unknown>);
-            rememberAlwaysAllow(toolName);
-            transcript.append(p.success(`  Approved ${toolName} for this session.`));
+            const outcome = applyApprovalChoice(toolName, args as Record<string, unknown>, "always");
+            transcript.append(p.success(`  ${outcome.message}`));
           } else if (choice === "once") {
-            cache.rememberApproval(toolName, "once", args as Record<string, unknown>);
-            transcript.append(p.success(`  Approved ${toolName} once.`));
+            const outcome = applyApprovalChoice(toolName, args as Record<string, unknown>, "once");
+            transcript.append(p.success(`  ${outcome.message}`));
           } else if (choice === "deny") {
-            cache.rememberDenial(toolName, DenialReason.USER_DENIED, args as Record<string, unknown>);
-            rememberAlwaysDeny(toolName);
-            transcript.append(p.warning(`  Denied ${toolName}.`));
+            const outcome = applyApprovalChoice(toolName, args as Record<string, unknown>, "deny");
+            transcript.append(p.warning(`  ${outcome.message}`));
           }
 
           renderScreen();

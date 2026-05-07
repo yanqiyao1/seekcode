@@ -35,7 +35,8 @@ function readSessionDirs(): string[] {
 }
 
 function safeSessionId(sessionId: unknown): string {
-  return basename(String(sessionId || ""))
+  if (typeof sessionId !== "string") return "";
+  return basename(sessionId)
     .replace(/\.json$/i, "")
     .replace(/[^a-zA-Z0-9._-]/g, "")
     .slice(0, 128);
@@ -47,7 +48,7 @@ function numberOrZero(value: unknown): number {
 
 function stringOrNull(value: unknown): string | null {
   if (value === null || value === undefined) return null;
-  return typeof value === "string" ? value : String(value);
+  return typeof value === "string" ? value : null;
 }
 
 function normalizeToolCall(raw: unknown): ToolCall | null {
@@ -119,7 +120,7 @@ function normalizeTurn(raw: unknown, index: number): Turn | null {
     tokens_out: numberOrZero(record.tokens_out),
     cost: numberOrZero(record.cost),
     duration_s: numberOrZero(record.duration_s),
-    artifact_ids: Array.isArray(record.artifact_ids) ? record.artifact_ids.map(String).filter(Boolean) : [],
+    artifact_ids: stringArray(record.artifact_ids),
   };
 }
 
@@ -161,9 +162,15 @@ function normalizeArtifactIndex(value: unknown): Record<string, string[]> {
   const result: Record<string, string[]> = {};
   for (const [key, raw] of Object.entries(value)) {
     if (!Array.isArray(raw)) continue;
-    result[key] = raw.map(String).filter(Boolean);
+    result[key] = raw.filter((item): item is string => typeof item === "string" && item.length > 0);
   }
   return result;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : [];
 }
 
 function sessionSortTime(session: Pick<Session, "updated_at">, mtimeMs = 0): number {

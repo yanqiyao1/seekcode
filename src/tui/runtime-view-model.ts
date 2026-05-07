@@ -305,7 +305,9 @@ export class TuiRuntimeViewModel {
   }
 
   private renderToolProgress(event: Extract<EngineRuntimeEvent, { type: "tool_progress" }>): void {
-    const message = event.rendered?.preview || event.data.progress.message;
+    const message = typeof event.rendered?.preview === "string" && event.rendered.preview
+      ? event.rendered.preview
+      : event.data.progress.message;
     const line = r.toolCallStatus(event.data.tool, "running", message);
     const activeToolLine = this.activeToolLines.current(event.data.tool);
     if (activeToolLine !== undefined) this.transcript.replaceLine(activeToolLine, line);
@@ -315,24 +317,27 @@ export class TuiRuntimeViewModel {
   }
 
   private renderContextIntervention(data: unknown): void {
-    const value = data as { risk?: string; action?: string; reason?: string; compaction?: { message?: string } };
-    this.transcript.append(p.dim(`\nContext guard: ${value.risk || "unknown"} / ${value.action || "intervention"} — ${value.reason || "capacity intervention"}.\n`));
-    if (value.compaction?.message) this.transcript.append(p.dim(value.compaction.message + "\n"));
+    const value = asRecord(data);
+    const compaction = asRecord(value?.compaction);
+    const risk = asString(value?.risk) ?? "unknown";
+    const action = asString(value?.action) ?? "intervention";
+    const reason = asString(value?.reason) ?? "capacity intervention";
+    this.transcript.append(p.dim(`\nContext guard: ${risk} / ${action} — ${reason}.\n`));
+    if (typeof compaction?.message === "string" && compaction.message) {
+      this.transcript.append(p.dim(compaction.message + "\n"));
+    }
     this.options.renderNow?.();
   }
 
   private renderPrefixInvalidated(data: unknown): void {
-    const value = data as {
-      reason?: string;
-      boundary_id?: string;
-      compaction?: { finalTokens?: number; removed_messages?: number; preserved_messages?: number };
-    };
+    const value = asRecord(data);
+    const compaction = asRecord(value?.compaction);
     const parts = [
-      `Prompt cache reset: ${value.reason || "unknown"}`,
-      value.boundary_id ? `boundary ${value.boundary_id}` : null,
-      typeof value.compaction?.removed_messages === "number" ? `${value.compaction.removed_messages} summarized` : null,
-      typeof value.compaction?.preserved_messages === "number" ? `${value.compaction.preserved_messages} recent kept` : null,
-      typeof value.compaction?.finalTokens === "number" ? `${value.compaction.finalTokens.toLocaleString()} projected tokens` : null,
+      `Prompt cache reset: ${asString(value?.reason) ?? "unknown"}`,
+      typeof value?.boundary_id === "string" && value.boundary_id ? `boundary ${value.boundary_id}` : null,
+      typeof compaction?.removed_messages === "number" ? `${compaction.removed_messages} summarized` : null,
+      typeof compaction?.preserved_messages === "number" ? `${compaction.preserved_messages} recent kept` : null,
+      typeof compaction?.finalTokens === "number" ? `${compaction.finalTokens.toLocaleString()} projected tokens` : null,
     ].filter(Boolean);
     this.transcript.append(p.dim(parts.join(" | ") + "\n"));
     this.options.renderNow?.();
@@ -454,4 +459,14 @@ export class TuiRuntimeViewModel {
     if (!changed) return;
     this.store.setState({ ...previous, ...patch });
   }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
 }

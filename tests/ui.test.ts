@@ -67,6 +67,19 @@ describe("Transcript", () => {
     expect(transcript.lines.map(line => line.text)).toEqual(["hello world", "next"]);
   });
 
+  it("clears transcript content and scroll state", () => {
+    const transcript = new Transcript();
+    transcript.append("hello\nworld");
+    transcript.render(1, 10);
+    transcript.scrollUp(1);
+
+    transcript.clear();
+
+    expect(transcript.lines).toEqual([]);
+    expect(transcript.scrollOffset).toBe(0);
+    expect(transcript.desiredHeight(10)).toBe(0);
+  });
+
   it("renders short transcript from the top", () => {
     const transcript = new Transcript();
     transcript.append("abcdef");
@@ -75,6 +88,11 @@ describe("Transcript", () => {
     expect(rendered).toHaveLength(2);
     expect(stripAnsi(rendered[0])).toBe("abc");
     expect(rendered.every(line => visibleLength(line) === 3)).toBe(true);
+  });
+
+  it("renders empty transcripts as padded blank rows", () => {
+    const transcript = new Transcript();
+    expect(transcript.render(2, 4).split("\n")).toEqual(["    ", "    "]);
   });
 
   it("reports wrapped content height", () => {
@@ -183,6 +201,18 @@ describe("Transcript", () => {
     expect(transcript.desiredHeight(2)).toBe(5);
     expect(transcript.maxScrollOffset(1, 2)).toBe(4);
   });
+
+  it("ignores out-of-range line replacements and empty wrapped row windows", () => {
+    const transcript = new Transcript();
+    transcript.append("alpha");
+
+    transcript.replaceLine(-1, "nope");
+    transcript.replaceLine(5, "nope");
+
+    expect(transcript.lines.map(line => line.text)).toEqual(["alpha"]);
+    expect(transcript.wrappedRowsRange(5, 3, 3)).toEqual([]);
+    expect(transcript.wrappedRowsRange(5, 4, 2)).toEqual([]);
+  });
 });
 
 describe("AssistantStream", () => {
@@ -235,6 +265,16 @@ describe("AssistantStream", () => {
     stream.append(transcript, "second");
 
     expect(transcript.lines.map(line => line.text)).toEqual(["first", "second"]);
+  });
+
+  it("reuses an existing blank transcript line for the first streamed chunk", () => {
+    const transcript = new Transcript();
+    transcript.append("");
+    const stream = new AssistantStream();
+
+    stream.append(transcript, "hello");
+
+    expect(transcript.lines.map(line => stripAnsi(line.text))).toEqual(["hello"]);
   });
 });
 
@@ -447,6 +487,98 @@ describe("TuiRuntimeViewModel", () => {
     expect(plain).toContain("write");
     expect(plain).toContain("Approval required");
     expect(plain).toContain("draft.txt");
+  });
+
+  it("ignores unknown runtime item types during replay conversion", () => {
+    const events = runtimeItemsToEngineRuntimeEvents([
+      { type: "mystery", data: { value: 1 } },
+      { type: "content_delta", data: { text: "kept" } },
+    ]);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: "content_delta", data: { text: "kept" } });
+  });
+
+  it("does not replay malformed persisted runtime items as [object Object] transcript content", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+    const events = runtimeItemsToEngineRuntimeEvents([
+      { type: "user_message", data: { text: { nested: true } as any } },
+      { type: "tool_call_begin", data: { name: { nested: true } as any, tool_call_id: "call-1" } },
+      { type: "approval_required", data: { tool: { nested: true } as any, args: { path: "draft.txt" } } },
+      { type: "content_delta", data: { text: "kept" } },
+    ]);
+
+    view.replayRuntimeEvents(events);
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+
+    expect(plain).toContain("kept");
+    expect(plain).not.toContain("[object Object]");
+    expect(plain).not.toContain("draft.txt");
+  });
+
+  it("sanitizes malformed replayed context and prefix runtime items instead of rendering object coercions", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+    const events = runtimeItemsToEngineRuntimeEvents([
+      {
+        type: "context_intervention",
+        data: {
+          risk: { nested: true } as any,
+          action: ["verify"] as any,
+          reason: { nested: true } as any,
+          compaction: { message: { nested: true } as any },
+        },
+      },
+      {
+        type: "prefix_invalidated",
+        data: {
+          reason: { nested: true } as any,
+          boundary_id: { nested: true } as any,
+          compaction: {
+            finalTokens: "900" as any,
+            removed_messages: { nested: true } as any,
+            preserved_messages: ["3"] as any,
+          },
+        },
+      },
+      { type: "content_delta", data: { text: "kept" } },
+    ]);
+
+    view.replayRuntimeEvents(events);
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+
+    expect(plain).toContain("Context guard: unknown / intervention");
+    expect(plain).toContain("Prompt cache reset: unknown");
+    expect(plain).toContain("kept");
+    expect(plain).not.toContain("[object Object]");
+    expect(plain).not.toContain("boundary [object Object]");
+    expect(plain).not.toContain("900 projected tokens");
+  });
+
+  it("marks tool replay results as errors when persisted content is denial text", () => {
+    const events = sessionMessagesToRuntimeEvents([
+      {
+        role: "tool",
+        content: "write was denied.",
+        tool_calls: null,
+        tool_call_id: "call-1",
+        name: "write",
+        reasoning_content: null,
+        is_error: null,
+      },
+    ]);
+
+    expect(events).toMatchObject([
+      {
+        type: "tool_result",
+        data: {
+          tool_call_id: "call-1",
+          name: "write",
+          is_error: true,
+        },
+      },
+    ]);
   });
 });
 
@@ -779,6 +911,10 @@ describe("Input shortcuts", () => {
     expect(coalesceInputSequences(keys)).toEqual(["\x1b[200~", "hello\nworld", "\x1b[201~"]);
   });
 
+  it("coalesces text while already inside bracketed paste mode", () => {
+    expect(coalesceInputSequences(["hello", "\n", "world"], { inBracketedPaste: true })).toEqual(["hello\nworld"]);
+  });
+
   it("treats newlines in paste-like bursts as input text", () => {
     expect(shouldTreatNewlineAsPaste(5, 12, 1000, 0)).toBe(true);
     expect(shouldTreatNewlineAsPaste(0, 1, 1000, 1001)).toBe(true);
@@ -810,6 +946,10 @@ describe("Input shortcuts", () => {
   it("keeps split mouse wheel escape prefixes pending until complete", () => {
     expect(trailingIncompleteEscapeStart("abc\x1b[<64;10;")).toBe(3);
     expect(splitInputSequences("\x1b[<64;10;5M")).toEqual(["\x1b[<64;10;5M"]);
+  });
+
+  it("recognizes incomplete SS3 escape prefixes", () => {
+    expect(trailingIncompleteEscapeStart("abc\x1bO")).toBe(3);
   });
 });
 
@@ -973,6 +1113,172 @@ describe("InputController", () => {
     expect(approval.getState()).toMatchObject({ value: "", cursor: 0 });
     vi.useRealTimers();
   });
+
+  it("flushes a pending bare escape on dispose without mutating input state", async () => {
+    vi.useFakeTimers();
+    const interrupts: string[] = [];
+    const controller = new InputController({
+      mode: "idle",
+      onInterrupt: () => {
+        interrupts.push("interrupt");
+        return false;
+      },
+    });
+
+    controller.handleData("\x1b");
+    controller.dispose();
+    await vi.advanceTimersByTimeAsync(30);
+
+    expect(interrupts).toEqual([]);
+    expect(controller.getState()).toMatchObject({ value: "", cursor: 0, inBracketedPaste: false });
+    vi.useRealTimers();
+  });
+
+  it("flushes a split escape sequence after the pending timeout", async () => {
+    const sequences: string[] = [];
+    vi.useFakeTimers();
+    const controller = new InputController({
+      mode: "approval",
+      editable: false,
+      onUnhandledSequence: (sequence) => {
+        sequences.push(sequence);
+        return true;
+      },
+    });
+
+    controller.handleData("\x1b");
+    await vi.advanceTimersByTimeAsync(30);
+
+    expect(sequences).toEqual(["\x1b"]);
+    vi.useRealTimers();
+  });
+
+  it("treats shift-tab as pasted text while inside bracketed paste mode", () => {
+    const controller = new InputController({ mode: "idle" });
+
+    controller.handleData("\x1b[200~");
+    controller.handleData("\x1b[Z");
+    controller.handleData("\x1b[201~");
+
+    expect(controller.getState().value).toBe("\x1b[Z");
+  });
+
+  it("keeps escape-prefixed navigation sequences from editing approval input", () => {
+    const sequences: string[] = [];
+    const controller = new InputController({
+      mode: "approval",
+      editable: false,
+      onUnhandledSequence: (sequence) => {
+        sequences.push(sequence);
+        return true;
+      },
+    });
+
+    controller.handleData("\x1b[C");
+    controller.handleData("\x1b[D");
+
+    expect(sequences).toEqual(["\x1b[C", "\x1b[D"]);
+    expect(controller.getState().value).toBe("");
+  });
+
+  it("detaches raw input listeners idempotently and restores bracketed paste only once", () => {
+    const writes: string[] = [];
+    let rawMode: boolean | undefined;
+    let resumeCount = 0;
+    let pauseCount = 0;
+    const listeners = new Map<string, Set<(...args: any[]) => void>>();
+    const stdin = {
+      isRaw: false,
+      setRawMode(value: boolean) { rawMode = value; return this; },
+      resume() { resumeCount++; return this; },
+      pause() { pauseCount++; return this; },
+      on(event: string, handler: (...args: any[]) => void) {
+        if (!listeners.has(event)) listeners.set(event, new Set());
+        listeners.get(event)!.add(handler);
+        return this;
+      },
+      removeListener(event: string, handler: (...args: any[]) => void) {
+        listeners.get(event)?.delete(handler);
+        return this;
+      },
+    };
+    const controller = new InputController();
+
+    const detach = controller.attach({
+      stdin: stdin as any,
+      stdout: { write(chunk: string) { writes.push(chunk); return true; } },
+      rawMode: true,
+      bracketedPaste: true,
+      pauseOnStop: true,
+    });
+
+    detach();
+    detach();
+
+    expect(writes).toEqual(["\x1b[?2004h", "\x1b[?2004l"]);
+    expect(rawMode).toBe(false);
+    expect(resumeCount).toBe(1);
+    expect(pauseCount).toBe(1);
+    expect(listeners.get("data")?.size ?? 0).toBe(0);
+  });
+
+  it("does not treat ctrl+d as eof while text is present", () => {
+    let eofCount = 0;
+    const controller = new InputController({
+      mode: "idle",
+      onEof: () => {
+        eofCount++;
+        return true;
+      },
+    });
+
+    controller.handleData("hello");
+    controller.handleData("\x04");
+
+    expect(eofCount).toBe(0);
+    expect(controller.getState().value).toBe("hello");
+  });
+
+  it("supports ctrl+a and ctrl+e cursor movement shortcuts", () => {
+    const controller = new InputController({ mode: "idle" });
+
+    controller.handleData("hello");
+    controller.handleData("\x01");
+    expect(controller.getState().cursor).toBe(0);
+
+    controller.handleData("\x05");
+    expect(controller.getState().cursor).toBe(5);
+  });
+
+  it("updates the prompt through setPrompt and emits a mode render", () => {
+    const prompts: string[] = [];
+    const controller = new InputController({
+      mode: "idle",
+      onRender: (state, meta) => {
+        prompts.push(`${state.prompt}:${meta.reason}`);
+      },
+    });
+
+    controller.setPrompt("next> ");
+
+    expect(controller.getState().prompt).toBe("next> ");
+    expect(prompts).toContain("next> :mode");
+  });
+
+  it("updates mode through setMode and emits a mode render", () => {
+    const renders: string[] = [];
+    const controller = new InputController({
+      mode: "idle",
+      onRender: (state, meta) => {
+        renders.push(`${state.mode}:${meta.reason}`);
+      },
+    });
+
+    controller.setMode("running");
+
+    expect(controller.getState().mode).toBe("running");
+    expect(renders).toContain("running:mode");
+  });
 });
 
 describe("Picker", () => {
@@ -1023,6 +1329,16 @@ describe("Picker", () => {
     expect(movePickerIndex(8, 20, "page_up", 5)).toBe(3);
     expect(movePickerIndex(8, 20, "top", 5)).toBe(0);
     expect(movePickerIndex(8, 20, "bottom", 5)).toBe(19);
+  });
+
+  it("returns an empty picker window when there is no space to show items", () => {
+    expect(pickerWindow(["a", "b"], 0, 0)).toEqual({
+      start: 0,
+      end: 0,
+      selectedIndex: -1,
+      total: 2,
+      entries: [],
+    });
   });
 });
 
@@ -1145,6 +1461,29 @@ describe("FrameRenderer", () => {
     expect(shouldUseSynchronizedOutput({ SEEKCODE_TUI_SYNC_OUTPUT: "0" } as any, { isTTY: true } as any)).toBe(false);
     expect(shouldUseSynchronizedOutput({ TERM: "dumb" } as any, { isTTY: true } as any)).toBe(false);
   });
+
+  it("falls back to SEEKCODE_SYNC_OUTPUT when the TUI-specific env var is unset", () => {
+    expect(shouldUseSynchronizedOutput({ SEEKCODE_SYNC_OUTPUT: "yes" } as any, { isTTY: false } as any)).toBe(true);
+  });
+
+  it("forces a full repaint after renderer reset even for the same frame", () => {
+    const chunks: string[] = [];
+    const renderer = new FrameRenderer({
+      stdout: {
+        isTTY: false,
+        write(chunk: string | Uint8Array) { chunks.push(String(chunk)); return true; },
+      } as any,
+      synchronizedOutput: false,
+    });
+
+    renderer.render(["alpha"], { cursor: { row: 1, col: 1 } });
+    renderer.reset();
+    chunks.length = 0;
+    const stats = renderer.render(["alpha"], { cursor: { row: 1, col: 1 } });
+
+    expect(stats).toMatchObject({ changedRows: 1, fullRepaint: true });
+    expect(chunks.join("")).toContain("\x1b[1;1Halpha");
+  });
 });
 
 describe("TuiLayout", () => {
@@ -1167,12 +1506,48 @@ describe("TuiLayout", () => {
     expect(cursor.col).toBeLessThanOrEqual(10);
   });
 
+  it("keeps the cursor column inside narrow terminal bounds when wrapping exactly at the edge", () => {
+    const layout = new TuiLayout(new Transcript());
+    const cursor = layout.cursorPosition("● ", "12345678", 8, 5, 4);
+
+    expect(cursor.row).toBeGreaterThanOrEqual(1);
+    expect(cursor.row).toBeLessThanOrEqual(4);
+    expect(cursor.col).toBeGreaterThanOrEqual(1);
+    expect(cursor.col).toBeLessThanOrEqual(5);
+  });
+
+  it("returns zero visible transcript rows when footer, status, completions, and input consume the viewport", () => {
+    const transcript = new Transcript();
+    transcript.append("hello");
+    const layout = new TuiLayout(transcript);
+
+    expect(layout.visibleTranscriptRows({
+      footer: "─\nstatus",
+      prompt: "● ",
+      input: "line1\nline2\nline3",
+      statusLine: "thinking",
+      completions: ["a", "b", "c"],
+      completionLimit: 3,
+    }, 6, 20)).toBe(0);
+  });
+
   it("places cursor on the last visible row for multiline input", () => {
     const layout = new TuiLayout(new Transcript());
     const cursor = layout.cursorPosition("● ", "alpha\nbeta", "alpha\nbeta".length, 20, 5);
 
     expect(cursor.row).toBe(5);
     expect(cursor.col).toBe(7);
+  });
+
+  it("keeps the cursor on the correct visible row when editing earlier multiline input", () => {
+    const layout = new TuiLayout(new Transcript());
+    const input = "one\ntwo\nthree\nfour";
+    const cursorIndex = input.indexOf("two") + "two".length;
+    const cursor = layout.cursorPosition("● ", input, cursorIndex, 20, 5);
+
+    expect(cursor.row).toBe(4);
+    expect(cursor.col).toBe(6);
+    expect(layout.visibleTranscriptRows({ footer: "─\nstatus", prompt: "● ", input, cursor: cursorIndex }, 8, 20)).toBe(0);
   });
 
   it("honors explicit completion limits for pickers", () => {

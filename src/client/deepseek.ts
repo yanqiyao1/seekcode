@@ -49,7 +49,7 @@ export class DeepSeekClient {
       options.reasoning_effort,
     ) as unknown as ChatCompletionMessageParam[];
 
-    const effectiveMaxTokens = Math.min(options.max_tokens ?? 8192, this.capability.max_output);
+    const effectiveMaxTokens = Math.min(normalizeMaxTokens(options.max_tokens), this.capability.max_output);
 
     const request: Record<string, unknown> = {
       model: this.model,
@@ -166,6 +166,10 @@ export class DeepSeekClient {
       return this.estimateTokens(messages.map(m => m.content || "").join(" "));
     }
   }
+}
+
+function normalizeMaxTokens(value: number | undefined): number {
+  return Number.isFinite(value) && (value as number) > 0 ? Math.floor(value as number) : 8192;
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

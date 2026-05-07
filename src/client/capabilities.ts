@@ -186,8 +186,8 @@ export function applyReasoningEffort(
   provider: ApiProvider,
   thinkingSupported: boolean,
 ): void {
-  if (!effort || !thinkingSupported) return;
-  const normalized = effort.trim().toLowerCase();
+  if (!thinkingSupported) return;
+  const normalized = (effort || "").trim().toLowerCase();
   if (["off", "disabled", "none", "false"].includes(normalized)) {
     if (provider === "nvidia-nim") request.chat_template_kwargs = { thinking: false };
     else request.thinking = { type: "disabled" };

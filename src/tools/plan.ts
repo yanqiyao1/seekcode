@@ -24,6 +24,8 @@ interface TodoItem {
   status: "pending" | "in_progress" | "completed";
 }
 
+const VALID_STATUSES = new Set<PlanStep["status"]>(["pending", "in_progress", "completed"]);
+
 // ── In-memory state ──────────────────────────────────────────
 
 let planSteps: PlanStep[] = [];
@@ -34,7 +36,7 @@ let notes: Array<{ title: string; content: string; created_at: string }> = [];
 export function getPlanState() { return [...planSteps]; }
 export function getTodoState() { return [...todoItems]; }
 export function getNoteState() { return [...notes]; }
-export function clearPlanState() { planSteps = []; todoItems = []; nextTodoId = 1; }
+export function clearPlanState() { planSteps = []; todoItems = []; nextTodoId = 1; notes = []; }
 
 export function formatTodoState(limit = 20): string {
   if (!todoItems.length) return "";
@@ -48,6 +50,45 @@ export function formatTodoState(limit = 20): string {
   return lines.join("\n");
 }
 
+function normalizeNoteAction(value: unknown): "add" | "set" | "get" | "list" | "delete" | string {
+  return typeof value === "string" && value.trim() ? value.trim().toLowerCase() : "add";
+}
+
+function validatePlanItemsInput(plan: unknown): string | null {
+  if (plan === undefined) return null;
+  if (!Array.isArray(plan)) return "plan must be an array";
+  for (const item of plan) {
+    if (!item || typeof item !== "object") return "each plan item must be an object";
+    const step = typeof (item as { step?: unknown }).step === "string" ? (item as { step: string }).step.trim() : "";
+    if (!step) return "step is required for each plan item";
+    const rawStatus = (item as { status?: unknown }).status;
+    if (rawStatus !== undefined && !VALID_STATUSES.has(rawStatus as PlanStep["status"])) {
+      return "status must be pending, in_progress, or completed";
+    }
+  }
+  return null;
+}
+
+function normalizeChecklistItemsInput(items: unknown): { items: Array<{ content: string; status: TodoItem["status"] }> } | { error: string } {
+  if (!Array.isArray(items)) return { error: "items must be an array" };
+
+  const normalizedItems: Array<{ content: string; status: TodoItem["status"] }> = [];
+  for (const item of items) {
+    if (!item || typeof item !== "object") return { error: "each item must be an object" };
+    const content = typeof (item as { content?: unknown }).content === "string"
+      ? (item as { content: string }).content.trim()
+      : "";
+    if (!content) return { error: "content is required for each checklist item" };
+    const rawStatus = (item as { status?: unknown }).status === undefined ? "pending" : (item as { status?: unknown }).status;
+    if (!VALID_STATUSES.has(rawStatus as TodoItem["status"])) {
+      return { error: "status must be pending, in_progress, or completed" };
+    }
+    normalizedItems.push({ content, status: rawStatus as TodoItem["status"] });
+  }
+
+  return { items: normalizedItems };
+}
+
 // ── checklist_write ──────────────────────────────────────────
 
 const STATUS_SYMBOLS: Record<string, string> = {
@@ -57,22 +98,24 @@ const STATUS_SYMBOLS: Record<string, string> = {
 };
 
 async function checklistWrite(args: Record<string, unknown>): Promise<string> {
-  const items = args.items as Array<{ content: string; status?: string }>;
-  if (!items || !Array.isArray(items)) return "Error: items must be an array";
+  const normalized = normalizeChecklistItemsInput(args.items);
+  if ("error" in normalized) return `Error: ${normalized.error}`;
+  const items = normalized.items;
 
-  todoItems = [];
-  nextTodoId = 1;
+  const nextItems: TodoItem[] = [];
   const lines: string[] = [];
   let inProgressCount = 0;
 
   for (const item of items) {
-    const status = (item.status || "pending") as TodoItem["status"];
+    const { content, status } = item;
     if (status === "in_progress") inProgressCount++;
-    const ti: TodoItem = { id: nextTodoId++, content: item.content, status };
-    todoItems.push(ti);
+    const ti: TodoItem = { id: nextTodoId + nextItems.length, content, status };
+    nextItems.push(ti);
     lines.push(`  ${STATUS_SYMBOLS[status]} [${ti.id}] ${ti.content}`);
   }
 
+  todoItems = nextItems;
+  nextTodoId = nextItems.length + 1;
   const header = `${todoItems.length} tasks, ${inProgressCount} in progress:\n`;
   return header + lines.join("\n");
 }
@@ -80,13 +123,20 @@ async function checklistWrite(args: Record<string, unknown>): Promise<string> {
 // ── update_plan ──────────────────────────────────────────────
 
 async function updatePlan(args: Record<string, unknown>): Promise<string> {
-  const explanation = (args.explanation as string) || "";
+  if (args.explanation !== undefined && typeof args.explanation !== "string") {
+    return "Error: explanation must be a string.";
+  }
+  const planError = validatePlanItemsInput(args.plan);
+  if (planError) return `Error: ${planError}`;
+  const explanation = args.explanation || "";
   const plan = args.plan as Array<{ step: string; status?: string }> | undefined;
 
   // If updating specific steps
   if (plan && Array.isArray(plan)) {
     for (const item of plan) {
-      const existing = planSteps.find(s => s.text === item.step);
+      if (typeof item.step !== "string") return "Error: step is required for each plan item";
+      const stepText = item.step.trim();
+      const existing = planSteps.find(s => s.text === stepText);
       if (existing) {
         existing.status = (item.status as PlanStep["status"]) || existing.status;
         if (item.status === "in_progress" && !existing.started_at) {
@@ -130,15 +180,40 @@ async function updatePlan(args: Record<string, unknown>): Promise<string> {
 
 // Also provide a way to set the full plan
 async function setPlan(args: Record<string, unknown>): Promise<string> {
-  const explanation = (args.explanation as string) || "";
+  if (args.explanation !== undefined && typeof args.explanation !== "string") {
+    return "Error: explanation must be a string.";
+  }
+  const planError = validatePlanItemsInput(args.plan);
+  if (planError) return `Error: ${planError}`;
+  const explanation = args.explanation || "";
   const plan = args.plan as Array<{ step: string; status?: string }> | undefined;
 
   if (plan && Array.isArray(plan)) {
-    planSteps = plan.map(p => ({
-      text: p.step,
-      status: (p.status as PlanStep["status"]) || "pending",
-      started_at: p.status === "in_progress" ? Date.now() : undefined,
-    }));
+    if (planSteps.length === 0) {
+      planSteps = plan.map(p => ({
+        text: p.step.trim(),
+        status: (p.status as PlanStep["status"]) || "pending",
+        started_at: p.status === "in_progress" ? Date.now() : undefined,
+      }));
+    } else {
+      for (const item of plan) {
+        if (typeof item.step !== "string") return "Error: step is required for each plan item";
+        const stepText = item.step.trim();
+        const existing = planSteps.find(step => step.text === stepText);
+        if (existing) {
+          existing.status = (item.status as PlanStep["status"]) || existing.status;
+          if (item.status === "in_progress" && !existing.started_at) existing.started_at = Date.now();
+          if (item.status === "completed") existing.completed_at = Date.now();
+          continue;
+        }
+        planSteps.push({
+          text: stepText,
+          status: (item.status as PlanStep["status"]) || "pending",
+          started_at: item.status === "in_progress" ? Date.now() : undefined,
+          completed_at: item.status === "completed" ? Date.now() : undefined,
+        });
+      }
+    }
   }
 
   return updatePlan(args);
@@ -147,9 +222,23 @@ async function setPlan(args: Record<string, unknown>): Promise<string> {
 // ── note ─────────────────────────────────────────────────────
 
 async function note(args: Record<string, unknown>): Promise<string> {
-  const title = (args.title as string) || "Untitled";
-  const content = (args.content as string) || "";
-  const action = (args.action as string) || "add";
+  if (args.action !== undefined && typeof args.action !== "string") {
+    return "Error: action must be a string.";
+  }
+  const title = typeof args.title === "string" ? args.title.trim() : "";
+  const content = args.content === undefined
+    ? ""
+    : typeof args.content === "string"
+      ? args.content
+      : null;
+  const action = normalizeNoteAction(args.action);
+
+  if (action !== "list" && !title) {
+    return "Error: title is required.";
+  }
+  if ((action === "add" || action === "set") && content === null) {
+    return "Error: content must be a string.";
+  }
 
   if (action === "add" || action === "set") {
     // Update existing or add new
@@ -212,6 +301,12 @@ export function registerPlanTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: false,
+    validateInput: (args) => {
+      const normalized = normalizeChecklistItemsInput(args.items);
+      return "error" in normalized
+        ? { ok: false as const, message: normalized.error }
+        : { ok: true as const, args: { ...args, items: normalized.items } };
+    },
     searchHint: "write task checklist",
     resultKind: "task",
   });
@@ -241,6 +336,13 @@ export function registerPlanTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: false,
+    validateInput: (args) => {
+      if (args.explanation !== undefined && typeof args.explanation !== "string") {
+        return { ok: false as const, message: "explanation must be a string." };
+      }
+      const planError = validatePlanItemsInput(args.plan);
+      return planError ? { ok: false as const, message: planError } : { ok: true as const, args };
+    },
     searchHint: "update work plan",
     resultKind: "task",
   });
@@ -255,15 +357,27 @@ export function registerPlanTools(): void {
         content: { type: "string", description: "Note content" },
         action: { type: "string", enum: ["add", "set", "get", "list", "delete"], default: "set" },
       },
-      required: ["title"],
     },
     execute: note,
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: false,
+    validateInput: (args) => {
+      if (args.action !== undefined && typeof args.action !== "string") {
+        return { ok: false as const, message: "action must be a string" };
+      }
+      const action = normalizeNoteAction(args.action || "set");
+      if (action === "list") return { ok: true, args: { ...args, action } };
+      const title = typeof args.title === "string" ? args.title.trim() : "";
+      if (!title) return { ok: false, message: "title is required" };
+      if ((action === "add" || action === "set") && args.content !== undefined && typeof args.content !== "string") {
+        return { ok: false, message: "content must be a string" };
+      }
+      return { ok: true, args: { ...args, action, title } };
+    },
     searchHint: "persistent notes",
     resultKind: "text",
-    readOnly: (args) => ["list", "get"].includes(String(args.action || "").toLowerCase()),
+    readOnly: (args) => ["list", "get"].includes(normalizeNoteAction(args.action)),
   });
 
   // Also add a debug command

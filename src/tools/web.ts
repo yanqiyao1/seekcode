@@ -201,6 +201,18 @@ function normalizeDomainList(value: unknown): string[] {
   return [];
 }
 
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(item => typeof item === "string");
+}
+
+function isNumericLike(value: unknown): value is number | string {
+  return typeof value === "number" || typeof value === "string";
+}
+
+function isBoolLike(value: unknown): value is boolean | string {
+  return typeof value === "boolean" || typeof value === "string";
+}
+
 function envString(name: string): string {
   return process.env[name]?.trim() || "";
 }
@@ -362,6 +374,139 @@ function extractRefId(args: Record<string, unknown>): string {
   return "";
 }
 
+function normalizeWebSearchValidationArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const query = extractSearchQuery(args);
+  const maxResults = extractSearchMaxResults(args);
+  const domains = extractSearchDomains(args);
+  const engine = normalizeSearchEngine(args.engine || args.source);
+  const searchType = normalizeSearchType(args.type || args.search_type || args.searchType);
+  const includeContent = extractSearchContextEnabled(args, searchType);
+  const contextResults = extractContextResults(args);
+  const contextMaxCharacters = extractContextMaxCharacters(args);
+
+  return {
+    ...args,
+    ...(query ? { query } : {}),
+    ...(maxResults > 0 ? { max_results: maxResults } : {}),
+    ...(domains.length ? { domains } : {}),
+    ...(engine ? { engine } : {}),
+    ...(searchType ? { type: searchType } : {}),
+    fetch_results: includeContent,
+    context_results: contextResults,
+    context_max_characters: contextMaxCharacters,
+  };
+}
+
+function validateWebSearchDomainArgs(args: Record<string, unknown>): string | null {
+  if (args.domains !== undefined && !isStringArray(args.domains)) {
+    return "domains must be an array of strings";
+  }
+  const searchQuery = args.search_query;
+  if (searchQuery !== undefined) {
+    if (!Array.isArray(searchQuery)) return "search_query must be an array";
+    for (const item of searchQuery) {
+      if (!item || typeof item !== "object") return "search_query entries must be objects";
+      const record = item as Record<string, unknown>;
+      if (record.domains !== undefined && !isStringArray(record.domains)) {
+        return "search_query domains must be an array of strings";
+      }
+    }
+  }
+  return null;
+}
+
+function validateWebSearchQueryArgs(args: Record<string, unknown>): string | null {
+  for (const key of ["query", "q"] as const) {
+    const value = args[key];
+    if (value !== undefined && typeof value !== "string") return `${key} must be a string`;
+  }
+
+  const searchQuery = args.search_query;
+  if (!Array.isArray(searchQuery)) return null;
+  for (const item of searchQuery) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    for (const key of ["q", "query"] as const) {
+      const value = record[key];
+      if (value !== undefined && typeof value !== "string") return `search_query ${key} must be a string`;
+    }
+  }
+  return null;
+}
+
+function validateWebSearchOptionArgs(args: Record<string, unknown>): string | null {
+  for (const key of ["max_results", "timeout_ms", "context_results", "context_max_characters"]) {
+    const value = args[key];
+    if (value !== undefined && !isNumericLike(value)) return `${key} must be a number`;
+  }
+  for (const key of ["fetch_results", "include_content", "context", "json"]) {
+    const value = args[key];
+    if (value !== undefined && !isBoolLike(value)) return `${key} must be a boolean`;
+  }
+  for (const key of ["engine", "source", "type", "search_type", "searchType"]) {
+    const value = args[key];
+    if (value !== undefined && typeof value !== "string") return `${key} must be a string`;
+  }
+
+  const searchQuery = args.search_query;
+  if (!Array.isArray(searchQuery)) return null;
+  for (const item of searchQuery) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    for (const key of ["max_results", "context_results", "context_max_characters", "contextMaxCharacters", "contextResults"]) {
+      const value = record[key];
+      if (value !== undefined && !isNumericLike(value)) return `search_query ${key} must be a number`;
+    }
+    for (const key of ["fetch_results", "include_content", "context"]) {
+      const value = record[key];
+      if (value !== undefined && !isBoolLike(value)) return `search_query ${key} must be a boolean`;
+    }
+  }
+  return null;
+}
+
+function validateWebSearchInput(args: Record<string, unknown>) {
+  const queryError = validateWebSearchQueryArgs(args);
+  if (queryError) return { ok: false as const, message: queryError };
+  const domainError = validateWebSearchDomainArgs(args);
+  if (domainError) return { ok: false as const, message: domainError };
+  const optionError = validateWebSearchOptionArgs(args);
+  if (optionError) return { ok: false as const, message: optionError };
+  const normalized = normalizeWebSearchValidationArgs(args);
+  return extractSearchQuery(normalized)
+    ? { ok: true as const, args: normalized }
+    : { ok: false as const, message: "query is required" };
+}
+
+function validateWebFetchOptionArgs(args: Record<string, unknown>): string | null {
+  for (const key of ["max_bytes", "timeout_ms"]) {
+    const value = args[key];
+    if (value !== undefined && !isNumericLike(value)) return `${key} must be a number`;
+  }
+  for (const key of ["json", "extract_text"]) {
+    const value = args[key];
+    if (value !== undefined && !isBoolLike(value)) return `${key} must be a boolean`;
+  }
+  if (args.format !== undefined && typeof args.format !== "string") return "format must be a string";
+  return null;
+}
+
+function validateWebFetchInput(args: Record<string, unknown>) {
+  const optionError = validateWebFetchOptionArgs(args);
+  if (optionError) return { ok: false as const, message: optionError };
+  const url = typeof args.url === "string" ? args.url.trim() : "";
+  const refId = extractRefId(args);
+  if (!url && !refId) return { ok: false as const, message: "url or ref_id is required" };
+  return {
+    ok: true as const,
+    args: {
+      ...args,
+      ...(url ? { url } : {}),
+      ...(refId ? { ref_id: refId } : {}),
+    },
+  };
+}
+
 function decodeHtml(text: string): string {
   return text
     .replace(/&amp;/g, "&")
@@ -406,6 +551,15 @@ function compactSnippet(value: unknown): string | undefined {
       .join(" ");
     return normalized || undefined;
   }
+  return undefined;
+}
+
+function compactScalar(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const normalized = normalizeText(value);
+    return normalized || undefined;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
   return undefined;
 }
 
@@ -1183,7 +1337,7 @@ async function searchSemanticScholar(query: string, maxResults: number, timeoutM
       const record = item as Record<string, unknown>;
       const entry = entryFromRecord(record, { title: ["title"], url: ["url"], snippet: ["abstract"] });
       if (!entry) return null;
-      const year = record.year ? String(record.year) : "";
+      const year = compactScalar(record.year) || "";
       const venue = typeof record.venue === "string" ? record.venue : "";
       const prefix = [year, venue].filter(Boolean).join(" ");
       return prefix ? { ...entry, snippet: [prefix, entry.snippet].filter(Boolean).join(" - ") } : entry;
@@ -1209,7 +1363,10 @@ async function searchPubmed(query: string, maxResults: number, timeoutMs: number
   const esearch = searchPayload && typeof searchPayload === "object" ? (searchPayload as Record<string, unknown>).esearchresult : undefined;
   const rawIds = esearch && typeof esearch === "object" ? (esearch as Record<string, unknown>).idlist : undefined;
   const ids: string[] = Array.isArray(rawIds)
-    ? rawIds.map(String).filter(Boolean).slice(0, maxResults)
+    ? rawIds
+      .map(id => compactScalar(id))
+      .filter((id): id is string => Boolean(id))
+      .slice(0, maxResults)
     : [];
   if (!ids.length) return [];
 
@@ -1425,6 +1582,10 @@ function pruneRefs(): void {
 }
 
 async function webSearchWithConfig(args: Record<string, unknown>, config: ResolvedWebConfig, signal?: AbortSignal): Promise<string> {
+  const domainError = validateWebSearchDomainArgs(args);
+  if (domainError) return `Error searching: ${domainError}.`;
+  const optionError = validateWebSearchOptionArgs(args);
+  if (optionError) return `Error searching: ${optionError}.`;
   const query = extractSearchQuery(args);
   if (!query) return "Error searching: query is required.";
 
@@ -1674,13 +1835,14 @@ function formatFetchResult(resp: FetchResponse, content: string, jsonOutput: boo
 }
 
 async function webFetchWithConfig(args: Record<string, unknown>, config: ResolvedWebConfig, signal?: AbortSignal): Promise<string> {
+  const optionError = validateWebFetchOptionArgs(args);
+  if (optionError) return `Error fetching URL: ${optionError}.`;
   if (!config.enabled || config.mode === "off") return "Error fetching URL: web tools are disabled by configuration.";
   const refId = extractRefId(args);
   const ref = refId ? WEB_REFS.get(refId) : undefined;
+  if (refId && !ref) return `Error fetching URL: unknown ref_id '${refId}'. Run web_search first or pass url directly.`;
   const rawUrl = typeof args.url === "string" && args.url.trim() ? args.url.trim() : ref?.url || "";
   if (!rawUrl) return "Error fetching URL: url is required.";
-
-  if (refId && !ref) return `Error fetching URL: unknown ref_id '${refId}'. Run web_search first or pass url directly.`;
 
   const format = normalizeFetchFormat(args);
   const jsonOutput = asBool(args.json, false);
@@ -1744,7 +1906,7 @@ export function registerWebTools(configInput?: Partial<WebConfig>): void {
     resultKind: "text",
     maxResultSizeChars: 100_000,
     isSearchOrReadCommand: () => ({ isSearch: true, isRead: false }),
-    validateInput: (args) => extractSearchQuery(args) ? { ok: true } : { ok: false, message: "query is required" },
+    validateInput: validateWebSearchInput,
   });
   r.register({
     name: "web_fetch",
@@ -1770,9 +1932,7 @@ export function registerWebTools(configInput?: Partial<WebConfig>): void {
     resultKind: "text",
     maxResultSizeChars: 120_000,
     isSearchOrReadCommand: () => ({ isSearch: false, isRead: true }),
-    validateInput: (args) => (typeof args.url === "string" && args.url.trim()) || (typeof args.ref_id === "string" && args.ref_id.trim())
-      ? { ok: true }
-      : { ok: false, message: "url or ref_id is required" },
+    validateInput: validateWebFetchInput,
   });
   r.register({
     name: "fetch_url",
@@ -1798,8 +1958,6 @@ export function registerWebTools(configInput?: Partial<WebConfig>): void {
     resultKind: "text",
     maxResultSizeChars: 120_000,
     isSearchOrReadCommand: () => ({ isSearch: false, isRead: true }),
-    validateInput: (args) => (typeof args.url === "string" && args.url.trim()) || (typeof args.ref_id === "string" && args.ref_id.trim())
-      ? { ok: true }
-      : { ok: false, message: "url or ref_id is required" },
+    validateInput: validateWebFetchInput,
   });
 }

@@ -14,6 +14,7 @@ import type { EngineRuntimeEvent } from "../src/engine/events.js";
 import { Engine } from "../src/engine/loop.js";
 import { clearHooks, registerHook } from "../src/engine/hooks.js";
 import { ImmutablePrefix } from "../src/engine/prefix.js";
+import { getTaskManager } from "../src/engine/task-lifecycle.js";
 import { getMode } from "../src/modes/base.js";
 import { ConversationHistory } from "../src/session/history.js";
 import { createSession } from "../src/session/types.js";
@@ -24,13 +25,16 @@ import { registerGitTools } from "../src/tools/git.js";
 import { registerPatchTool } from "../src/tools/patch.js";
 import { applyPatch as applyAdvancedPatch } from "../src/tools/patch-advanced.js";
 import { registerShellTool } from "../src/tools/shell.js";
+import { registerTaskTools } from "../src/tools/tasks.js";
+import { registerWebTools } from "../src/tools/web.js";
 import { SideGit } from "../src/rollback/side-git.js";
 import { registerToolSearchTool } from "../src/tools/tool-search.js";
 import { registerDiagnosticsTools } from "../src/tools/diagnostics.js";
 import { registerArtifactTools } from "../src/tools/artifacts.js";
 import { clearArtifactsForTests, listArtifactLinks, readArtifact } from "../src/artifacts/store.js";
 import { clearMCPManagerForTests, getMCPManager } from "../src/mcp/manager.js";
-import { activateSkill, applySkillToUserInput, installSkillFromArchive, scanSkills, trustSkill, uninstallSkill, updateSkill } from "../src/engine/skills.js";
+import { activateSkill, applySkillToUserInput, fetchRegistrySkills, installSkillFromArchive, scanSkills, trustSkill, uninstallSkill, updateSkill } from "../src/engine/skills.js";
+import { writeUserConfigRaw } from "../src/config.js";
 
 let tmp: string;
 let oldArtifactsDir: string | undefined;
@@ -168,6 +172,106 @@ describe("file tools", () => {
     expect(readFileSync(file, "utf-8")).toBe("");
   });
 
+  it("rejects non-string file tool inputs during execution instead of coercing objects into paths and patterns", async () => {
+    registerFileTools();
+    const file = join(tmp, "direct-exec.txt");
+    writeFileSync(file, "alpha\nbeta\n");
+
+    expect(await getRegistry().lookup("read")!.execute({ path: { nested: true } as any, root: tmp })).toContain("path must be a non-empty string");
+    expect(await getRegistry().lookup("write")!.execute({ path: file, content: { nested: true } as any, root: tmp })).toContain("content must be a string");
+    expect(await getRegistry().lookup("edit")!.execute({ path: file, old_string: { nested: true } as any, new_string: "x", root: tmp })).toContain("old_string must be a non-empty string");
+    expect(await getRegistry().lookup("ls")!.execute({ path: { nested: true } as any, root: tmp })).toContain("path must be a string");
+    expect(await getRegistry().lookup("search")!.execute({ path: tmp, pattern: { nested: true } as any })).toContain("pattern must be a non-empty string");
+    expect(await getRegistry().lookup("glob")!.execute({ path: tmp, pattern: { nested: true } as any })).toContain("pattern must be a non-empty string");
+    expect(readFileSync(file, "utf-8")).toBe("alpha\nbeta\n");
+  });
+
+  it("rejects malformed optional file tool inputs instead of silently normalizing them away", async () => {
+    registerFileTools();
+    const file = join(tmp, "typed-options.txt");
+    writeFileSync(file, "alpha\nbeta\n");
+    const readTool = getRegistry().lookup("read")!;
+    const editTool = getRegistry().lookup("edit")!;
+    const lsTool = getRegistry().lookup("ls")!;
+    const searchTool = getRegistry().lookup("search")!;
+    const globTool = getRegistry().lookup("glob")!;
+
+    expect(await readTool.validateInput?.(
+      { path: file, root: { nested: true } as any },
+      { tool_name: "read", workspace_path: tmp, tool_def: readTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("root must be a string"),
+    });
+    expect(await readTool.validateInput?.(
+      { path: file, offset: { nested: true } as any },
+      { tool_name: "read", workspace_path: tmp, tool_def: readTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("offset must be a number"),
+    });
+    expect(await readTool.validateInput?.(
+      { path: file, limit: { nested: true } as any },
+      { tool_name: "read", workspace_path: tmp, tool_def: readTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("limit must be a number"),
+    });
+    expect(await editTool.validateInput?.(
+      { path: file, old_string: "alpha", new_string: "beta", replace_all: "yes" as any },
+      { tool_name: "edit", workspace_path: tmp, tool_def: editTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("replace_all must be a boolean"),
+    });
+    expect(await lsTool.validateInput?.(
+      { root: { nested: true } as any },
+      { tool_name: "ls", workspace_path: tmp, tool_def: lsTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("root must be a string"),
+    });
+    expect(await searchTool.validateInput?.(
+      { path: tmp, pattern: "alpha", case_sensitive: "no" as any },
+      { tool_name: "search", workspace_path: tmp, tool_def: searchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("case_sensitive must be a boolean"),
+    });
+    expect(await searchTool.validateInput?.(
+      { path: tmp, pattern: "alpha", include: { nested: true } as any },
+      { tool_name: "search", workspace_path: tmp, tool_def: searchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("include must be a string"),
+    });
+    expect(await globTool.validateInput?.(
+      { path: tmp, pattern: "*.txt", root: { nested: true } as any },
+      { tool_name: "glob", workspace_path: tmp, tool_def: globTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("root must be a string"),
+    });
+
+    expect(await readTool.execute({ path: file, offset: { nested: true } as any })).toContain("offset must be a number");
+    expect(await readTool.execute({ path: file, limit: { nested: true } as any })).toContain("limit must be a number");
+    expect(await editTool.execute({ path: file, old_string: "alpha", new_string: "beta", replace_all: "yes" as any })).toContain("replace_all must be a boolean");
+    expect(await lsTool.execute({ root: { nested: true } as any })).toContain("root must be a string");
+    expect(await searchTool.execute({ path: tmp, pattern: "alpha", case_sensitive: "no" as any })).toContain("case_sensitive must be a boolean");
+    expect(await searchTool.execute({ path: tmp, pattern: "alpha", include: { nested: true } as any })).toContain("include must be a string");
+    expect(await globTool.execute({ path: tmp, pattern: "*.txt", root: { nested: true } as any })).toContain("root must be a string");
+  });
+
+  it("clamps negative read offsets to the start of the file", async () => {
+    registerFileTools();
+    const file = join(tmp, "offset.txt");
+    writeFileSync(file, "first\nsecond\nthird\n");
+
+    const read = await getRegistry().lookup("read")!.execute({ path: file, root: tmp, offset: -5, limit: 1 });
+
+    expect(read).toBe("first");
+  });
+
   it("accepts common path/content aliases for write validation", async () => {
     registerFileTools();
     const file = join(tmp, "alias-target.txt");
@@ -274,6 +378,64 @@ describe("git and patch tools", () => {
     expect(result).toContain("+新内容");
   });
 
+  it("rejects malformed git tool inputs instead of coercing them into fake git args", async () => {
+    registerGitTools();
+    const gitDiff = getRegistry().lookup("git_diff")!;
+    const gitLog = getRegistry().lookup("git_log")!;
+    const gitStatus = getRegistry().lookup("git_status")!;
+
+    expect(await gitDiff.validateInput?.(
+      { workdir: { nested: true } as any },
+      { tool_name: "git_diff", workspace_path: tmp, tool_def: gitDiff },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
+    expect(await gitDiff.validateInput?.(
+      { workdir: tmp, files: [join(tmp, "tracked.txt"), 7] as any },
+      { tool_name: "git_diff", workspace_path: tmp, tool_def: gitDiff },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("files must be a string or array of strings"),
+    });
+    expect(await gitLog.validateInput?.(
+      { n: { nested: true } as any },
+      { tool_name: "git_log", workspace_path: tmp, tool_def: gitLog },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("n must be a positive integer"),
+    });
+
+    expect(await gitStatus.execute({ cwd: { nested: true } as any })).toContain("workdir must be a string");
+    expect(await gitDiff.execute({ workdir: tmp, files: [join(tmp, "tracked.txt"), 7] as any })).toContain("files must be a string or array of strings");
+    expect(await gitLog.execute({ workdir: tmp, n: { nested: true } as any })).toContain("n must be a positive integer");
+  });
+
+  it("trims git workdir aliases during validation and execution", async () => {
+    registerGitTools();
+    await run("git init");
+    await run("git config user.email test@example.com");
+    await run("git config user.name Tester");
+    writeFileSync(join(tmp, "tracked.txt"), "tracked\n");
+    await run("git add . && git commit -m init");
+    writeFileSync(join(tmp, "tracked.txt"), "changed\n");
+    const tool = getRegistry().lookup("git_status")!;
+
+    expect(await tool.validateInput?.(
+      { workdir: `  ${tmp}  ` },
+      { tool_name: "git_status", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: true,
+      args: {
+        workdir: tmp,
+      },
+    });
+
+    const result = await tool.execute({ cwd: `  ${tmp}  ` });
+
+    expect(result).toContain("tracked.txt");
+  });
+
   it("apply_patch cleans up temp files after a failed patch", async () => {
     registerPatchTool();
     const before = tempPatchFiles();
@@ -323,6 +485,17 @@ describe("git and patch tools", () => {
     expect(result).toContain("[diff]");
     expect(result).toContain("- old");
     expect(result).toContain("+ new");
+  });
+
+  it("rejects non-string apply_patch payloads instead of throwing during execution", async () => {
+    registerPatchTool();
+
+    const result = await getRegistry().lookup("apply_patch")!.execute({
+      patch: { nested: true } as any,
+      workdir: tmp,
+    });
+
+    expect(result).toContain("patch must be a non-empty string");
   });
 
   it("advanced patch rejects paths that escape the workdir", () => {
@@ -420,6 +593,108 @@ describe("git and patch tools", () => {
     expect(result).toMatch(/Patch failed/i);
     expect(readFileSync(join(tmp, "a.txt"), "utf-8")).toBe("before-a\n");
     expect(readFileSync(join(tmp, "b.txt"), "utf-8")).toBe("before-b\n");
+  });
+
+  it("registered apply_patch normalizes cwd aliases during validation", async () => {
+    registerPatchTool();
+    const tool = getRegistry().lookup("apply_patch")!;
+    const validation = await tool.validateInput?.(
+      { patch: "diff --git a/a b/a\n", cwd: tmp },
+      { tool_name: "apply_patch", workspace_path: tmp, tool_def: tool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: {
+        patch: "diff --git a/a b/a\n",
+        workdir: tmp,
+      },
+    });
+  });
+
+  it("registered apply_patch honors cwd aliases during direct execution even when workdir is an empty placeholder", async () => {
+    registerPatchTool();
+    const workspace = join(tmp, "patch-alias-exec");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, "note.txt"), "before\n");
+    const patch = [
+      "diff --git a/note.txt b/note.txt",
+      "--- a/note.txt",
+      "+++ b/note.txt",
+      "@@ -1 +1 @@",
+      "-before",
+      "+after",
+      "",
+    ].join("\n");
+
+    const result = await getRegistry().lookup("apply_patch")!.execute({
+      patch,
+      workdir: "",
+      cwd: workspace,
+    });
+
+    expect(result).toMatch(/Patch applied successfully/i);
+    expect(readFileSync(join(workspace, "note.txt"), "utf-8")).toBe("after\n");
+    expect(existsSync(join(tmp, "note.txt"))).toBe(false);
+  });
+
+  it("registered apply_patch ignores whitespace-only workdir placeholders so cwd aliases still apply", async () => {
+    registerPatchTool();
+    const workspace = join(tmp, "patch-whitespace-alias-exec");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, "note.txt"), "before\n");
+    const patch = [
+      "diff --git a/note.txt b/note.txt",
+      "--- a/note.txt",
+      "+++ b/note.txt",
+      "@@ -1 +1 @@",
+      "-before",
+      "+after",
+      "",
+    ].join("\n");
+    const tool = getRegistry().lookup("apply_patch")!;
+
+    expect(await tool.validateInput?.(
+      { patch, workdir: "   ", cwd: workspace },
+      { tool_name: "apply_patch", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: true,
+      args: {
+        patch,
+        workdir: workspace,
+        cwd: workspace,
+      },
+    });
+
+    const result = await tool.execute({
+      patch,
+      workdir: "   ",
+      cwd: workspace,
+    });
+
+    expect(result).toMatch(/Patch applied successfully/i);
+    expect(readFileSync(join(workspace, "note.txt"), "utf-8")).toBe("after\n");
+    expect(existsSync(join(tmp, "note.txt"))).toBe(false);
+  });
+
+  it("rejects non-string apply_patch workdirs instead of coercing them into fake patch roots", async () => {
+    registerPatchTool();
+    const tool = getRegistry().lookup("apply_patch")!;
+
+    expect(await tool.validateInput?.(
+      { patch: "diff --git a/a b/a\n", cwd: { nested: true } as any },
+      { tool_name: "apply_patch", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
+
+    const result = await tool.execute({
+      patch: "diff --git a/a b/a\n",
+      cwd: { nested: true } as any,
+    });
+
+    expect(result).toContain("workdir must be a string");
   });
 
   it("advanced patch dry-run does not create parent directories", () => {
@@ -1191,6 +1466,432 @@ describe("engine", () => {
     expect(executed).toBe(false);
     expect(approvalArgs).toEqual({ path: "normalized.txt", content: "normalized" });
     expect(result.tool_results[0].content).toContain("denied");
+  });
+
+  it("preserves file root aliases through engine default injection", async () => {
+    registerFileTools();
+    const workspace = join(tmp, "workspace");
+    mkdirSync(workspace, { recursive: true });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      {
+        type: "done",
+        finish_reason: "tool_calls",
+        usage: null,
+        content: "",
+        reasoning_content: null,
+        tool_calls: [{
+          id: "call_1",
+          name: "write",
+          arguments: { path: "alias.txt", content: "alias body", workspace },
+        }],
+      },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      requestApproval: async () => true,
+    });
+
+    expect(result.tool_results[0]).toMatchObject({ is_error: false });
+    expect(readFileSync(join(workspace, "alias.txt"), "utf-8")).toBe("alias body");
+    expect(existsSync(join(tmp, "alias.txt"))).toBe(false);
+  });
+
+  it("ignores whitespace-only file root placeholders so valid cwd aliases still apply", async () => {
+    registerFileTools();
+    const workspace = join(tmp, "file-root-alias-exec");
+    mkdirSync(workspace, { recursive: true });
+
+    const result = await getRegistry().lookup("write")!.execute({
+      path: "alias.txt",
+      content: "alias body",
+      root: "   ",
+      cwd: workspace,
+    });
+
+    expect(result).toContain("Successfully wrote");
+    expect(readFileSync(join(workspace, "alias.txt"), "utf-8")).toBe("alias body");
+    expect(existsSync(join(tmp, "alias.txt"))).toBe(false);
+  });
+
+  it("ignores whitespace-only file root placeholders and falls back to the path location", async () => {
+    registerFileTools();
+    const workspace = join(tmp, "file-root-fallback");
+    mkdirSync(workspace, { recursive: true });
+    const file = join(workspace, "note.txt");
+    writeFileSync(file, "hello\n");
+
+    const result = await getRegistry().lookup("read")!.execute({
+      path: file,
+      root: "   ",
+    });
+
+    expect(result).toBe("hello\n");
+  });
+
+  it("preserves apply_patch cwd aliases through engine default injection", async () => {
+    registerPatchTool();
+    const workspace = join(tmp, "patch-workspace");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, "note.txt"), "before\n");
+    const patch = [
+      "diff --git a/note.txt b/note.txt",
+      "--- a/note.txt",
+      "+++ b/note.txt",
+      "@@ -1 +1 @@",
+      "-before",
+      "+after",
+      "",
+    ].join("\n");
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      {
+        type: "done",
+        finish_reason: "tool_calls",
+        usage: null,
+        content: "",
+        reasoning_content: null,
+        tool_calls: [{
+          id: "call_1",
+          name: "apply_patch",
+          arguments: { patch, cwd: workspace },
+        }],
+      },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      requestApproval: async () => true,
+    });
+
+    expect(result.tool_results[0]).toMatchObject({ is_error: false });
+    expect(readFileSync(join(workspace, "note.txt"), "utf-8")).toBe("after\n");
+    expect(existsSync(join(tmp, "note.txt"))).toBe(false);
+  });
+
+  it("runs bash in the session workspace when workdir is omitted", async () => {
+    registerShellTool();
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      {
+        type: "done",
+        finish_reason: "tool_calls",
+        usage: null,
+        content: "",
+        reasoning_content: null,
+        tool_calls: [{
+          id: "call_1",
+          name: "bash",
+          arguments: { command: "pwd" },
+        }],
+      },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      requestApproval: async () => true,
+    });
+
+    expect(result.tool_results[0]).toMatchObject({ is_error: false });
+    expect(result.tool_results[0].content).toContain(tmp);
+  });
+
+  it("runs task_create shell queues in the session workspace when workdir is omitted", async () => {
+    registerTaskTools();
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      {
+        type: "done",
+        finish_reason: "tool_calls",
+        usage: null,
+        content: "",
+        reasoning_content: null,
+        tool_calls: [{
+          id: "call_1",
+          name: "task_create",
+          arguments: { description: "pwd task", command: "pwd" },
+        }],
+      },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      requestApproval: async () => true,
+    });
+    const created = JSON.parse(result.tool_results[0].content);
+    const done = await waitFor(() => {
+      const task = getTaskManager().getHistory().find(item => item.id === created.id);
+      return task?.status === "completed" ? task : null;
+    }, 2500);
+
+    expect(done.output).toContain(tmp);
+  });
+
+  it("runs task_gate_run in the session workspace when workdir is omitted", async () => {
+    registerShellTool();
+    registerTaskTools();
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      {
+        type: "done",
+        finish_reason: "tool_calls",
+        usage: null,
+        content: "",
+        reasoning_content: null,
+        tool_calls: [{
+          id: "call_1",
+          name: "task_gate_run",
+          arguments: { command: "pwd" },
+        }],
+      },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      requestApproval: async () => true,
+    });
+    const gate = JSON.parse(result.tool_results[0].content);
+
+    expect(gate.workdir).toBe(tmp);
+    expect(gate.output).toContain(tmp);
+  });
+
+  it("runs git_status in the session workspace when workdir is omitted", async () => {
+    registerGitTools();
+    const { execSync } = await import("node:child_process");
+    const workspace = join(tmp, "git-workspace");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, "tracked.txt"), "tracked\n");
+    execSync("git init", { cwd: workspace, stdio: "ignore" });
+    execSync("git config user.email test@example.com", { cwd: workspace, stdio: "ignore" });
+    execSync("git config user.name 'Test User'", { cwd: workspace, stdio: "ignore" });
+    execSync("git add tracked.txt", { cwd: workspace, stdio: "ignore" });
+    execSync("git commit -m init", { cwd: workspace, stdio: "ignore" });
+    writeFileSync(join(workspace, "tracked.txt"), "changed\n");
+
+    const session = createSession({ workspace_path: workspace });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      {
+        type: "done",
+        finish_reason: "tool_calls",
+        usage: null,
+        content: "",
+        reasoning_content: null,
+        tool_calls: [{
+          id: "call_1",
+          name: "git_status",
+          arguments: {},
+        }],
+      },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+
+    expect(result.tool_results[0]).toMatchObject({ is_error: false });
+    expect(result.tool_results[0].content).toContain("tracked.txt");
+  });
+
+  it("runs diagnostics in the session workspace when workdir is omitted", async () => {
+    registerDiagnosticsTools();
+    const workspace = join(tmp, "diag-workspace");
+    mkdirSync(workspace, { recursive: true });
+
+    const session = createSession({ workspace_path: workspace });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      {
+        type: "done",
+        finish_reason: "tool_calls",
+        usage: null,
+        content: "",
+        reasoning_content: null,
+        tool_calls: [{
+          id: "call_1",
+          name: "diagnostics",
+          arguments: {},
+        }],
+      },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+    const payload = JSON.parse(result.tool_results[0].content);
+
+    expect(payload.cwd).toBe(workspace);
+  });
+
+  it("preserves explicit cwd aliases for git_status through the engine path", async () => {
+    registerGitTools();
+    const { execSync } = await import("node:child_process");
+    const workspace = join(tmp, "workspace");
+    const repo = join(workspace, "git-cwd-workspace");
+    mkdirSync(repo, { recursive: true });
+    writeFileSync(join(repo, "tracked.txt"), "tracked\n");
+    execSync("git init", { cwd: repo, stdio: "ignore" });
+    execSync("git config user.email test@example.com", { cwd: repo, stdio: "ignore" });
+    execSync("git config user.name 'Test User'", { cwd: repo, stdio: "ignore" });
+    execSync("git add tracked.txt", { cwd: repo, stdio: "ignore" });
+    execSync("git commit -m init", { cwd: repo, stdio: "ignore" });
+    writeFileSync(join(repo, "tracked.txt"), "changed\n");
+
+    const session = createSession({ workspace_path: workspace });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      {
+        type: "done",
+        finish_reason: "tool_calls",
+        usage: null,
+        content: "",
+        reasoning_content: null,
+        tool_calls: [{
+          id: "call_1",
+          name: "git_status",
+          arguments: { cwd: repo },
+        }],
+      },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+
+    expect(result.tool_results[0]).toMatchObject({ is_error: false });
+    expect(result.tool_results[0].content).toContain("tracked.txt");
+  });
+
+  it("preserves explicit cwd aliases for bash through the engine path", async () => {
+    registerShellTool();
+    const workspace = join(tmp, "workspace");
+    const shellDir = join(workspace, "bash-cwd-workspace");
+    mkdirSync(shellDir, { recursive: true });
+
+    const session = createSession({ workspace_path: workspace });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      {
+        type: "done",
+        finish_reason: "tool_calls",
+        usage: null,
+        content: "",
+        reasoning_content: null,
+        tool_calls: [{
+          id: "call_1",
+          name: "bash",
+          arguments: { command: "pwd", cwd: shellDir },
+        }],
+      },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      requestApproval: async () => true,
+    });
+
+    expect(result.tool_results[0]).toMatchObject({ is_error: false });
+    expect(result.tool_results[0].content).toContain(shellDir);
+  });
+
+  it("runs pr_attempt_record in the session workspace when workdir is omitted", async () => {
+    registerDiagnosticsTools();
+    getRegistry().activate("pr_attempt_record");
+    const { execSync } = await import("node:child_process");
+    const workspace = join(tmp, "attempt-workspace");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, "tracked.txt"), "tracked\n");
+    execSync("git init", { cwd: workspace, stdio: "ignore" });
+    execSync("git config user.email test@example.com", { cwd: workspace, stdio: "ignore" });
+    execSync("git config user.name 'Test User'", { cwd: workspace, stdio: "ignore" });
+    execSync("git add tracked.txt", { cwd: workspace, stdio: "ignore" });
+    execSync("git commit -m init", { cwd: workspace, stdio: "ignore" });
+    writeFileSync(join(workspace, "tracked.txt"), "changed\n");
+
+    const session = createSession({ workspace_path: workspace });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      {
+        type: "done",
+        finish_reason: "tool_calls",
+        usage: null,
+        content: "",
+        reasoning_content: null,
+        tool_calls: [{
+          id: "call_1",
+          name: "pr_attempt_record",
+          arguments: {},
+        }],
+      },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+    const recorded = JSON.parse(result.tool_results[0].content);
+
+    expect(recorded.status).toContain("tracked.txt");
+  });
+
+  it("runs git_log and git_branch in the session workspace when workdir is omitted", async () => {
+    registerGitTools();
+    const { execSync } = await import("node:child_process");
+    const workspace = join(tmp, "git-log-workspace");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, "tracked.txt"), "tracked\n");
+    execSync("git init", { cwd: workspace, stdio: "ignore" });
+    execSync("git config user.email test@example.com", { cwd: workspace, stdio: "ignore" });
+    execSync("git config user.name 'Test User'", { cwd: workspace, stdio: "ignore" });
+    execSync("git checkout -b feature/test-branch", { cwd: workspace, stdio: "ignore" });
+    execSync("git add tracked.txt", { cwd: workspace, stdio: "ignore" });
+    execSync("git commit -m init", { cwd: workspace, stdio: "ignore" });
+
+    const session = createSession({ workspace_path: workspace });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      {
+        type: "done",
+        finish_reason: "tool_calls",
+        usage: null,
+        content: "",
+        reasoning_content: null,
+        tool_calls: [
+          { id: "call_1", name: "git_log", arguments: {} },
+          { id: "call_2", name: "git_branch", arguments: {} },
+        ],
+      },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+
+    expect(result.tool_results[0].content).toContain("init");
+    expect(result.tool_results[1].content).toContain("feature/test-branch");
   });
 
   it("emits tool progress events and rendered result metadata", async () => {
@@ -2315,6 +3016,46 @@ describe("skills system", () => {
     expect(existsSync(join(skillsDir, "renamed"))).toBe(false);
     expect(readFileSync(join(skillsDir, "original", "SKILL.md"), "utf-8")).toBe(originalBody);
   });
+
+  it("rejects malformed installed skill markers instead of stringifying fake update metadata", async () => {
+    const skillsDir = join(tmp, "installed");
+    const original = tarGz([
+      { path: "repo-main/original/SKILL.md", data: skillMd("original", "original skill", "body v1") },
+    ]);
+    const installed = installSkillFromArchive(original, "https://example.com/original.tar.gz", skillsDir);
+
+    writeFileSync(join(installed.path, ".installed-from"), JSON.stringify({
+      source: { nested: true },
+      checksum: ["bad"],
+    }, null, 2), "utf-8");
+
+    await expect(updateSkill("original", { skillsDir })).rejects.toThrow(/was not installed by \/skill install/i);
+  });
+
+  it("filters malformed remote skill registry entries instead of stringifying objects into fake skill metadata", async () => {
+    const registryBody = JSON.stringify({
+      skills: [
+        { name: "valid-skill", description: "works", source: "registry", spec: "valid-skill" },
+        { name: { nested: true }, description: "bad name" },
+        { name: "typed-skill", description: { nested: true }, source: ["bad"] },
+      ],
+    });
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(registryBody, {
+      status: 200,
+      headers: { "content-length": String(registryBody.length) },
+    })) as typeof globalThis.fetch;
+    try {
+      const listed = await fetchRegistrySkills("https://example.com/skills.json");
+
+      expect(listed).toEqual([
+        { name: "valid-skill", description: "works", source: "registry", spec: "valid-skill" },
+        { name: "typed-skill", description: undefined, source: undefined, spec: undefined, url: undefined, repo: undefined },
+      ]);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
 });
 
 describe("P1 tool system", () => {
@@ -2344,6 +3085,222 @@ describe("P1 tool system", () => {
     expect(config).toContain("demo");
   });
 
+  it("rejects malformed mcp_manager add inputs instead of persisting stringified objects", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("mcp_manager")!;
+
+    expect(await tool.validateInput?.(
+      { action: "add", name: { nested: true } as any, command: process.execPath },
+      { tool_name: "mcp_manager", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("name"),
+    });
+
+    const result = await tool.execute({
+      action: "add",
+      name: { nested: true } as any,
+      command: process.execPath,
+    });
+    const listed = JSON.parse(await tool.execute({ action: "list" })) as Array<{ name: string }>;
+
+    expect(result).toContain("name is required");
+    expect(listed).toEqual([]);
+  });
+
+  it("rejects malformed mcp_manager env values instead of persisting stringified process environment", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("mcp_manager")!;
+
+    expect(await tool.validateInput?.(
+      {
+        action: "add",
+        name: "bad-env",
+        command: process.execPath,
+        env: { OK: "1", BAD: { nested: true } } as any,
+      },
+      { tool_name: "mcp_manager", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("env must be an object with string values"),
+    });
+
+    const result = await tool.execute({
+      action: "add",
+      name: "bad-env",
+      command: process.execPath,
+      env: { OK: "1", BAD: { nested: true } } as any,
+    });
+    const listed = JSON.parse(await tool.execute({ action: "list" })) as Array<{ name: string }>;
+
+    expect(result).toContain("env must be an object with string values");
+    expect(listed).toEqual([]);
+  });
+
+  it("rejects malformed mcp_manager transport and enabled flags instead of silently normalizing them", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("mcp_manager")!;
+
+    expect(await tool.validateInput?.(
+      { action: "add", name: "bad-transport", transport: { nested: true } as any, command: process.execPath },
+      { tool_name: "mcp_manager", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("transport must be a string"),
+    });
+    expect(await tool.validateInput?.(
+      { action: "add", name: "bad-transport", transport: "http", command: process.execPath },
+      { tool_name: "mcp_manager", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("transport must be stdio or sse"),
+    });
+    expect(await tool.validateInput?.(
+      { action: "add", name: "bad-enabled", command: process.execPath, enabled: "yes" as any },
+      { tool_name: "mcp_manager", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("enabled must be a boolean"),
+    });
+
+    expect(await tool.execute({
+      action: "add",
+      name: "bad-transport",
+      transport: "http",
+      command: process.execPath,
+    })).toContain("transport must be stdio or sse");
+    expect(await tool.execute({
+      action: "add",
+      name: "bad-enabled",
+      command: process.execPath,
+      enabled: "yes" as any,
+    })).toContain("enabled must be a boolean");
+    expect(JSON.parse(await tool.execute({ action: "list" }))).toEqual([]);
+  });
+
+  it("rejects malformed mcp_manager name selectors instead of stringifying objects into fake targets", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("mcp_manager")!;
+
+    expect(await tool.validateInput?.(
+      { action: "enable", name: { nested: true } as any },
+      { tool_name: "mcp_manager", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("name"),
+    });
+
+    expect(await tool.execute({ action: "enable", name: { nested: true } as any })).toContain("name is required");
+    expect(await tool.execute({ action: "reconnect", name: { nested: true } as any })).toContain("name is required");
+    expect(await tool.execute({ action: "health", name: { nested: true } as any })).toContain("name is required");
+  });
+
+  it("allows mcp_manager health validation without a name so callers can inspect all servers", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("mcp_manager")!;
+
+    expect(await tool.validateInput?.(
+      { action: "health" },
+      { tool_name: "mcp_manager", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: true,
+      args: { action: "health" },
+    });
+
+    expect(await tool.execute({ action: "health" })).toBe("{}");
+  });
+
+  it("filters malformed persisted MCP env values instead of reloading them into server config", async () => {
+    registerDiagnosticsTools();
+    writeUserConfigRaw({
+      mcp_servers: [
+        {
+          name: "demo",
+          transport: "stdio",
+          command: process.execPath,
+          env: {
+            GOOD: "1",
+            BAD_OBJ: { nested: true },
+            BAD_NUM: 7,
+          },
+        },
+      ],
+    });
+
+    const listed = JSON.parse(await getRegistry().lookup("mcp_manager")!.execute({ action: "list" })) as Array<{ name: string; env: Record<string, string> }>;
+
+    expect(listed).toEqual([
+      expect.objectContaining({
+        name: "demo",
+        env: { GOOD: "1" },
+      }),
+    ]);
+  });
+
+  it("skips malformed persisted MCP server rows instead of coercing them into fake configured servers", async () => {
+    registerDiagnosticsTools();
+    writeUserConfigRaw({
+      mcp_servers: [
+        {
+          name: { nested: true },
+          transport: "stdio",
+          command: process.execPath,
+        },
+        {
+          name: "demo",
+          transport: { nested: true },
+          command: { nested: true },
+          args: ["--ok", { nested: true }, ""],
+          url: { nested: true },
+          env: { GOOD: "1", BAD: { nested: true } },
+        },
+      ],
+    });
+
+    const listed = JSON.parse(await getRegistry().lookup("mcp_manager")!.execute({ action: "list" })) as Array<{
+      name: string;
+      transport: string;
+      command?: string;
+      args: string[];
+      url?: string;
+      env: Record<string, string>;
+    }>;
+
+    expect(listed).toMatchObject([
+      {
+        name: "demo",
+        transport: "stdio",
+        args: ["--ok"],
+        env: { GOOD: "1" },
+      },
+    ]);
+  });
+
+  it("rewrites persisted MCP config without malformed coerced fields after a manager update", async () => {
+    registerDiagnosticsTools();
+    writeUserConfigRaw({
+      mcp_servers: [
+        {
+          name: "demo",
+          transport: "stdio",
+          command: process.execPath,
+          args: ["--ok", { nested: true }],
+          env: { GOOD: "1", BAD: { nested: true } },
+        },
+      ],
+    });
+
+    await getRegistry().lookup("mcp_manager")!.execute({ action: "disable", name: "demo" });
+    const config = readFileSync(join(process.env.HOME!, ".seekcode", "config.toml"), "utf-8");
+
+    expect(config).toContain('name = "demo"');
+    expect(config).toContain('enabled = false');
+    expect(config).toContain('"--ok"');
+    expect(config).toContain('GOOD = "1"');
+    expect(config).not.toContain("nested");
+    expect(config).not.toContain("[object Object]");
+  });
+
   it("reports MCP health failures with per-server log artifacts", async () => {
     registerDiagnosticsTools();
     await getRegistry().lookup("mcp_manager")!.execute({
@@ -2358,6 +3315,50 @@ describe("P1 tool system", () => {
 
     expect(health).toContain("failed");
     expect(health).toContain("log_artifact_id");
+  });
+
+  it("kills MCP stdio processes when startup fails before registration completes", async () => {
+    registerDiagnosticsTools();
+    const pidFile = join(tmp, "mcp-init-fail.pid");
+    const serverFile = join(tmp, "mcp-init-fail.mjs");
+    writeFileSync(serverFile, `
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(pidFile)}, String(process.pid), "utf-8");
+function respondError(id, message) {
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32001, message } }) + "\\n");
+}
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk.toString("utf-8");
+  let index;
+  while ((index = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, index).trim();
+    buffer = buffer.slice(index + 1);
+    if (!line) continue;
+    const request = JSON.parse(line);
+    if (request.method === "initialize") {
+      respondError(request.id, "init failed");
+    } else {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n");
+    }
+  }
+});
+setInterval(() => {}, 1000);
+`);
+
+    await getRegistry().lookup("mcp_manager")!.execute({
+      action: "add",
+      name: "broken",
+      command: process.execPath,
+      args: [serverFile],
+    });
+    const reloaded = JSON.parse(await getRegistry().lookup("mcp_manager")!.execute({ action: "reload" }));
+    const broken = reloaded.servers.find((server: any) => server.name === "broken");
+    await waitFor(() => existsSync(pidFile) ? true : null);
+    const pid = Number(readFileSync(pidFile, "utf-8").trim());
+
+    expect(broken.status).toBe("failed");
+    await waitFor(() => !isPidAlive(pid), 2500);
   });
 
   it("connects MCP servers, hot-refreshes tools, and unregisters tools after crashes", async () => {
@@ -2395,6 +3396,138 @@ describe("P1 tool system", () => {
     expect(health.hot.status).toBe("failed");
     expect(health.hot.stderr_tail).toContain("mcp crash requested");
     expect(health.hot.log_artifact_id).toBeTruthy();
+  });
+
+  it("cancels stale MCP reconnect timers after a manual reconnect", async () => {
+    registerDiagnosticsTools();
+    const stateFile = join(tmp, "mcp-reconnect-state.json");
+    const startsFile = join(tmp, "mcp-starts.log");
+    const serverFile = join(tmp, "mcp-reconnect-server.mjs");
+    const readStartCount = () => existsSync(startsFile)
+      ? readFileSync(startsFile, "utf-8").split("\n").filter(Boolean).length
+      : 0;
+    writeFileSync(stateFile, JSON.stringify({ tools: ["ping"] }));
+    writeFileSync(serverFile, `
+import { appendFileSync, readFileSync } from "node:fs";
+const stateFile = ${JSON.stringify(stateFile)};
+const startsFile = ${JSON.stringify(startsFile)};
+appendFileSync(startsFile, "start\\n", "utf-8");
+function tools() {
+  const state = JSON.parse(readFileSync(stateFile, "utf-8"));
+  return (state.tools || []).map((name) => ({
+    name,
+    description: name + " tool",
+    inputSchema: { type: "object", properties: { value: { type: "string" }, crash: { type: "boolean" } } },
+  }));
+}
+function respond(id, result) {
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
+}
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk.toString("utf-8");
+  let index;
+  while ((index = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, index).trim();
+    buffer = buffer.slice(index + 1);
+    if (!line) continue;
+    const request = JSON.parse(line);
+    if (request.method === "initialize") {
+      respond(request.id, { protocolVersion: "2024-11-05", capabilities: {} });
+    } else if (request.method === "tools/list") {
+      respond(request.id, { tools: tools() });
+    } else if (request.method === "tools/call") {
+      const args = request.params?.arguments || {};
+      if (args.crash) process.exit(42);
+      respond(request.id, { content: [{ type: "text", text: request.params.name + ":" + JSON.stringify(args) }] });
+    } else {
+      respond(request.id, {});
+    }
+  }
+});
+`);
+
+    await getRegistry().lookup("mcp_manager")!.execute({
+      action: "add",
+      name: "race",
+      command: process.execPath,
+      args: [serverFile],
+    });
+    await getRegistry().lookup("mcp_manager")!.execute({ action: "reload" });
+    await waitFor(() => getRegistry().lookup("mcp_race_ping") || null);
+    expect(readStartCount()).toBe(1);
+
+    await getRegistry().lookup("mcp_race_ping")!.execute({ crash: true });
+    await waitFor(() => getRegistry().lookup("mcp_race_ping") ? null : true);
+
+    await getRegistry().lookup("mcp_manager")!.execute({ action: "reconnect", name: "race" });
+    await waitFor(() => getRegistry().lookup("mcp_race_ping") || null);
+    await waitFor(() => readStartCount() === 2 ? 2 : null);
+
+    await new Promise(resolve => setTimeout(resolve, 1300));
+
+    expect(readStartCount()).toBe(2);
+    expect(await getRegistry().lookup("mcp_race_ping")!.execute({ value: "ok" })).toContain("ping:{\"value\":\"ok\"}");
+  });
+
+  it("does not reconnect disabled MCP servers or register their tools", async () => {
+    registerDiagnosticsTools();
+    const stateFile = join(tmp, "mcp-disabled-state.json");
+    const startsFile = join(tmp, "mcp-disabled-starts.log");
+    const serverFile = join(tmp, "mcp-disabled-server.mjs");
+    const readStartCount = () => existsSync(startsFile)
+      ? readFileSync(startsFile, "utf-8").split("\n").filter(Boolean).length
+      : 0;
+    writeFileSync(stateFile, JSON.stringify({ tools: ["noop"] }));
+    writeFileSync(serverFile, `
+import { appendFileSync, readFileSync } from "node:fs";
+const stateFile = ${JSON.stringify(stateFile)};
+const startsFile = ${JSON.stringify(startsFile)};
+appendFileSync(startsFile, "start\\n", "utf-8");
+function tools() {
+  const state = JSON.parse(readFileSync(stateFile, "utf-8"));
+  return (state.tools || []).map((name) => ({
+    name,
+    description: name + " tool",
+    inputSchema: { type: "object", properties: {} },
+  }));
+}
+function respond(id, result) {
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
+}
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk.toString("utf-8");
+  let index;
+  while ((index = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, index).trim();
+    buffer = buffer.slice(index + 1);
+    if (!line) continue;
+    const request = JSON.parse(line);
+    if (request.method === "initialize") {
+      respond(request.id, { protocolVersion: "2024-11-05", capabilities: {} });
+    } else if (request.method === "tools/list") {
+      respond(request.id, { tools: tools() });
+    } else if (request.method === "tools/call") {
+      respond(request.id, { content: [{ type: "text", text: request.params.name }] });
+    } else {
+      respond(request.id, {});
+    }
+  }
+});
+`);
+
+    await getRegistry().lookup("mcp_manager")!.execute({ action: "add", name: "sleeping", command: process.execPath, args: [serverFile] });
+    await getRegistry().lookup("mcp_manager")!.execute({ action: "disable", name: "sleeping" });
+    await getRegistry().lookup("mcp_manager")!.execute({ action: "reload" });
+
+    const reconnect = await getRegistry().lookup("mcp_manager")!.execute({ action: "reconnect", name: "sleeping" });
+    const listed = JSON.parse(await getRegistry().lookup("mcp_manager")!.execute({ action: "list" }));
+
+    expect(reconnect).toContain("disabled");
+    expect(readStartCount()).toBe(0);
+    expect(getRegistry().lookup("mcp_sleeping_noop")).toBeUndefined();
+    expect(listed.find((server: any) => server.name === "sleeping")).toMatchObject({ status: "disabled" });
   });
 
   it("persists MCP add/disable/enable/remove and applies enabled state after reload", async () => {
@@ -2561,6 +3694,76 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
+  it("skips malformed Python diagnostic JSON entries instead of stringifying object fields into fake diagnostics", async () => {
+    registerDiagnosticsTools();
+    const bin = join(tmp, "bin");
+    mkdirSync(bin, { recursive: true });
+    const fakePyright = join(bin, "pyright");
+    writeFileSync(fakePyright, [
+      "#!/usr/bin/env bash",
+      "cat <<'JSON'",
+      JSON.stringify({
+        generalDiagnostics: [
+          {
+            file: { nested: true },
+            severity: "error",
+            message: "bad file field",
+            rule: "badRule",
+            range: { start: { line: 1, character: 1 } },
+          },
+          {
+            file: join(tmp, "src", "bad-message.py"),
+            severity: "warning",
+            message: { nested: true },
+            rule: "badMessage",
+            range: { start: { line: 2, character: 2 } },
+          },
+          {
+            file: join(tmp, "src", "bad-rule.py"),
+            severity: "error",
+            message: "bad rule field",
+            rule: { nested: true },
+            range: { start: { line: 3, character: 3 } },
+          },
+          {
+            file: join(tmp, "src", "keep.py"),
+            severity: "error",
+            message: "real diagnostic",
+            rule: "reportRealIssue",
+            range: { start: { line: 4, character: 5 } },
+          },
+        ],
+      }),
+      "JSON",
+    ].join("\n"));
+    await run(`chmod +x ${JSON.stringify(fakePyright)}`);
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${bin}:${oldPath || ""}`;
+    try {
+      const result = JSON.parse(await getRegistry().lookup("lsp_diagnostics")!.execute({
+        workdir: tmp,
+        language: "python",
+        min_severity: "all",
+      }));
+
+      expect(result.summary).toEqual({ total: 1, by_severity: { error: 1 } });
+      expect(result.diagnostics).toEqual([
+        expect.objectContaining({
+          file: join(tmp, "src", "keep.py"),
+          line: 5,
+          column: 6,
+          severity: "error",
+          code: "reportRealIssue",
+          message: "real diagnostic",
+        }),
+      ]);
+      expect(JSON.stringify(result.diagnostics)).not.toContain("[object Object]");
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
   it("parses TypeScript, Go, and Rust diagnostic text formats", async () => {
     registerDiagnosticsTools();
     const bin = join(tmp, "bin");
@@ -2608,6 +3811,162 @@ process.stdin.on("data", (chunk) => {
 
     expect(result).toContain("dirty worktree guard");
     expect(result).toContain("Evidence artifact:");
+  });
+
+  it("normalizes GitHub comment aliases during validation", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("github_comment")!;
+    const validation = await tool.validateInput?.(
+      { number: "42", body: "hello", workdir: tmp },
+      { tool_name: "github_comment", workspace_path: tmp, tool_def: tool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: {
+        target: "42",
+        body: "hello",
+        workdir: tmp,
+      },
+    });
+  });
+
+  it("accepts the canonical GitHub comment target field during execution", async () => {
+    registerDiagnosticsTools();
+    await run("git init");
+    await run("git config user.email test@example.com");
+    await run("git config user.name Tester");
+    writeFileSync(join(tmp, ".gitignore"), "artifacts/\nhome/\ngh-calls.log\n");
+    const bin = join(tmp, "bin");
+    const calls = join(tmp, "gh-calls.log");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, "gh"), [
+      "#!/usr/bin/env bash",
+      `printf '%s\\n' \"$*\" >> ${JSON.stringify(calls)}`,
+      "if [[ \"$1 $2\" == \"issue view\" ]]; then",
+      "  printf '%s\\n' '{\"number\":42,\"title\":\"Canonical target\",\"state\":\"OPEN\",\"url\":\"https://example.invalid/42\"}'",
+      "  exit 0",
+      "fi",
+      "if [[ \"$1 $2\" == \"issue comment\" ]]; then",
+      "  printf '%s\\n' 'comment created'",
+      "  exit 0",
+      "fi",
+      "exit 2",
+    ].join("\n"));
+    await run(`chmod +x ${JSON.stringify(join(bin, "gh"))}`);
+    await run("git add .gitignore bin/gh && git commit -m fake-gh");
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${bin}:${oldPath || ""}`;
+    try {
+      const result = await getRegistry().lookup("github_comment")!.execute({
+        target: " 42 ",
+        body: " hello ",
+        workdir: tmp,
+      });
+
+      expect(result).toContain("comment created");
+      expect(readFileSync(calls, "utf-8")).toContain("issue comment 42 --body hello");
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it("rejects blank GitHub comment bodies during execution instead of posting whitespace-only comments", async () => {
+    registerDiagnosticsTools();
+
+    expect(await getRegistry().lookup("github_comment")!.execute({
+      target: "42",
+      body: "   ",
+      workdir: tmp,
+    })).toContain("target and body are required");
+  });
+
+  it("normalizes GitHub issue selectors during validation", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("github_issue_context")!;
+    const validation = await tool.validateInput?.(
+      { number: "77", workdir: tmp },
+      { tool_name: "github_issue_context", workspace_path: tmp, tool_def: tool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: {
+        issue: "77",
+        workdir: tmp,
+      },
+    });
+  });
+
+  it("trims GitHub issue selectors during execution", async () => {
+    registerDiagnosticsTools();
+    await run("git init");
+    await run("git config user.email test@example.com");
+    await run("git config user.name Tester");
+    writeFileSync(join(tmp, ".gitignore"), "artifacts/\nhome/\ngh-calls.log\n");
+    const bin = join(tmp, "bin");
+    const calls = join(tmp, "gh-calls.log");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, "gh"), [
+      "#!/usr/bin/env bash",
+      `printf '%s\\n' \"$*\" >> ${JSON.stringify(calls)}`,
+      "if [[ \"$1 $2\" == \"issue view\" ]]; then",
+      "  printf '%s\\n' '{\"number\":77,\"title\":\"Issue title\",\"state\":\"OPEN\",\"url\":\"https://example.invalid/77\"}'",
+      "  exit 0",
+      "fi",
+      "exit 2",
+    ].join("\n"));
+    await run(`chmod +x ${JSON.stringify(join(bin, "gh"))}`);
+    await run("git add .gitignore bin/gh && git commit -m fake-gh");
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${bin}:${oldPath || ""}`;
+    try {
+      const result = await getRegistry().lookup("github_issue_context")!.execute({ issue: " 77 ", workdir: tmp });
+
+      expect(result).toContain("Issue title");
+      expect(readFileSync(calls, "utf-8")).toContain("issue view 77 --json");
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it("rejects non-string GitHub selectors during execution instead of stringifying objects into fake targets", async () => {
+    registerDiagnosticsTools();
+
+    expect(await getRegistry().lookup("github_issue_context")!.execute({ number: { nested: true } as any, workdir: tmp })).toContain("issue, number, or url is required");
+    expect(await getRegistry().lookup("github_pr_context")!.execute({ number: { nested: true } as any, workdir: tmp })).toContain("pr, number, or url is required");
+    expect(await getRegistry().lookup("github_comment")!.execute({ number: { nested: true } as any, body: "hello", workdir: tmp })).toContain("target and body are required");
+    expect(await getRegistry().lookup("github_close_issue")!.execute({ number: { nested: true } as any, reason: "done", workdir: tmp })).toContain("issue and reason are required");
+  });
+
+  it("normalizes GitHub close selectors and reason during validation", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("github_close_issue")!;
+    const validation = await tool.validateInput?.(
+      { number: "88", reason: "done", workdir: tmp },
+      { tool_name: "github_close_issue", workspace_path: tmp, tool_def: tool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: {
+        issue: "88",
+        reason: "done",
+        workdir: tmp,
+      },
+    });
+  });
+
+  it("rejects blank GitHub close reasons during execution instead of posting whitespace-only close comments", async () => {
+    registerDiagnosticsTools();
+
+    expect(await getRegistry().lookup("github_close_issue")!.execute({
+      issue: "88",
+      reason: "   ",
+      workdir: tmp,
+    })).toContain("issue and reason are required");
   });
 
   it("does not misclassify verified GitHub targets whose title contains error-like words", async () => {
@@ -2681,6 +4040,133 @@ process.stdin.on("data", (chunk) => {
     expect(read).toContain("+new");
   });
 
+  it("normalizes pr_attempt_gate aliases during validation", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("pr_attempt_gate")!;
+    const validation = await tool.validateInput?.(
+      { gate: "test -f README.md", workdir: tmp },
+      { tool_name: "pr_attempt_gate", workspace_path: tmp, tool_def: tool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: {
+        command: "test -f README.md",
+        workdir: tmp,
+      },
+    });
+  });
+
+  it("rejects non-string PR attempt gate commands during execution instead of stringifying objects", async () => {
+    registerDiagnosticsTools();
+
+    const tool = getRegistry().lookup("pr_attempt_gate")!;
+    expect(await tool.validateInput?.(
+      { gate: { nested: true } as any, workdir: tmp },
+      { tool_name: "pr_attempt_gate", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("command is required"),
+    });
+
+    expect(await getRegistry().lookup("pr_attempt_gate")!.execute({
+      gate: { nested: true } as any,
+      workdir: tmp,
+    })).toContain("command is required");
+  });
+
+  it("rejects blank PR attempt gate commands during execution instead of running empty gates", async () => {
+    registerDiagnosticsTools();
+
+    expect(await getRegistry().lookup("pr_attempt_gate")!.execute({
+      command: "   ",
+      workdir: tmp,
+    })).toContain("command is required");
+  });
+
+  it("normalizes PR review selectors during validation", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("pr_attempt_review_sync")!;
+    const validation = await tool.validateInput?.(
+      { number: "91", workdir: tmp },
+      { tool_name: "pr_attempt_review_sync", workspace_path: tmp, tool_def: tool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: {
+        pr: "91",
+        workdir: tmp,
+      },
+    });
+  });
+
+  it("trims PR review selectors during execution", async () => {
+    registerDiagnosticsTools();
+    await run("git init");
+    await run("git config user.email test@example.com");
+    await run("git config user.name Tester");
+    writeFileSync(join(tmp, ".gitignore"), "artifacts/\nhome/\ngh-calls.log\n");
+    const bin = join(tmp, "bin");
+    const calls = join(tmp, "gh-calls.log");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, "gh"), [
+      "#!/usr/bin/env bash",
+      `printf '%s\\n' \"$*\" >> ${JSON.stringify(calls)}`,
+      "if [[ \"$1 $2\" == \"pr view\" ]]; then",
+      "  printf '%s\\n' '{\"comments\":[],\"reviews\":[],\"reviewDecision\":\"\",\"url\":\"https://example.invalid/pr/91\"}'",
+      "  exit 0",
+      "fi",
+      "exit 2",
+    ].join("\n"));
+    await run(`chmod +x ${JSON.stringify(join(bin, "gh"))}`);
+    await run("git add .gitignore bin/gh && git commit -m fake-gh");
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${bin}:${oldPath || ""}`;
+    try {
+      const result = await getRegistry().lookup("pr_attempt_review_sync")!.execute({
+        pr: " 91 ",
+        workdir: tmp,
+      });
+
+      expect(result).toContain("artifact_id");
+      expect(readFileSync(calls, "utf-8")).toContain("pr view 91 --json");
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it("rejects non-string PR review selectors during execution instead of stringifying objects into fake targets", async () => {
+    registerDiagnosticsTools();
+
+    expect(await getRegistry().lookup("pr_attempt_review_sync")!.execute({
+      number: { nested: true } as any,
+      workdir: tmp,
+    })).toContain("pr, number, or url is required");
+  });
+
+  it("validates pr_attempt_read id requirements before dispatch", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("pr_attempt_read")!;
+    const validation = await tool.validateInput?.(
+      { id: "artifact_123" },
+      { tool_name: "pr_attempt_read", workspace_path: tmp, tool_def: tool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: { id: "artifact_123" },
+    });
+    expect(await tool.validateInput?.(
+      {},
+      { tool_name: "pr_attempt_read", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("id is required"),
+    });
+  });
+
   it("runs PR attempt gates and records rollback evidence", async () => {
     registerDiagnosticsTools();
     registerArtifactTools();
@@ -2706,6 +4192,483 @@ process.stdin.on("data", (chunk) => {
     expect(rollbackLog).toContain("[after]");
   });
 
+  it("rejects non-string PR attempt branch and rollback targets instead of stringifying objects", async () => {
+    registerDiagnosticsTools();
+
+    expect(await getRegistry().lookup("pr_attempt_branch")!.execute({
+      workdir: tmp,
+      branch: { nested: true } as any,
+    })).toContain("branch must be a string");
+
+    expect(await getRegistry().lookup("pr_attempt_rollback")!.execute({
+      workdir: tmp,
+      branch: { nested: true } as any,
+    })).toContain("branch must be a string");
+
+    expect(await getRegistry().lookup("pr_attempt_rollback")!.execute({
+      workdir: tmp,
+      target: { nested: true } as any,
+    })).toContain("target must be a string");
+  });
+
+  it("rejects blank PR attempt branch names instead of creating bogus '-' branches", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("pr_attempt_branch")!;
+
+    expect(await tool.validateInput?.(
+      { workdir: tmp, branch: "   " },
+      { tool_name: "pr_attempt_branch", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("branch must be a non-empty string"),
+    });
+    expect(await tool.validateInput?.(
+      { workdir: tmp, base: "   " },
+      { tool_name: "pr_attempt_branch", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("base must be a non-empty string"),
+    });
+
+    expect(await tool.execute({
+      workdir: tmp,
+      branch: "   ",
+    })).not.toContain('"branch":"-"');
+  });
+
+  it("rejects non-string PR draft metadata instead of stringifying objects into GitHub commands", async () => {
+    registerDiagnosticsTools();
+    const draftTool = getRegistry().lookup("pr_attempt_push_draft")!;
+    const rollbackTool = getRegistry().lookup("pr_attempt_rollback")!;
+
+    expect(await draftTool.validateInput?.(
+      { workdir: tmp, title: { nested: true } as any },
+      { tool_name: "pr_attempt_push_draft", workspace_path: tmp, tool_def: draftTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("title must be a string"),
+    });
+    expect(await draftTool.validateInput?.(
+      { workdir: tmp, body: { nested: true } as any },
+      { tool_name: "pr_attempt_push_draft", workspace_path: tmp, tool_def: draftTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("body must be a string"),
+    });
+    expect(await draftTool.validateInput?.(
+      { workdir: tmp, branch: { nested: true } as any },
+      { tool_name: "pr_attempt_push_draft", workspace_path: tmp, tool_def: draftTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("branch must be a string"),
+    });
+    expect(await rollbackTool.validateInput?.(
+      { workdir: tmp, branch: { nested: true } as any },
+      { tool_name: "pr_attempt_rollback", workspace_path: tmp, tool_def: rollbackTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("branch must be a string"),
+    });
+    expect(await rollbackTool.validateInput?.(
+      { workdir: tmp, target: { nested: true } as any },
+      { tool_name: "pr_attempt_rollback", workspace_path: tmp, tool_def: rollbackTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("target must be a string"),
+    });
+
+    expect(await getRegistry().lookup("pr_attempt_push_draft")!.execute({
+      workdir: tmp,
+      title: { nested: true } as any,
+    })).toContain("title must be a string");
+
+    expect(await getRegistry().lookup("pr_attempt_push_draft")!.execute({
+      workdir: tmp,
+      body: { nested: true } as any,
+    })).toContain("body must be a string");
+    expect(await getRegistry().lookup("pr_attempt_push_draft")!.execute({
+      workdir: tmp,
+      branch: { nested: true } as any,
+    })).toContain("branch must be a string");
+    expect(await getRegistry().lookup("pr_attempt_rollback")!.execute({
+      workdir: tmp,
+      branch: { nested: true } as any,
+    })).toContain("branch must be a string");
+    expect(await getRegistry().lookup("pr_attempt_rollback")!.execute({
+      workdir: tmp,
+      target: { nested: true } as any,
+    })).toContain("target must be a string");
+  });
+
+  it("validates automation id requirements before dispatch", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("automation_run")!;
+    const validation = await tool.validateInput?.(
+      { id: "auto_123" },
+      { tool_name: "automation_run", workspace_path: tmp, tool_def: tool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: { id: "auto_123" },
+    });
+    expect(await tool.validateInput?.(
+      {},
+      { tool_name: "automation_run", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("id is required"),
+    });
+  });
+
+  it("rejects non-string automation ids during validation instead of stringifying objects", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("automation_run")!;
+
+    expect(await tool.validateInput?.(
+      { id: { nested: true } as any },
+      { tool_name: "automation_run", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("id is required"),
+    });
+  });
+
+  it("rejects non-string automation ids during execution instead of looking up [object Object]", async () => {
+    registerDiagnosticsTools();
+
+    expect(await getRegistry().lookup("automation_run")!.execute({ id: { nested: true } as any })).toContain("id is required");
+    expect(await getRegistry().lookup("automation_pause")!.execute({ id: { nested: true } as any })).toContain("id is required");
+    expect(await getRegistry().lookup("automation_delete")!.execute({ id: { nested: true } as any })).toContain("id is required");
+  });
+
+  it("validates automation_create prompt requirements before dispatch", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("automation_create")!;
+    const validation = await tool.validateInput?.(
+      { prompt: "watch release branch" },
+      { tool_name: "automation_create", workspace_path: tmp, tool_def: tool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: { prompt: "watch release branch" },
+    });
+    expect(await tool.validateInput?.(
+      { prompt: "   " },
+      { tool_name: "automation_create", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("prompt is required"),
+    });
+  });
+
+  it("rejects non-string automation prompts instead of persisting coerced values", async () => {
+    registerDiagnosticsTools();
+    const createTool = getRegistry().lookup("automation_create")!;
+
+    expect(await createTool.validateInput?.(
+      { prompt: { nested: true } as any },
+      { tool_name: "automation_create", workspace_path: tmp, tool_def: createTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("prompt is required"),
+    });
+
+    const created = await createTool.execute({ prompt: { nested: true } as any });
+    const listed = await getRegistry().lookup("automation_list")!.execute({});
+
+    expect(created).toContain("prompt is required");
+    expect(listed).toBe("[]");
+  });
+
+  it("rejects non-string automation schedules instead of persisting coerced scheduling metadata", async () => {
+    registerDiagnosticsTools();
+    const createTool = getRegistry().lookup("automation_create")!;
+
+    expect(await createTool.validateInput?.(
+      { prompt: "watch branch", schedule: { nested: true } as any },
+      { tool_name: "automation_create", workspace_path: tmp, tool_def: createTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("schedule must be a string"),
+    });
+
+    expect(await createTool.execute({
+      prompt: "watch branch",
+      schedule: { nested: true } as any,
+    })).toContain("schedule must be a string");
+    expect(await getRegistry().lookup("automation_list")!.execute({})).toBe("[]");
+  });
+
+  it("rejects non-string automation updates instead of corrupting persisted automation state", async () => {
+    registerDiagnosticsTools();
+    const created = JSON.parse(await getRegistry().lookup("automation_create")!.execute({ prompt: "watch branch" })) as { id: string };
+    const updateTool = getRegistry().lookup("automation_update")!;
+
+    expect(await updateTool.validateInput?.(
+      { id: created.id, schedule: { nested: true } as any },
+      { tool_name: "automation_update", workspace_path: tmp, tool_def: updateTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("schedule must be a string"),
+    });
+
+    const updated = await getRegistry().lookup("automation_update")!.execute({
+      id: created.id,
+      prompt: { nested: true } as any,
+    });
+    const read = JSON.parse(await getRegistry().lookup("automation_read")!.execute({ id: created.id })) as { prompt: string };
+
+    expect(updated).toContain("prompt is required");
+    expect(read.prompt).toBe("watch branch");
+  });
+
+  it("rejects malformed lsp_diagnostics inputs instead of stringifying them into fake commands and artifact metadata", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("lsp_diagnostics")!;
+
+    expect(await tool.validateInput?.(
+      { workdir: tmp, language: { nested: true } as any },
+      { tool_name: "lsp_diagnostics", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("language must be a string"),
+    });
+    expect(await tool.validateInput?.(
+      { workdir: tmp, min_severity: { nested: true } as any },
+      { tool_name: "lsp_diagnostics", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("min_severity must be a string"),
+    });
+    expect(await tool.validateInput?.(
+      { workdir: tmp, files: [join(tmp, "a.ts"), 7] as any },
+      { tool_name: "lsp_diagnostics", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("files must be a string or array of strings"),
+    });
+
+    expect(await tool.execute({ workdir: tmp, language: { nested: true } as any })).toContain("language must be a string");
+    expect(await tool.execute({ workdir: tmp, min_severity: { nested: true } as any })).toContain("min_severity must be a string");
+    expect(await tool.execute({ workdir: tmp, files: [join(tmp, "a.ts"), 7] as any })).toContain("files must be a string or array of strings");
+  });
+
+  it("rejects malformed diagnostics workdirs instead of passing object roots into subprocess helpers", async () => {
+    registerDiagnosticsTools();
+    const diagnosticsTool = getRegistry().lookup("diagnostics")!;
+    const issueTool = getRegistry().lookup("github_issue_context")!;
+    const recordTool = getRegistry().lookup("pr_attempt_record")!;
+    const draftTool = getRegistry().lookup("pr_attempt_push_draft")!;
+    const rollbackTool = getRegistry().lookup("pr_attempt_rollback")!;
+
+    expect(await diagnosticsTool.validateInput?.(
+      { workdir: { nested: true } as any },
+      { tool_name: "diagnostics", workspace_path: tmp, tool_def: diagnosticsTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
+    expect(await issueTool.validateInput?.(
+      { number: "1", workdir: { nested: true } as any },
+      { tool_name: "github_issue_context", workspace_path: tmp, tool_def: issueTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
+    expect(await recordTool.validateInput?.(
+      { cwd: { nested: true } as any },
+      { tool_name: "pr_attempt_record", workspace_path: tmp, tool_def: recordTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
+    expect(await draftTool.validateInput?.(
+      { workdir: { nested: true } as any },
+      { tool_name: "pr_attempt_push_draft", workspace_path: tmp, tool_def: draftTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
+    expect(await rollbackTool.validateInput?.(
+      { cwd: { nested: true } as any },
+      { tool_name: "pr_attempt_rollback", workspace_path: tmp, tool_def: rollbackTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
+
+    expect(await diagnosticsTool.execute({ workdir: { nested: true } as any })).toContain("workdir must be a string");
+    expect(await getRegistry().lookup("pr_attempt_record")!.execute({ cwd: { nested: true } as any })).toContain("workdir must be a string");
+    expect(await getRegistry().lookup("pr_attempt_push_draft")!.execute({ workdir: { nested: true } as any })).toContain("workdir must be a string");
+    expect(await getRegistry().lookup("pr_attempt_rollback")!.execute({ cwd: { nested: true } as any })).toContain("workdir must be a string");
+  });
+
+  it("normalizes web_search compatibility aliases during validation", async () => {
+    registerWebTools();
+    const tool = getRegistry().lookup("web_search")!;
+    const validation = await tool.validateInput?.(
+      {
+        source: "bing",
+        searchType: "deep",
+        include_content: true,
+        contextResults: 3,
+        contextMaxCharacters: 900,
+        search_query: [{ q: "deepseek api", max_results: 2, domains: ["example.com"] }],
+      },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: tool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: {
+        source: "bing",
+        engine: "bing",
+        searchType: "deep",
+        type: "deep",
+        include_content: true,
+        fetch_results: true,
+        contextResults: 3,
+        context_results: 3,
+        contextMaxCharacters: 900,
+        context_max_characters: 900,
+        search_query: [{ q: "deepseek api", max_results: 2, domains: ["example.com"] }],
+        query: "deepseek api",
+        max_results: 2,
+        domains: ["example.com"],
+      },
+    });
+  });
+
+  it("rejects malformed web_search domain filters instead of stringifying objects into fake site filters", async () => {
+    registerWebTools();
+    const tool = getRegistry().lookup("web_search")!;
+
+    expect(await tool.validateInput?.(
+      { query: "deepseek", domains: [{ nested: true }] as any },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("domains must be an array of strings"),
+    });
+    expect(await tool.validateInput?.(
+      { search_query: [{ q: "deepseek", domains: [{ nested: true }] as any }] },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("search_query domains must be an array of strings"),
+    });
+  });
+
+  it("rejects malformed web_search query fields instead of deferring them to a generic missing-query error", async () => {
+    registerWebTools();
+    const tool = getRegistry().lookup("web_search")!;
+
+    expect(await tool.validateInput?.(
+      { query: { nested: true } as any },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("query must be a string"),
+    });
+    expect(await tool.validateInput?.(
+      { search_query: [{ q: { nested: true } as any }] },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("search_query q must be a string"),
+    });
+
+    expect(await tool.execute({ query: { nested: true } as any })).toContain("query is required");
+  });
+
+  it("rejects malformed optional web_search and web_fetch inputs instead of silently coercing them to defaults", async () => {
+    registerWebTools();
+    const searchTool = getRegistry().lookup("web_search")!;
+    const fetchTool = getRegistry().lookup("web_fetch")!;
+
+    expect(await searchTool.validateInput?.(
+      { query: "deepseek", max_results: { nested: true } as any },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: searchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("max_results must be a number"),
+    });
+    expect(await searchTool.validateInput?.(
+      { query: "deepseek", json: { nested: true } as any },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: searchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("json must be a boolean"),
+    });
+    expect(await searchTool.validateInput?.(
+      { search_query: [{ q: "deepseek", max_results: { nested: true } as any }] },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: searchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("search_query max_results must be a number"),
+    });
+
+    expect(await fetchTool.validateInput?.(
+      { url: "https://example.com", max_bytes: { nested: true } as any },
+      { tool_name: "web_fetch", workspace_path: tmp, tool_def: fetchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("max_bytes must be a number"),
+    });
+    expect(await fetchTool.validateInput?.(
+      { url: "https://example.com", json: { nested: true } as any },
+      { tool_name: "web_fetch", workspace_path: tmp, tool_def: fetchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("json must be a boolean"),
+    });
+    expect(await fetchTool.validateInput?.(
+      { url: "https://example.com", format: { nested: true } as any },
+      { tool_name: "web_fetch", workspace_path: tmp, tool_def: fetchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("format must be a string"),
+    });
+  });
+
+  it("accepts refId aliases for web_fetch validation", async () => {
+    registerWebTools();
+    const tool = getRegistry().lookup("web_fetch")!;
+    const validation = await tool.validateInput?.(
+      { refId: "ref_123", format: "markdown" },
+      { tool_name: "web_fetch", workspace_path: tmp, tool_def: tool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: {
+        refId: "ref_123",
+        ref_id: "ref_123",
+        format: "markdown",
+      },
+    });
+  });
+
+  it("accepts refId aliases for fetch_url validation", async () => {
+    registerWebTools();
+    const tool = getRegistry().lookup("fetch_url")!;
+    const validation = await tool.validateInput?.(
+      { refId: "ref_456", json: true },
+      { tool_name: "fetch_url", workspace_path: tmp, tool_def: tool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: {
+        refId: "ref_456",
+        ref_id: "ref_456",
+        json: true,
+      },
+    });
+  });
+
   it("links artifacts to replay targets", async () => {
     registerArtifactTools();
     const created = JSON.parse(await getRegistry().lookup("artifact_create")!.execute({ kind: "evidence", name: "e.txt", content: "proof" }));
@@ -2713,6 +4676,92 @@ process.stdin.on("data", (chunk) => {
 
     expect(listArtifactLinks({ scope: "turn", target_id: "session1:1" })[0].artifact_id).toBe(created.id);
     expect(await getRegistry().lookup("artifact_links")!.execute({ scope: "turn" })).toContain(created.id);
+  });
+
+  it("accepts artifact_link alias arguments during validation", async () => {
+    registerArtifactTools();
+    const created = JSON.parse(await getRegistry().lookup("artifact_create")!.execute({ kind: "evidence", name: "e.txt", content: "proof" }));
+    const linkTool = getRegistry().lookup("artifact_link")!;
+    const validation = await linkTool.validateInput?.(
+      { artifact_id: created.id, scope: "turn", target: "session1:2" },
+      { tool_name: "artifact_link", workspace_path: tmp, tool_def: linkTool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: {
+        id: created.id,
+        scope: "turn",
+        target_id: "session1:2",
+      },
+    });
+  });
+
+  it("accepts artifact_links alias filters during validation and execution", async () => {
+    registerArtifactTools();
+    const created = JSON.parse(await getRegistry().lookup("artifact_create")!.execute({ kind: "evidence", name: "e.txt", content: "proof" }));
+    await getRegistry().lookup("artifact_link")!.execute({ id: created.id, scope: "turn", target_id: "session1:aliases" });
+    const linksTool = getRegistry().lookup("artifact_links")!;
+
+    expect(await linksTool.validateInput?.(
+      { artifact_id: created.id, target: "session1:aliases" },
+      { tool_name: "artifact_links", workspace_path: tmp, tool_def: linksTool },
+    )).toMatchObject({
+      ok: true,
+      args: {
+        id: created.id,
+        target_id: "session1:aliases",
+      },
+    });
+
+    const result = await linksTool.execute({
+      artifact_id: created.id,
+      target: "session1:aliases",
+    } as any);
+
+    expect(result).toContain(created.id);
+    expect(result).toContain("session1:aliases");
+  });
+
+  it("rejects invalid artifact link scopes instead of persisting malformed links", async () => {
+    registerArtifactTools();
+    const created = JSON.parse(await getRegistry().lookup("artifact_create")!.execute({ kind: "evidence", name: "e.txt", content: "proof" }));
+    const linkTool = getRegistry().lookup("artifact_link")!;
+
+    expect(await linkTool.validateInput?.(
+      { id: created.id, scope: "weird", target_id: "session1:3" },
+      { tool_name: "artifact_link", workspace_path: tmp, tool_def: linkTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("scope"),
+    });
+
+    const result = await linkTool.execute({ id: created.id, scope: "weird", target_id: "session1:3" });
+
+    expect(result).toContain("scope must be one of");
+    expect(listArtifactLinks({ target_id: "session1:3" })).toEqual([]);
+  });
+
+  it("rejects non-string artifact link ids and targets instead of stringifying objects into the link index", async () => {
+    registerArtifactTools();
+    const linkTool = getRegistry().lookup("artifact_link")!;
+
+    expect(await linkTool.validateInput?.(
+      { id: { nested: true } as any, scope: "turn", target_id: ["session1:4"] as any },
+      { tool_name: "artifact_link", workspace_path: tmp, tool_def: linkTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("id and target_id"),
+    });
+
+    const result = await linkTool.execute({
+      id: { nested: true } as any,
+      scope: "turn",
+      target_id: ["session1:4"] as any,
+    });
+
+    expect(result).toContain("id and target_id are required");
+    expect(listArtifactLinks({ scope: "turn" })).toEqual([]);
   });
 
   it("keeps artifact index separate from artifact records and truncates large reads safely", async () => {
@@ -2729,6 +4778,190 @@ process.stdin.on("data", (chunk) => {
     expect(read).toContain("\"truncated\": true");
     expect(read).toContain("\"total_bytes\": 32");
     expect(read.endsWith("bbbbb")).toBe(true);
+  });
+
+  it("rejects non-string artifact_create content instead of persisting coerced values", async () => {
+    registerArtifactTools();
+
+    const result = await getRegistry().lookup("artifact_create")!.execute({
+      kind: "log",
+      name: "bad.log",
+      content: { nested: true } as any,
+    });
+    const listed = await getRegistry().lookup("artifact_list")!.execute({ kind: "log" });
+
+    expect(result).toContain("content must be a string");
+    expect(listed).toBe("No artifacts.");
+  });
+
+  it("rejects non-string artifact_create string fields instead of persisting coerced metadata", async () => {
+    registerArtifactTools();
+
+    expect(await getRegistry().lookup("artifact_create")!.execute({
+      kind: { nested: true } as any,
+      name: "bad.log",
+      content: "hello",
+    })).toContain("kind must be a string");
+    expect(await getRegistry().lookup("artifact_create")!.execute({
+      kind: "log",
+      name: ["bad.log"] as any,
+      content: "hello",
+    })).toContain("name must be a string");
+    expect(await getRegistry().lookup("artifact_create")!.execute({
+      kind: "log",
+      name: "bad.log",
+      extension: 7 as any,
+      content: "hello",
+    })).toContain("extension must be a string");
+
+    expect(await getRegistry().lookup("artifact_list")!.execute({ kind: "log" })).toBe("No artifacts.");
+  });
+
+  it("rejects malformed artifact metadata instead of reporting success for unreadable artifact state", async () => {
+    registerArtifactTools();
+    const createTool = getRegistry().lookup("artifact_create")!;
+    const created = JSON.parse(await createTool.execute({
+      kind: "evidence",
+      name: "proof.txt",
+      content: "proof",
+    }));
+    const linkTool = getRegistry().lookup("artifact_link")!;
+
+    expect(await createTool.validateInput?.(
+      { kind: "log", name: "bad.log", content: "hello", metadata: [] as any },
+      { tool_name: "artifact_create", workspace_path: tmp, tool_def: createTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("metadata must be an object"),
+    });
+    expect(await linkTool.validateInput?.(
+      { id: created.id, scope: "turn", target_id: "session1:meta", metadata: [] as any },
+      { tool_name: "artifact_link", workspace_path: tmp, tool_def: linkTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("metadata must be an object"),
+    });
+
+    expect(await createTool.execute({
+      kind: "log",
+      name: "bad.log",
+      content: "hello",
+      metadata: [] as any,
+    })).toContain("metadata must be an object");
+    expect(await linkTool.execute({
+      id: created.id,
+      scope: "turn",
+      target_id: "session1:meta",
+      metadata: [] as any,
+    })).toContain("metadata must be an object");
+    expect(listArtifactLinks({ scope: "turn", target_id: "session1:meta" })).toEqual([]);
+  });
+
+  it("rejects non-string artifact list and link filters instead of stringifying objects into fake lookups", async () => {
+    registerArtifactTools();
+    const listTool = getRegistry().lookup("artifact_list")!;
+    const linksTool = getRegistry().lookup("artifact_links")!;
+
+    expect(await listTool.validateInput?.(
+      { limit: "nope" },
+      { tool_name: "artifact_list", workspace_path: tmp, tool_def: listTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("limit must be a number"),
+    });
+    expect(await getRegistry().lookup("artifact_list")!.execute({
+      kind: { nested: true } as any,
+    })).toContain("kind must be a string");
+    expect(await getRegistry().lookup("artifact_list")!.execute({
+      limit: { nested: true } as any,
+    })).toContain("limit must be a number");
+    expect(await getRegistry().lookup("artifact_list")!.execute({
+      limit: "nope",
+    })).toContain("limit must be a number");
+    expect(await getRegistry().lookup("artifact_links")!.execute({
+      scope: { nested: true } as any,
+    })).toContain("scope must be a string");
+    expect(await getRegistry().lookup("artifact_links")!.execute({
+      target_id: { nested: true } as any,
+    })).toContain("target_id must be a string");
+    expect(await getRegistry().lookup("artifact_links")!.execute({
+      id: { nested: true } as any,
+    })).toContain("id must be a string");
+
+    expect(await linksTool.validateInput?.(
+      { scope: "" },
+      { tool_name: "artifact_links", workspace_path: tmp, tool_def: linksTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("scope must be one of"),
+    });
+    expect(await linksTool.validateInput?.(
+      { target_id: "   " },
+      { tool_name: "artifact_links", workspace_path: tmp, tool_def: linksTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("target_id must be a non-empty string"),
+    });
+    expect(await linksTool.validateInput?.(
+      { id: "   " },
+      { tool_name: "artifact_links", workspace_path: tmp, tool_def: linksTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("id must be a non-empty string"),
+    });
+
+    expect(await linksTool.execute({ scope: "" })).toContain("scope must be one of");
+    expect(await linksTool.execute({ target_id: "   " })).toContain("target_id must be a non-empty string");
+    expect(await linksTool.execute({ id: "   " })).toContain("id must be a non-empty string");
+  });
+
+  it("treats whitespace-only artifact_list limits like omission instead of collapsing results to one record", async () => {
+    registerArtifactTools();
+    await getRegistry().lookup("artifact_create")!.execute({ kind: "log", name: "a.log", content: "a" });
+    await getRegistry().lookup("artifact_create")!.execute({ kind: "log", name: "b.log", content: "b" });
+
+    const listed = JSON.parse(await getRegistry().lookup("artifact_list")!.execute({
+      limit: "   " as any,
+    }));
+
+    expect(listed).toHaveLength(2);
+  });
+
+  it("rejects non-string artifact_read ids instead of stringifying objects into fake lookups", async () => {
+    registerArtifactTools();
+
+    const result = await getRegistry().lookup("artifact_read")!.execute({ id: { nested: true } as any });
+
+    expect(result).toContain("id is required");
+  });
+
+  it("rejects malformed artifact_read byte limits instead of coercing objects into numeric defaults", async () => {
+    registerArtifactTools();
+    const readTool = getRegistry().lookup("artifact_read")!;
+    const created = JSON.parse(await getRegistry().lookup("artifact_create")!.execute({
+      kind: "log",
+      name: "run.log",
+      content: "abcdef",
+    }));
+
+    expect(await readTool.validateInput?.(
+      { id: created.id, max_bytes: "nope" },
+      { tool_name: "artifact_read", workspace_path: tmp, tool_def: readTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("max_bytes must be a number"),
+    });
+    const result = await getRegistry().lookup("artifact_read")!.execute({
+      id: created.id,
+      max_bytes: { nested: true } as any,
+    });
+    const stringResult = await getRegistry().lookup("artifact_read")!.execute({
+      id: created.id,
+      max_bytes: "nope",
+    });
+
+    expect(result).toContain("max_bytes must be a number");
+    expect(stringResult).toContain("max_bytes must be a number");
   });
 });
 
@@ -2852,6 +5085,16 @@ async function waitFor<T>(fn: () => T | Promise<T>, timeoutMs = 1500): Promise<N
     await new Promise(resolve => setTimeout(resolve, 25));
   } while (Date.now() < deadline);
   throw new Error("Timed out waiting for condition");
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: any) {
+    return error?.code === "EPERM";
+  }
 }
 
 function mcpServerScript(stateFile: string): string {

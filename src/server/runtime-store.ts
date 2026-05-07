@@ -125,13 +125,8 @@ function ensureLoaded(): void {
     mkdirSync(eventDir(), { recursive: true });
     for (const file of readdirSync(threadDir()).filter(name => name.endsWith(".json"))) {
       try {
-        const raw = JSON.parse(readFileSync(join(threadDir(), file), "utf-8")) as {
-          config: Config;
-          session: Session;
-          thread: RuntimeThread;
-          turns: RuntimeTurn[];
-          prefix?: SerializedImmutablePrefix;
-        };
+        const raw = parsePersistedRuntimeRecord(JSON.parse(readFileSync(join(threadDir(), file), "utf-8")));
+        if (!raw) continue;
         const history = new ConversationHistory(raw.session);
         const interruptedTurns: RuntimeTurn[] = [];
         for (const turn of raw.turns || []) {
@@ -172,6 +167,136 @@ function ensureLoaded(): void {
   }
 }
 
+function parsePersistedRuntimeRecord(value: unknown): {
+  config: Config;
+  session: Session;
+  thread: RuntimeThread;
+  turns: RuntimeTurn[];
+  prefix?: SerializedImmutablePrefix;
+} | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const config = record.config && typeof record.config === "object" && !Array.isArray(record.config)
+    ? record.config as Config
+    : null;
+  const session = record.session && typeof record.session === "object" && !Array.isArray(record.session)
+    ? record.session as Session
+    : null;
+  const thread = parseRuntimeThread(record.thread);
+  const turns = parseRuntimeTurns(record.turns);
+  const prefix = record.prefix && typeof record.prefix === "object" && !Array.isArray(record.prefix)
+    ? record.prefix as SerializedImmutablePrefix
+    : undefined;
+
+  if (!config || !session || !thread || !turns) return null;
+  return { config, session, thread, turns, ...(prefix ? { prefix } : {}) };
+}
+
+function parseRuntimeThread(value: unknown): RuntimeThread | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const id = nonEmptyString(record.id);
+  const sessionId = nonEmptyString(record.session_id);
+  const createdAt = nonEmptyString(record.created_at);
+  const updatedAt = nonEmptyString(record.updated_at);
+  const model = nonEmptyString(record.model);
+  const mode = nonEmptyString(record.mode);
+  const workspace = nonEmptyString(record.workspace);
+  const archived = typeof record.archived === "boolean" ? record.archived : null;
+  const latestTurnId = optionalString(record.latest_turn_id);
+  if (!id || !sessionId || !createdAt || !updatedAt || !model || !mode || !workspace || archived === null || latestTurnId === undefined) {
+    return null;
+  }
+  return {
+    id,
+    session_id: sessionId,
+    created_at: createdAt,
+    updated_at: updatedAt,
+    model,
+    mode,
+    workspace,
+    archived,
+    ...(latestTurnId !== null ? { latest_turn_id: latestTurnId } : {}),
+  };
+}
+
+function parseRuntimeTurns(value: unknown): RuntimeTurn[] | null {
+  if (!Array.isArray(value)) return [];
+  const turns: RuntimeTurn[] = [];
+  for (const item of value) {
+    const turn = parseRuntimeTurn(item);
+    if (!turn) return null;
+    turns.push(turn);
+  }
+  return turns;
+}
+
+function parseRuntimeTurn(value: unknown): RuntimeTurn | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const id = nonEmptyString(record.id);
+  const threadId = nonEmptyString(record.thread_id);
+  const status = typeof record.status === "string" ? record.status : null;
+  const message = typeof record.message === "string" ? record.message : "";
+  const createdAt = nonEmptyString(record.created_at);
+  const updatedAt = nonEmptyString(record.updated_at);
+  const artifactIds = stringArray(record.artifact_ids);
+  const error = optionalString(record.error);
+  const interruptedAt = optionalString(record.interrupted_at);
+  const resumedFromTurnId = optionalString(record.resumed_from_turn_id);
+  const usage = record.usage === undefined || record.usage === null
+    ? null
+    : (record.usage && typeof record.usage === "object" && !Array.isArray(record.usage)
+        ? record.usage as Record<string, unknown>
+        : undefined);
+
+  if (
+    !id
+    || !threadId
+    || !status
+    || !createdAt
+    || !updatedAt
+    || !VALID_TURN_STATUSES.has(status as TurnStatus)
+    || error === undefined
+    || interruptedAt === undefined
+    || resumedFromTurnId === undefined
+    || usage === undefined
+  ) {
+    return null;
+  }
+
+  return {
+    id,
+    thread_id: threadId,
+    status: status as TurnStatus,
+    message,
+    created_at: createdAt,
+    updated_at: updatedAt,
+    artifact_ids: artifactIds,
+    ...(usage !== null ? { usage } : {}),
+    ...(error !== null ? { error } : {}),
+    ...(interruptedAt !== null ? { interrupted_at: interruptedAt } : {}),
+    ...(resumedFromTurnId !== null ? { resumed_from_turn_id: resumedFromTurnId } : {}),
+  };
+}
+
+const VALID_TURN_STATUSES = new Set<TurnStatus>(["queued", "in_progress", "completed", "failed", "interrupted", "canceled"]);
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function optionalString(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "string" ? value : undefined;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : [];
+}
+
 function cloneJson<T>(value: T): T {
   if (value === undefined || value === null) return value;
   return JSON.parse(JSON.stringify(value)) as T;
@@ -206,26 +331,29 @@ function cloneTurn(turn: Turn): Turn {
   };
 }
 
-function loadEvents(threadId: string): RuntimeEvent[] {
+function loadJsonLines<T>(path: string): T[] {
   try {
-    return readFileSync(eventPath(threadId), "utf-8")
-      .split("\n")
-      .filter(Boolean)
-      .map(line => JSON.parse(line) as RuntimeEvent);
+    const lines = readFileSync(path, "utf-8").split("\n").filter(Boolean);
+    const records: T[] = [];
+    for (const line of lines) {
+      try {
+        records.push(JSON.parse(line) as T);
+      } catch {
+        // skip corrupt persisted lines without discarding the entire stream
+      }
+    }
+    return records;
   } catch {
     return [];
   }
 }
 
+function loadEvents(threadId: string): RuntimeEvent[] {
+  return loadJsonLines<RuntimeEvent>(eventPath(threadId));
+}
+
 function loadItems(threadId: string): RuntimeItem[] {
-  try {
-    return readFileSync(itemPath(threadId), "utf-8")
-      .split("\n")
-      .filter(Boolean)
-      .map(line => JSON.parse(line) as RuntimeItem);
-  } catch {
-    return [];
-  }
+  return loadJsonLines<RuntimeItem>(itemPath(threadId));
 }
 
 function persistRecord(record: RuntimeRecord): void {

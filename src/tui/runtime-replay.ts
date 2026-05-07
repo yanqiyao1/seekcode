@@ -23,7 +23,9 @@ export function sessionMessagesToRuntimeEvents(
   const replayMessages = messages.slice(-maxMessages);
   const events: EngineRuntimeEvent[] = [];
 
-  for (const message of replayMessages) {
+  for (const rawMessage of replayMessages) {
+    const message = sanitizeMessage(rawMessage);
+    if (!message) continue;
     if (message.role === "system") {
       const compactionEvent = compactionBoundaryToRuntimeEvent(message);
       if (compactionEvent) events.push(compactionEvent);
@@ -31,7 +33,8 @@ export function sessionMessagesToRuntimeEvents(
     }
 
     if (message.role === "user") {
-      events.push({ type: "user_message", data: { text: message.content || "" } });
+      if (typeof message.content !== "string") continue;
+      events.push({ type: "user_message", data: { text: message.content } });
       continue;
     }
 
@@ -44,10 +47,15 @@ export function sessionMessagesToRuntimeEvents(
     }
 
     if (message.role === "tool") {
-      const content = message.content || "";
+      const content = typeof message.content === "string" ? message.content : "";
+      const name = typeof message.name === "string" && message.name ? message.name : undefined;
+      const toolCallId = typeof message.tool_call_id === "string" && message.tool_call_id
+        ? message.tool_call_id
+        : undefined;
+      if (!name && !toolCallId) continue;
       const result: ToolResult = {
-        tool_call_id: message.tool_call_id || message.name || "tool",
-        name: message.name || "tool",
+        tool_call_id: toolCallId || "",
+        name: name || toolCallId || "",
         content,
         is_error: message.is_error ?? /^Error:|was denied\./i.test(content),
       };
@@ -65,66 +73,220 @@ export function runtimeItemsToEngineRuntimeEvents(items: RuntimeItemLike[]): Eng
 }
 
 export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRuntimeEvent | null {
-  const data = item.data as Record<string, unknown>;
+  const data = asRecord(item.data);
   switch (item.type) {
     case "api_call_start":
       return { type: "api_call_start", data: {} };
-    case "thinking_delta":
-      return { type: "thinking_delta", data: { text: String(data?.text ?? "") } };
-    case "content_delta":
-      return { type: "content_delta", data: { text: String(data?.text ?? "") } };
-    case "user_message":
-      return { type: "user_message", data: { text: String(data?.text ?? "") } };
+    case "thinking_delta": {
+      const text = asString(data?.text);
+      return text === undefined ? null : { type: "thinking_delta", data: { text } };
+    }
+    case "content_delta": {
+      const text = asString(data?.text);
+      return text === undefined ? null : { type: "content_delta", data: { text } };
+    }
+    case "user_message": {
+      const text = asString(data?.text);
+      return text === undefined ? null : { type: "user_message", data: { text } };
+    }
     case "assistant_message":
-      return { type: "assistant_message", data: data as unknown as Message };
-    case "tool_call_begin":
+      return sanitizeMessage(item.data)
+        ? { type: "assistant_message", data: sanitizeMessage(item.data)! }
+        : null;
+    case "tool_call_begin": {
+      const name = asString(data?.name);
+      if (!name) return null;
       return {
         type: "tool_call_begin",
         data: {
-          name: String(data?.name ?? "tool"),
+          name,
           tool_call_id: typeof data?.tool_call_id === "string" ? data.tool_call_id : undefined,
           index: typeof data?.index === "number" ? data.index : undefined,
         },
         artifact_ids: item.artifact_ids,
       };
-    case "tool_call":
-      return { type: "tool_call", data: data as unknown as ToolCall, artifact_ids: item.artifact_ids };
-    case "approval_required":
+    }
+    case "tool_call": {
+      const toolCall = sanitizeToolCall(item.data);
+      return toolCall ? { type: "tool_call", data: toolCall, artifact_ids: item.artifact_ids } : null;
+    }
+    case "approval_required": {
+      const tool = asString(data?.tool);
+      if (!tool) return null;
       return {
         type: "approval_required",
         data: {
-          tool: String(data?.tool ?? "tool"),
+          tool,
           args: (data?.args && typeof data.args === "object") ? data.args as Record<string, unknown> : {},
           description: typeof data?.description === "string" ? data.description : undefined,
         },
         artifact_ids: item.artifact_ids,
       };
+    }
     case "tool_result": {
-      const result = data as unknown as ToolResult;
+      const result = sanitizeToolResult(item.data);
+      if (!result) return null;
       return {
         type: "tool_result",
         data: result,
         artifact_ids: item.artifact_ids,
-        preview: typeof data?.content === "string" ? data.content : "",
+        preview: result.content,
       } satisfies ToolResultRuntimeEvent;
     }
-    case "tool_progress":
+    case "tool_progress": {
+      const progress = sanitizeToolProgress(item.data);
+      if (!progress) return null;
       return {
         type: "tool_progress",
-        data: data as ToolProgressRuntimeEvent["data"],
+        data: progress,
         artifact_ids: item.artifact_ids,
       };
+    }
     case "context_intervention":
-      return { type: "context_intervention", data: data as unknown as ContextIntervention, artifact_ids: item.artifact_ids };
+      return {
+        type: "context_intervention",
+        data: sanitizeContextIntervention(data),
+        artifact_ids: item.artifact_ids,
+      };
     case "prefix_invalidated":
       return {
         type: "prefix_invalidated",
-        data: data as PrefixInvalidatedEventData,
+        data: sanitizePrefixInvalidated(data),
         artifact_ids: item.artifact_ids,
       };
     default:
       return null;
   }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function sanitizeToolCall(value: unknown): ToolCall | null {
+  const data = asRecord(value);
+  const name = asString(data?.name);
+  if (!name) return null;
+  return {
+    id: asString(data?.id) || "",
+    name,
+    arguments: asRecord(data?.arguments) || {},
+  };
+}
+
+function sanitizeToolResult(value: unknown): ToolResult | null {
+  const data = asRecord(value);
+  const name = asString(data?.name);
+  if (!name) return null;
+  const content = asString(data?.content) || "";
+  return {
+    tool_call_id: asString(data?.tool_call_id) || "",
+    name,
+    content,
+    is_error: typeof data?.is_error === "boolean" ? data.is_error : /^Error:|was denied\./i.test(content),
+  };
+}
+
+function sanitizeToolProgress(value: unknown): ToolProgressRuntimeEvent["data"] | null {
+  const data = asRecord(value);
+  const progress = asRecord(data?.progress);
+  const tool = asString(data?.tool);
+  const toolCallId = asString(data?.tool_call_id);
+  const message = asString(progress?.message);
+  if (!tool || !toolCallId || !message) return null;
+  return {
+    tool,
+    tool_call_id: toolCallId,
+    progress: {
+      message,
+      percent: typeof progress?.percent === "number" ? progress.percent : undefined,
+      data: asRecord(progress?.data) || undefined,
+    },
+  };
+}
+
+function sanitizeContextIntervention(value: Record<string, unknown> | null): ContextIntervention {
+  const compaction = asRecord(value?.compaction);
+  return {
+    action: asNonEmptyString(value?.action) ?? "intervention",
+    risk: asNonEmptyString(value?.risk) ?? "unknown",
+    reason: asNonEmptyString(value?.reason) ?? "capacity intervention",
+    tokens_before: typeof value?.tokens_before === "number" && Number.isFinite(value.tokens_before) ? value.tokens_before : 0,
+    tokens_after: typeof value?.tokens_after === "number" && Number.isFinite(value.tokens_after) ? value.tokens_after : 0,
+    layers: [],
+    ...(typeof value?.injected_message === "string" && value.injected_message.trim()
+      ? { injected_message: value.injected_message }
+      : {}),
+    ...(compaction ? { compaction: sanitizeCompaction(compaction) } : {}),
+  } as ContextIntervention;
+}
+
+function sanitizePrefixInvalidated(value: Record<string, unknown> | null): PrefixInvalidatedEventData {
+  const compaction = asRecord(value?.compaction);
+  return {
+    reason: asNonEmptyString(value?.reason) ?? "unknown",
+    ...(typeof value?.boundary_id === "string" && value.boundary_id ? { boundary_id: value.boundary_id } : {}),
+    ...(compaction ? { compaction: sanitizePrefixCompaction(compaction) } : {}),
+  };
+}
+
+function sanitizeCompaction(value: Record<string, unknown>) {
+  const actions = Array.isArray(value.actions)
+    ? value.actions.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+  return {
+    actions,
+    finalTokens: typeof value.finalTokens === "number" && Number.isFinite(value.finalTokens) ? value.finalTokens : Number.NaN,
+    message: asNonEmptyString(value.message) ?? "",
+    ...(typeof value.boundary_id === "string" ? { boundary_id: value.boundary_id } : {}),
+    ...(typeof value.removed_messages === "number" && Number.isFinite(value.removed_messages) ? { removed_messages: value.removed_messages } : {}),
+    ...(typeof value.original_tokens === "number" && Number.isFinite(value.original_tokens) ? { original_tokens: value.original_tokens } : {}),
+    ...(typeof value.summary_message_name === "string" ? { summary_message_name: value.summary_message_name } : {}),
+    ...(typeof value.preserved_messages === "number" && Number.isFinite(value.preserved_messages) ? { preserved_messages: value.preserved_messages } : {}),
+    ...(typeof value.prefix_invalidated === "boolean" ? { prefix_invalidated: value.prefix_invalidated } : {}),
+    ...(typeof value.prefix_invalidation_reason === "string" ? { prefix_invalidation_reason: value.prefix_invalidation_reason } : {}),
+  };
+}
+
+function sanitizePrefixCompaction(value: Record<string, unknown>): PrefixInvalidatedEventData["compaction"] {
+  const actions = Array.isArray(value.actions)
+    ? value.actions.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+  return {
+    actions,
+    finalTokens: typeof value.finalTokens === "number" && Number.isFinite(value.finalTokens) ? value.finalTokens : Number.NaN,
+    ...(typeof value.original_tokens === "number" && Number.isFinite(value.original_tokens) ? { original_tokens: value.original_tokens } : {}),
+    ...(typeof value.removed_messages === "number" && Number.isFinite(value.removed_messages) ? { removed_messages: value.removed_messages } : {}),
+    ...(typeof value.preserved_messages === "number" && Number.isFinite(value.preserved_messages) ? { preserved_messages: value.preserved_messages } : {}),
+    ...(typeof value.summary_message_name === "string" ? { summary_message_name: value.summary_message_name } : {}),
+  };
+}
+
+function sanitizeMessage(value: unknown): Message | null {
+  const data = asRecord(value);
+  const role = data?.role;
+  if (role !== "system" && role !== "user" && role !== "assistant" && role !== "tool") return null;
+  return {
+    role,
+    content: typeof data.content === "string" || data.content === null ? data.content : null,
+    tool_calls: Array.isArray(data.tool_calls)
+      ? data.tool_calls.map(sanitizeToolCall).filter((toolCall): toolCall is ToolCall => !!toolCall)
+      : null,
+    tool_call_id: typeof data.tool_call_id === "string" || data.tool_call_id === null ? data.tool_call_id : null,
+    name: typeof data.name === "string" || data.name === null ? data.name : null,
+    reasoning_content: typeof data.reasoning_content === "string" || data.reasoning_content === null ? data.reasoning_content : null,
+    is_error: typeof data.is_error === "boolean" || data.is_error === null ? data.is_error : null,
+  };
 }
 
 function compactionBoundaryToRuntimeEvent(message: Message): EngineRuntimeEvent | null {

@@ -54,6 +54,8 @@ const TASK_ID_PREFIXES: Record<TaskType, string> = {
 // Case-insensitive-safe alphabet: digits + lowercase = 36 chars.
 // 36^8 ≈ 2.8 trillion combinations.
 const TASK_ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz";
+const VALID_TASK_TYPES = new Set<TaskType>(["bash", "agent", "remote_agent", "workflow", "monitor", "sub_task", "background"]);
+const VALID_TASK_STATUSES = new Set<TaskStatus>(["pending", "running", "completed", "failed", "killed"]);
 
 export function generateTaskId(type: TaskType): string {
   const prefix = TASK_ID_PREFIXES[type] || "x";
@@ -290,8 +292,8 @@ export class TaskManager {
   private load(): void {
     if (!this.dataFile) return;
     try {
-      const raw = JSON.parse(readFileSync(this.dataFile, "utf-8")) as { active?: TaskRecord[]; history?: TaskRecord[] };
-      for (const task of raw.active || []) {
+      const raw = parsePersistedTaskState(JSON.parse(readFileSync(this.dataFile, "utf-8")));
+      for (const task of raw.active) {
         if (task.queue && isActiveStatus(task.status)) {
           task.status = "pending";
           task.endTime = undefined;
@@ -306,7 +308,7 @@ export class TaskManager {
           this.taskHistory.push(task);
         }
       }
-      this.taskHistory.push(...(raw.history || []));
+      this.taskHistory.push(...raw.history);
       this.taskHistory = this.taskHistory.slice(-this.maxHistory);
       queueMicrotask(() => this.runQueue());
     } catch {
@@ -446,6 +448,169 @@ export function defaultTaskStoreFile(): string {
 export function clearPersistentTaskStateForTests(): void {
   clearTaskManager();
   try { rmSync(dirname(defaultTaskStoreFile()), { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+function parsePersistedTaskState(value: unknown): { active: TaskRecord[]; history: TaskRecord[] } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { active: [], history: [] };
+  }
+  const record = value as Record<string, unknown>;
+  return {
+    active: parsePersistedTaskList(record.active),
+    history: parsePersistedTaskList(record.history),
+  };
+}
+
+function parsePersistedTaskList(value: unknown): TaskRecord[] {
+  if (!Array.isArray(value)) return [];
+  const parsed: TaskRecord[] = [];
+  for (const item of value) {
+    const task = parsePersistedTask(item);
+    if (task) parsed.push(task);
+  }
+  return parsed;
+}
+
+function parsePersistedTask(value: unknown): TaskRecord | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const id = nonEmptyString(record.id);
+  const type = parseTaskType(record.type);
+  const status = parseTaskStatus(record.status);
+  const description = nonEmptyString(record.description);
+  const startTime = finiteNumber(record.startTime);
+  const notified = typeof record.notified === "boolean" ? record.notified : null;
+  if (!id || !type || !status || !description || startTime === null || notified === null) return null;
+
+  const toolUseId = optionalString(record.toolUseId);
+  const agentId = optionalString(record.agentId);
+  const endTime = optionalFiniteNumber(record.endTime);
+  const totalPausedMs = optionalFiniteNumber(record.totalPausedMs);
+  const output = optionalString(record.output);
+  const outputFile = optionalString(record.outputFile);
+  const artifactIds = optionalStringArray(record.artifactIds);
+  const progress = optionalTaskProgress(record.progress);
+  const queue = optionalTaskQueue(record.queue);
+  const attempts = optionalFiniteNumber(record.attempts);
+  const maxAttempts = optionalFiniteNumber(record.maxAttempts);
+  const exitCode = optionalNullableFiniteNumber(record.exitCode);
+  const signal = optionalString(record.signal);
+
+  if (
+    toolUseId === undefined
+    || agentId === undefined
+    || endTime === undefined
+    || totalPausedMs === undefined
+    || output === undefined
+    || outputFile === undefined
+    || artifactIds === undefined
+    || progress === undefined
+    || queue === undefined
+    || attempts === undefined
+    || maxAttempts === undefined
+    || exitCode === undefined
+    || signal === undefined
+  ) {
+    return null;
+  }
+
+  return {
+    id,
+    type,
+    status,
+    description,
+    startTime,
+    notified,
+    ...(toolUseId !== null ? { toolUseId } : {}),
+    ...(agentId !== null ? { agentId } : {}),
+    ...(endTime !== null ? { endTime } : {}),
+    ...(totalPausedMs !== null ? { totalPausedMs } : {}),
+    ...(output !== null ? { output } : {}),
+    ...(outputFile !== null ? { outputFile } : {}),
+    ...(artifactIds !== null ? { artifactIds } : {}),
+    ...(progress !== null ? { progress } : {}),
+    ...(queue !== null ? { queue } : {}),
+    ...(attempts !== null ? { attempts } : {}),
+    ...(maxAttempts !== null ? { maxAttempts } : {}),
+    ...(exitCode !== null ? { exitCode } : {}),
+    ...(signal !== null ? { signal } : {}),
+  };
+}
+
+function parseTaskType(value: unknown): TaskType | null {
+  return typeof value === "string" && VALID_TASK_TYPES.has(value as TaskType) ? value as TaskType : null;
+}
+
+function parseTaskStatus(value: unknown): TaskStatus | null {
+  return typeof value === "string" && VALID_TASK_STATUSES.has(value as TaskStatus) ? value as TaskStatus : null;
+}
+
+function optionalTaskProgress(value: unknown): TaskProgress | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const type = parseTaskType(record.type);
+  const lastUpdate = finiteNumber(record.lastUpdate);
+  const percent = optionalFiniteNumber(record.percent);
+  const message = optionalString(record.message);
+  if (!type || lastUpdate === null || percent === undefined || message === undefined) return undefined;
+  return {
+    type,
+    lastUpdate,
+    ...(percent !== null ? { percent } : {}),
+    ...(message !== null ? { message } : {}),
+  };
+}
+
+function optionalTaskQueue(value: unknown): TaskQueueSpec | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.kind !== "shell") return undefined;
+  const command = nonEmptyString(record.command);
+  const workdir = nonEmptyString(record.workdir);
+  const timeoutMs = optionalFiniteNumber(record.timeoutMs);
+  if (!command || !workdir || timeoutMs === undefined) return undefined;
+  return {
+    kind: "shell",
+    command,
+    workdir,
+    ...(timeoutMs !== null ? { timeoutMs } : {}),
+  };
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function optionalString(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "string" ? value : undefined;
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function nullableFiniteNumber(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  if (value === undefined) return undefined;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalNullableFiniteNumber(value: unknown): number | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalFiniteNumber(value: unknown): number | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalStringArray(value: unknown): string[] | null | undefined {
+  if (value === undefined || value === null) return null;
+  return Array.isArray(value) && value.every(item => typeof item === "string") ? value : undefined;
 }
 
 function appendTaskOutput(existing: string | undefined, next: string): string {

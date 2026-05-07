@@ -1,12 +1,12 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearHooks, fireHooks, registerHook } from "../src/engine/hooks.js";
 import { clearPersistentTaskStateForTests, getTaskManager, TaskManager } from "../src/engine/task-lifecycle.js";
 import { MCPClient } from "../src/mcp/client.js";
-import { parseSSEFrames } from "../src/server/transport.js";
+import { parseSSEFrames, SSETransport } from "../src/server/transport.js";
 import { clearJobManagerForTests, getJobManager, reloadJobManagerForTests } from "../src/tools/jobs.js";
 import { getRegistry } from "../src/tools/registry.js";
 import { registerShellTool } from "../src/tools/shell.js";
@@ -66,6 +66,112 @@ describe("shell tool", () => {
 
     expect(result).toMatch(/timed out|signal/i);
     await waitFor(() => !isPidAlive(childPid), 2500);
+  });
+
+  it("treats invalid negative foreground timeouts as the default instead of timing out immediately", async () => {
+    registerShellTool();
+
+    const result = await getRegistry().lookup("bash")!.execute({
+      command: "printf stable",
+      timeout: -1,
+      workdir: tmp,
+    });
+
+    expect(result).toContain("stable");
+    expect(result).not.toContain("timed out");
+    expect(result).toContain("[exit code: 0]");
+  });
+
+  it("rejects non-string bash commands without throwing", async () => {
+    registerShellTool();
+
+    await expect(getRegistry().lookup("bash")!.execute({ command: 123 as any, workdir: tmp })).resolves.toContain("command must be a non-empty string");
+  });
+
+  it("rejects malformed optional shell start arguments instead of silently falling back to defaults", async () => {
+    registerShellTool();
+    const bashTool = getRegistry().lookup("bash")!;
+    const taskShellStart = getRegistry().lookup("task_shell_start")!;
+
+    expect(await bashTool.validateInput?.(
+      { command: "printf ok", workdir: { nested: true } as any },
+      { tool_name: "bash", workspace_path: tmp, tool_def: bashTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
+    expect(await bashTool.validateInput?.(
+      { command: "printf ok", cwd: { nested: true } as any },
+      { tool_name: "bash", workspace_path: tmp, tool_def: bashTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
+    expect(await bashTool.validateInput?.(
+      { command: "printf ok", timeout: { nested: true } as any },
+      { tool_name: "bash", workspace_path: tmp, tool_def: bashTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("timeout must be a number"),
+    });
+    expect(await bashTool.validateInput?.(
+      { command: "printf ok", background: "yes" as any },
+      { tool_name: "bash", workspace_path: tmp, tool_def: bashTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("background must be a boolean"),
+    });
+    expect(await bashTool.validateInput?.(
+      { command: "printf ok", pty: "yes" as any },
+      { tool_name: "bash", workspace_path: tmp, tool_def: bashTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("pty must be a boolean"),
+    });
+
+    expect(await bashTool.execute({ command: "printf ok", workdir: { nested: true } as any })).toContain("workdir must be a string");
+    expect(await bashTool.execute({ command: "printf ok", cwd: { nested: true } as any })).toContain("workdir must be a string");
+    expect(await bashTool.execute({ command: "printf ok", timeout: { nested: true } as any })).toContain("timeout must be a number");
+    expect(await bashTool.execute({ command: "printf ok", background: "yes" as any })).toContain("background must be a boolean");
+    expect(await bashTool.execute({ command: "printf ok", pty: "yes" as any })).toContain("pty must be a boolean");
+
+    expect(await taskShellStart.validateInput?.(
+      { command: "printf ok", pty: "yes" as any },
+      { tool_name: "task_shell_start", workspace_path: tmp, tool_def: taskShellStart },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("pty must be a boolean"),
+    });
+  });
+
+  it("rejects non-string task gate commands instead of stringifying them into shell input", async () => {
+    registerTaskTools();
+
+    expect(await getRegistry().lookup("task_gate_run")!.execute({
+      command: { nested: true } as any,
+      workdir: tmp,
+    })).toContain("command is required");
+  });
+
+  it("trims bash workdir aliases during validation and execution", async () => {
+    registerShellTool();
+    const bashTool = getRegistry().lookup("bash")!;
+
+    expect(await bashTool.validateInput?.(
+      { command: "pwd", cwd: `  ${tmp}  ` },
+      { tool_name: "bash", workspace_path: tmp, tool_def: bashTool },
+    )).toMatchObject({
+      ok: true,
+      args: {
+        command: "pwd",
+        workdir: tmp,
+      },
+    });
+
+    const result = await bashTool.execute({ command: "pwd", workdir: `  ${tmp}  ` });
+
+    expect(result).toContain(tmp);
+    expect(result).toContain("[exit code: 0]");
   });
 
   it("starts, polls, and cancels background shell jobs", async () => {
@@ -155,6 +261,98 @@ describe("shell tool", () => {
     expect(done).toContain("status: completed");
   });
 
+  it("normalizes invalid negative shell wait tails instead of slicing logs from the front", async () => {
+    registerShellTool();
+
+    const started = await getRegistry().lookup("task_shell_start")!.execute({
+      command: "printf tail-check",
+      workdir: tmp,
+      pty: false,
+    });
+    const id = started.match(/job_[a-z0-9_]+/)?.[0]!;
+    await waitFor(() => getRegistry().lookup("task_shell_wait")!.execute({ id }).then(output => output.includes("status: completed") ? output : ""));
+
+    const output = await getRegistry().lookup("exec_shell_wait")!.execute({ id, tail_chars: -1 });
+
+    expect(output).toContain("tail-check");
+    expect(output).toContain("status: completed");
+  });
+
+  it("normalizes job_id aliases for shell job polling validation", async () => {
+    registerShellTool();
+    const waitTool = getRegistry().lookup("exec_shell_wait")!;
+    const validation = await waitTool.validateInput?.(
+      { job_id: "job_123", tail_chars: 20 },
+      { tool_name: "exec_shell_wait", workspace_path: tmp, tool_def: waitTool },
+    );
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: {
+        id: "job_123",
+        tail_chars: 20,
+      },
+    });
+  });
+
+  it("rejects malformed shell wait tail sizes instead of coercing them into defaults", async () => {
+    registerShellTool();
+    const waitTool = getRegistry().lookup("exec_shell_wait")!;
+    const taskWaitTool = getRegistry().lookup("task_shell_wait")!;
+
+    expect(await waitTool.validateInput?.(
+      { id: "job_123", tail_chars: { nested: true } as any },
+      { tool_name: "exec_shell_wait", workspace_path: tmp, tool_def: waitTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("tail_chars must be a number"),
+    });
+    expect(await taskWaitTool.validateInput?.(
+      { id: "job_123", tail_chars: { nested: true } as any },
+      { tool_name: "task_shell_wait", workspace_path: tmp, tool_def: taskWaitTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("tail_chars must be a number"),
+    });
+
+    expect(await waitTool.execute({ id: "job_123", tail_chars: { nested: true } as any })).toContain("tail_chars must be a number");
+  });
+
+  it("rejects non-string shell job ids during validation instead of stringifying objects", async () => {
+    registerShellTool();
+    const waitTool = getRegistry().lookup("exec_shell_wait")!;
+
+    expect(await waitTool.validateInput?.(
+      { id: { nested: true } as any },
+      { tool_name: "exec_shell_wait", workspace_path: tmp, tool_def: waitTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("id is required"),
+    });
+  });
+
+  it("rejects non-string shell job ids during execution instead of looking up [object Object]", async () => {
+    registerShellTool();
+
+    expect(await getRegistry().lookup("exec_shell_wait")!.execute({ id: { nested: true } as any })).toContain("id is required");
+    expect(await getRegistry().lookup("exec_shell_cancel")!.execute({ id: { nested: true } as any })).toContain("id is required");
+    expect(await getRegistry().lookup("exec_shell_interact")!.execute({ id: { nested: true } as any, input: "hello" })).toContain("id is required");
+  });
+
+  it("rejects non-string shell stdin payloads during execution instead of stringifying objects into job input", async () => {
+    registerShellTool();
+
+    const started = await getRegistry().lookup("task_shell_start")!.execute({
+      command: "bash -lc 'echo ready; sleep 1'",
+      workdir: tmp,
+      pty: false,
+    });
+    const id = started.match(/job_[a-z0-9_]+/)?.[0]!;
+    await waitFor(() => getRegistry().lookup("task_shell_wait")!.execute({ id }).then(output => output.includes("ready")));
+
+    expect(await getRegistry().lookup("exec_shell_interact")!.execute({ id, input: { nested: true } as any })).toContain("input must be a string");
+  });
+
   it("starts background jobs with PTY support by default", async () => {
     registerShellTool();
 
@@ -195,6 +393,76 @@ describe("shell tool", () => {
 
     expect(jobs.map(job => job.id)).toEqual([id]);
     expect(jobs[0].status).toBe("completed");
+  });
+
+  it("ignores persisted job records with malformed typed fields during reload", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    getJobManager();
+
+    const startedAt = Date.now() - 1_000;
+    const endedAt = startedAt + 250;
+
+    writeFileSync(join(jobsDir, "job_valid.json"), JSON.stringify({
+      id: "job_valid",
+      command: "printf kept",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt,
+      endedAt,
+      output: "kept\n",
+    }), "utf-8");
+
+    writeFileSync(join(jobsDir, "job_malformed.json"), JSON.stringify({
+      id: { nested: true },
+      command: "printf dropped",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt,
+      endedAt,
+      output: "dropped\n",
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+    const jobs = getJobManager().list();
+
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({
+      id: "job_valid",
+      command: "printf kept",
+      status: "completed",
+      output: "kept\n",
+    });
+  });
+
+  it("ignores malformed job status helper payloads instead of coercing them into successful completion", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    getJobManager();
+
+    const statusFile = join(jobsDir, "job_status_malformed.status.json");
+    writeFileSync(statusFile, JSON.stringify({ exitCode: false, endedAt: "0" }), "utf-8");
+    writeFileSync(join(jobsDir, "job_status_malformed.json"), JSON.stringify({
+      id: "job_status_malformed",
+      command: "printf stale",
+      workdir: tmp,
+      status: "running",
+      exitCode: null,
+      startedAt: Date.now() - 1_000,
+      output: "stale\n",
+      statusFile,
+      pid: 999_999_999,
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+    const job = getJobManager().get("job_status_malformed");
+
+    expect(job).toMatchObject({
+      id: "job_status_malformed",
+      status: "stale",
+      exitCode: null,
+    });
+    expect(job?.output).toContain("[stale] Supervisor is no longer running");
   });
 });
 
@@ -287,6 +555,24 @@ describe("task tools", () => {
     expect(done.output).toMatch(/exit code|signal/i);
   });
 
+  it("normalizes invalid negative queued task timeouts instead of crashing spawn", async () => {
+    registerTaskTools();
+
+    const created = JSON.parse(await getRegistry().lookup("task_create")!.execute({
+      description: "Negative timeout task",
+      command: "printf queued-ok",
+      workdir: tmp,
+      timeout: -1,
+    }));
+    const done = await waitFor(() => {
+      const task = getTaskManager().getHistory().find(item => item.id === created.id);
+      return task?.status === "completed" ? task : null;
+    }, 2500);
+
+    expect(done.output).toContain("queued-ok");
+    expect(done.output).not.toContain("The value of \"timeout\" is out of range");
+  });
+
   it("runs task verification gates with pass and fail evidence", async () => {
     registerShellTool();
     registerTaskTools();
@@ -298,6 +584,44 @@ describe("task tools", () => {
     expect(passed.output).toContain("pass");
     expect(failed).toMatchObject({ passed: false });
     expect(failed.output).toContain("[exit code: 7]");
+  });
+
+  it("normalizes invalid negative gate timeouts instead of surfacing spawn range errors", async () => {
+    registerShellTool();
+    registerTaskTools();
+
+    const passed = JSON.parse(await getRegistry().lookup("task_gate_run")!.execute({
+      command: "printf gate-ok",
+      workdir: tmp,
+      timeout: -1,
+    }));
+
+    expect(passed).toMatchObject({ passed: true });
+    expect(passed.output).toContain("gate-ok");
+    expect(passed.output).not.toContain("out of range");
+  });
+
+  it("trims task_gate_run workdir aliases during validation and execution", async () => {
+    registerShellTool();
+    registerTaskTools();
+    const gateTool = getRegistry().lookup("task_gate_run")!;
+
+    expect(await gateTool.validateInput?.(
+      { command: "pwd", cwd: `  ${tmp}  ` },
+      { tool_name: "task_gate_run", workspace_path: tmp, tool_def: gateTool },
+    )).toMatchObject({
+      ok: true,
+      args: {
+        command: "pwd",
+        workdir: tmp,
+      },
+    });
+
+    const result = JSON.parse(await gateTool.execute({ command: "pwd", workdir: `  ${tmp}  ` }));
+
+    expect(result.workdir).toBe(tmp);
+    expect(result.passed).toBe(true);
+    expect(result.output).toContain(tmp);
   });
 
   it("requeues resumable tasks after manager restart instead of killing them", async () => {
@@ -317,6 +641,66 @@ describe("task tools", () => {
     });
 
     expect(done.output).toContain("resumed");
+  });
+
+  it("ignores malformed persisted task records without dropping neighboring valid tasks on reload", () => {
+    const store = join(tmp, "tasks", "tasks.json");
+    mkdirSync(join(tmp, "tasks"), { recursive: true });
+    writeFileSync(store, JSON.stringify({
+      active: [
+        {
+          id: "bgvalid01",
+          type: "background",
+          status: "running",
+          description: "Valid active task",
+          startTime: 100,
+          notified: false,
+        },
+        {
+          id: { nested: true },
+          type: "background",
+          status: "running",
+          description: "Broken active task",
+          startTime: 200,
+          notified: false,
+        },
+      ],
+      history: [
+        {
+          id: "bgdone001",
+          type: "background",
+          status: "completed",
+          description: "Valid completed task",
+          startTime: 50,
+          endTime: 75,
+          notified: true,
+        },
+        {
+          id: "bgbad001",
+          type: "background",
+          status: { nested: true },
+          description: "Broken completed task",
+          startTime: 60,
+          notified: true,
+        },
+      ],
+    }, null, 2), "utf-8");
+
+    const reloaded = new TaskManager(store);
+
+    expect(reloaded.getActiveTasks()).toEqual([]);
+    expect(reloaded.getHistory()).toEqual([
+      expect.objectContaining({
+        id: "bgvalid01",
+        status: "killed",
+        description: "Valid active task",
+      }),
+      expect.objectContaining({
+        id: "bgdone001",
+        status: "completed",
+        description: "Valid completed task",
+      }),
+    ]);
   });
 });
 
@@ -365,6 +749,113 @@ describe("SSE frame parser", () => {
     const parsed = parseSSEFrames(": keepalive\n\nevent: msg\n: ignored\ndata: ok\n\n");
 
     expect(parsed.frames).toEqual([{ event: "msg", data: "ok" }]);
+  });
+});
+
+describe("SSE transport", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("reconnects after liveness timeout instead of disabling auto-reconnect", async () => {
+    vi.useFakeTimers();
+    let firstController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        body: new ReadableStream({
+          start(controller) {
+            firstController = controller;
+            // Hold the connection open without sending any data.
+          },
+        }),
+      });
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    const onMessage = vi.fn();
+    const onError = vi.fn();
+    const getReconnectDelay = vi.fn(() => 0);
+    const onStateChange = vi.fn();
+    const transport = new SSETransport({
+      url: "http://localhost/sse",
+      events: { onMessage, onError, onStateChange },
+      getReconnectDelay,
+    });
+
+    try {
+      const connectPromise = transport.connect();
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(45_000);
+      await vi.advanceTimersByTimeAsync(0);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "SSE liveness timeout" }));
+      expect(getReconnectDelay).toHaveBeenCalledWith(0);
+      expect(transport.currentState).toBe("connecting");
+      expect(onStateChange).toHaveBeenNthCalledWith(1, "connecting");
+      expect(onStateChange.mock.calls.map(args => args[0])).toContain("disconnected");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(onMessage).not.toHaveBeenCalled();
+
+      transport.disconnect();
+      firstController?.close();
+      await connectPromise;
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("reconnects when the SSE stream ends cleanly", async () => {
+    vi.useFakeTimers();
+    let secondController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("data: once\n\n"));
+            controller.close();
+          },
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        body: new ReadableStream({
+          start(controller) {
+            secondController = controller;
+            controller.enqueue(new TextEncoder().encode("data: twice\n\n"));
+          },
+        }),
+      });
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    const onMessage = vi.fn();
+    const transport = new SSETransport({
+      url: "http://localhost/sse",
+      events: { onMessage },
+      getReconnectDelay: () => 0,
+    });
+
+    try {
+      await transport.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(onMessage).toHaveBeenNthCalledWith(1, "once");
+      expect(onMessage).toHaveBeenNthCalledWith(2, "twice");
+    } finally {
+      transport.disconnect();
+      secondController?.close();
+      globalThis.fetch = oldFetch;
+    }
   });
 });
 

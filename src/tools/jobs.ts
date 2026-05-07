@@ -42,6 +42,8 @@ interface StartOptions {
   timeoutMs?: number;
 }
 
+const VALID_JOB_STATUSES = new Set<JobStatus>(["running", "completed", "failed", "killed", "stale"]);
+
 class JobManager {
   private jobs = new Map<string, InternalJob>();
   private dataDir: string;
@@ -188,7 +190,8 @@ class JobManager {
       mkdirSync(this.dataDir, { recursive: true });
       for (const file of readdirSync(this.dataDir).filter(name => /^job_[a-z0-9_]+\.json$/.test(name))) {
         try {
-          const job = JSON.parse(readFileSync(join(this.dataDir, file), "utf-8")) as InternalJob;
+          const job = parsePersistedJob(JSON.parse(readFileSync(join(this.dataDir, file), "utf-8")));
+          if (!job) continue;
           job.proc = undefined;
           this.jobs.set(job.id, job);
           this.refreshJob(job);
@@ -282,6 +285,108 @@ class JobManager {
   }
 }
 
+function parsePersistedJob(value: unknown): InternalJob | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const id = nonEmptyString(record.id);
+  const command = nonEmptyString(record.command);
+  const workdir = nonEmptyString(record.workdir);
+  const status = typeof record.status === "string" && VALID_JOB_STATUSES.has(record.status as JobStatus)
+    ? record.status as JobStatus
+    : null;
+  const startedAt = finiteNumber(record.startedAt);
+  const output = typeof record.output === "string" ? record.output : null;
+  if (!id || !command || !workdir || !status || startedAt === null || output === null) return null;
+
+  const exitCode = nullableFiniteNumber(record.exitCode);
+  if (exitCode === undefined) return null;
+  const endedAt = optionalFiniteNumber(record.endedAt);
+  const pid = optionalFiniteNumber(record.pid);
+  const lastInputAt = optionalFiniteNumber(record.lastInputAt);
+  const signal = optionalString(record.signal);
+  const logFile = optionalString(record.logFile);
+  const inputFile = optionalString(record.inputFile);
+  const statusFile = optionalString(record.statusFile);
+  const commandFile = optionalString(record.commandFile);
+  const supervisorFile = optionalString(record.supervisorFile);
+  const artifactIds = optionalStringArray(record.artifactIds);
+  const pty = optionalBoolean(record.pty);
+  const reattachable = optionalBoolean(record.reattachable);
+
+  if (
+    endedAt === undefined
+    || pid === undefined
+    || lastInputAt === undefined
+    || signal === undefined
+    || logFile === undefined
+    || inputFile === undefined
+    || statusFile === undefined
+    || commandFile === undefined
+    || supervisorFile === undefined
+    || artifactIds === undefined
+    || pty === undefined
+    || reattachable === undefined
+  ) {
+    return null;
+  }
+
+  return {
+    id,
+    command,
+    workdir,
+    status,
+    exitCode,
+    signal,
+    startedAt,
+    output,
+    ...(endedAt !== null ? { endedAt } : {}),
+    ...(pid !== null ? { pid } : {}),
+    ...(logFile !== null ? { logFile } : {}),
+    ...(inputFile !== null ? { inputFile } : {}),
+    ...(statusFile !== null ? { statusFile } : {}),
+    ...(commandFile !== null ? { commandFile } : {}),
+    ...(supervisorFile !== null ? { supervisorFile } : {}),
+    ...(artifactIds !== null ? { artifactIds } : {}),
+    ...(pty !== null ? { pty } : {}),
+    ...(reattachable !== null ? { reattachable } : {}),
+    ...(lastInputAt !== null ? { lastInputAt } : {}),
+  };
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function optionalString(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "string" ? value : undefined;
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function nullableFiniteNumber(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  if (value === undefined) return undefined;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalFiniteNumber(value: unknown): number | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalBoolean(value: unknown): boolean | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function optionalStringArray(value: unknown): string[] | null | undefined {
+  if (value === undefined || value === null) return null;
+  return Array.isArray(value) && value.every(item => typeof item === "string") ? value : undefined;
+}
+
 let manager: JobManager | null = null;
 
 export function getJobManager(): JobManager {
@@ -358,10 +463,10 @@ function readStatusFile(path?: string): { exitCode: number; endedAt?: number } |
   if (!path || !existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, "utf-8")) as { exitCode?: unknown; endedAt?: unknown };
-    const exitCode = Number(parsed.exitCode);
-    if (!Number.isFinite(exitCode)) return null;
-    const endedAt = Number(parsed.endedAt);
-    return { exitCode, endedAt: Number.isFinite(endedAt) ? endedAt : undefined };
+    const exitCode = typeof parsed.exitCode === "number" && Number.isFinite(parsed.exitCode) ? parsed.exitCode : null;
+    if (exitCode === null) return null;
+    const endedAt = typeof parsed.endedAt === "number" && Number.isFinite(parsed.endedAt) ? parsed.endedAt : undefined;
+    return { exitCode, endedAt };
   } catch {
     return null;
   }

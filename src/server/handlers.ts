@@ -74,6 +74,20 @@ function ensureTools(config?: Config) {
   registerDiagnosticsTools();
 }
 
+const VALID_THREAD_MODES = new Set<Config["mode"]>(["plan", "agent", "yolo"]);
+
+function parseBoundedQueryInt(raw: string | undefined, fallback: number, min: number, max: number): number {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(Math.floor(parsed), max));
+}
+
+function parseSinceSeq(raw: string | undefined): number {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.floor(parsed));
+}
+
 export async function health(c: Context) {
   return c.json({ status: "ok", version: VERSION });
 }
@@ -98,7 +112,7 @@ export async function getSessionHandler(c: Context) {
 }
 
 export async function listSessionsHandler(c: Context) {
-  const limit = Math.max(1, Math.min(Number(c.req.query("limit") || 50), 200));
+  const limit = parseBoundedQueryInt(c.req.query("limit"), 50, 1, 200);
   const search = (c.req.query("search") || "").toLowerCase();
   const sessions = listRuntimeRecords()
     .filter(record => !search || record.session.title.toLowerCase().includes(search) || record.session.id.includes(search))
@@ -129,7 +143,7 @@ export async function resumeSessionThreadHandler(c: Context) {
 }
 
 export async function listThreadsHandler(c: Context) {
-  const limit = Math.max(1, Math.min(Number(c.req.query("limit") || 50), 200));
+  const limit = parseBoundedQueryInt(c.req.query("limit"), 50, 1, 200);
   const includeArchived = c.req.query("include_archived") === "true";
   const threads = listRuntimeRecords()
     .filter(record => includeArchived || !record.thread.archived)
@@ -140,11 +154,32 @@ export async function listThreadsHandler(c: Context) {
 
 export async function createThreadHandler(c: Context) {
   const cfg = loadConfig();
-  const body = await c.req.json().catch(() => ({}));
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return c.json({ error: "invalid JSON body" }, 400);
+  }
+  if (body.model !== undefined && typeof body.model !== "string") {
+    return c.json({ error: "model must be a string" }, 400);
+  }
+  if (body.model !== undefined && typeof body.model === "string" && !body.model.trim()) {
+    return c.json({ error: "model must be a non-empty string" }, 400);
+  }
+  if (body.mode !== undefined && typeof body.mode !== "string") {
+    return c.json({ error: "mode must be a string" }, 400);
+  }
+  if (body.mode !== undefined && (!body.mode.trim() || !VALID_THREAD_MODES.has(body.mode as Config["mode"]))) {
+    return c.json({ error: "mode must be one of plan, agent, or yolo" }, 400);
+  }
+  if (body.workspace !== undefined && typeof body.workspace !== "string") {
+    return c.json({ error: "workspace must be a string" }, 400);
+  }
+  if (body.workspace !== undefined && typeof body.workspace === "string" && !body.workspace.trim()) {
+    return c.json({ error: "workspace must be a non-empty string" }, 400);
+  }
   const session = createSession({
-    model: body.model || cfg.model,
-    mode: body.mode || cfg.mode,
-    workspace_path: body.workspace || process.cwd(),
+    model: typeof body.model === "string" && body.model ? body.model : cfg.model,
+    mode: typeof body.mode === "string" && body.mode ? body.mode : cfg.mode,
+    workspace_path: typeof body.workspace === "string" && body.workspace ? body.workspace : process.cwd(),
   });
   const threadConfig: Config = {
     ...cfg,
@@ -169,12 +204,36 @@ export async function getThreadHandler(c: Context) {
 export async function threadItemsHandler(c: Context) {
   const record = getRuntimeRecord(c.req.param("thread_id") || "");
   if (!record) return c.json({ error: "Thread not found" }, 404);
-  const sinceSeq = Number(c.req.query("since_seq") || 0);
+  const sinceSeq = parseSinceSeq(c.req.query("since_seq"));
   return c.json({ items: replayRuntimeItems(record.thread.id, sinceSeq) });
 }
 
 export async function updateThreadHandler(c: Context) {
-  const body = await c.req.json().catch(() => ({}));
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return c.json({ error: "invalid JSON body" }, 400);
+  }
+  if (body.archived !== undefined && typeof body.archived !== "boolean") {
+    return c.json({ error: "archived must be a boolean" }, 400);
+  }
+  if (body.mode !== undefined && typeof body.mode !== "string") {
+    return c.json({ error: "mode must be a string" }, 400);
+  }
+  if (body.mode !== undefined && (!body.mode.trim() || !VALID_THREAD_MODES.has(body.mode as Config["mode"]))) {
+    return c.json({ error: "mode must be one of plan, agent, or yolo" }, 400);
+  }
+  if (body.model !== undefined && typeof body.model !== "string") {
+    return c.json({ error: "model must be a string" }, 400);
+  }
+  if (body.model !== undefined && typeof body.model === "string" && !body.model.trim()) {
+    return c.json({ error: "model must be a non-empty string" }, 400);
+  }
+  if (body.workspace !== undefined && typeof body.workspace !== "string") {
+    return c.json({ error: "workspace must be a string" }, 400);
+  }
+  if (body.workspace !== undefined && typeof body.workspace === "string" && !body.workspace.trim()) {
+    return c.json({ error: "workspace must be a non-empty string" }, 400);
+  }
   const patch: Record<string, unknown> = {};
   if (typeof body.archived === "boolean") patch.archived = body.archived;
   if (typeof body.mode === "string") patch.mode = body.mode;
@@ -206,7 +265,7 @@ export async function forkThreadHandler(c: Context) {
 export async function threadEventsHandler(c: Context) {
   const record = getRuntimeRecord(c.req.param("thread_id") || "");
   if (!record) return c.json({ error: "Thread not found" }, 404);
-  const sinceSeq = Number(c.req.query("since_seq") || 0);
+  const sinceSeq = parseSinceSeq(c.req.query("since_seq"));
   if ((c.req.header("accept") || "").includes("text/event-stream")) {
     return streamSSE(c, async (stream) => {
       let closed = false;
@@ -311,8 +370,10 @@ export async function chatHandler(c: Context) {
   const record = getRuntimeRecordBySession(id);
   if (!record) return c.json({ error: "Session not found" }, 404);
 
-  const body = await c.req.json();
-  const message = body.message;
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) return c.json({ error: "invalid JSON body" }, 400);
+  if (typeof body.message !== "string") return c.json({ error: "message must be a string" }, 400);
+  const message = body.message.trim();
   if (!message) return c.json({ error: "message required" }, 400);
 
   ensureTools(record.config);

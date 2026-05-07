@@ -88,7 +88,9 @@ function getShellCommand(ctx: ApprovalContext): string | null {
 }
 
 function shellWorkdir(ctx: ApprovalContext, workspace: string): string {
-  const raw = ctx.tool_args.workdir;
+  const raw = typeof ctx.tool_args.workdir === "string" && ctx.tool_args.workdir.trim()
+    ? ctx.tool_args.workdir
+    : ctx.tool_args.cwd;
   if (typeof raw !== "string" || raw.trim() === "") return workspace;
   return resolve(workspace, raw);
 }
@@ -135,6 +137,10 @@ function extractShellPathCandidate(token: string): string | null {
   if (token.startsWith("file:///")) return token.replace(/^file:\/\//, "");
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(token)) return null;
   if (token === "." || token === "..") return token;
+  if (token.includes("=")) {
+    const [, value = ""] = token.split("=", 2);
+    if (value && !token.startsWith("-")) return extractShellPathCandidate(value);
+  }
   if (token === "~" || token.startsWith("~/")) return expandHome(token);
   if (token.startsWith("/") || token.startsWith("./") || token.startsWith("../")) return token;
   if (token.startsWith("-") && token.includes("=")) {

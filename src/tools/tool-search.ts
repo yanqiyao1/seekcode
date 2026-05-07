@@ -1,14 +1,25 @@
 /** Tool discovery and activation for tools that are present in the stable schema prefix. */
 
-import { PermissionLevel, isToolConcurrencySafe, isToolDestructive, isToolReadOnly } from "./base.js";
+import {
+  PermissionLevel,
+  isToolStaticallyConcurrencySafe,
+  isToolStaticallyDestructive,
+  isToolStaticallyReadOnly,
+} from "./base.js";
 import { getRegistry } from "./registry.js";
 
 function normalize(value: unknown): string {
   return String(value ?? "").toLowerCase();
 }
 
+function normalizeQueryArg(args: Record<string, unknown>): string {
+  if (typeof args.query === "string") return args.query.trim();
+  if (typeof args.q === "string") return args.q.trim();
+  return "";
+}
+
 async function toolSearch(args: Record<string, unknown>): Promise<string> {
-  const query = normalize(args.query || args.q);
+  const query = normalize(normalizeQueryArg(args));
   if (!query.trim()) return "Error: query is required.";
   const registry = getRegistry();
   const matches = registry.search(query, 12);
@@ -19,9 +30,9 @@ async function toolSearch(args: Record<string, unknown>): Promise<string> {
     `Activated ${matches.length} matching tool(s):`,
     ...matches.map(({ tool }) => {
       const tags = [
-        isToolReadOnly(tool) ? "read-only" : "",
-        isToolDestructive(tool) ? "destructive" : "",
-        isToolConcurrencySafe(tool) ? "concurrent" : "",
+        isToolStaticallyReadOnly(tool) ? "read-only" : "",
+        isToolStaticallyDestructive(tool) ? "destructive" : "",
+        isToolStaticallyConcurrencySafe(tool) ? "concurrent" : "",
         tool.searchHint ? `hint: ${tool.searchHint}` : "",
       ].filter(Boolean).join(", ");
       return `- ${tool.name}${tags ? ` [${tags}]` : ""}: ${tool.description}`;
@@ -34,9 +45,16 @@ async function toolStats(): Promise<string> {
 }
 
 async function toolEnable(args: Record<string, unknown>): Promise<string> {
-  const name = String(args.name || "");
+  const name = typeof args.name === "string" ? args.name.trim() : "";
   if (!name) return "Error: name is required.";
   return getRegistry().enableDegraded(name) ? `Enabled ${name}.` : `Error: tool not found: ${name}`;
+}
+
+function validateToolEnableArgs(args: Record<string, unknown>) {
+  const name = typeof args.name === "string" ? args.name.trim() : "";
+  return name
+    ? { ok: true as const, args: { ...args, name } }
+    : { ok: false as const, message: "name is required." };
 }
 
 export function registerToolSearchTool(): void {
@@ -47,14 +65,18 @@ export function registerToolSearchTool(): void {
       type: "object",
       properties: {
         query: { type: "string", description: "Tool capability to search for." },
+        q: { type: "string", description: "Alias for query." },
       },
-      required: ["query"],
     },
     execute: toolSearch,
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: true,
     readOnly: true,
+    validateInput: (args) => {
+      const query = normalizeQueryArg(args);
+      return query ? { ok: true, args: { ...args, query } } : { ok: false, message: "query is required." };
+    },
     searchHint: "discover deferred tools",
     resultKind: "text",
   });
@@ -78,6 +100,7 @@ export function registerToolSearchTool(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: true,
+    validateInput: validateToolEnableArgs,
     searchHint: "reenable tool",
     resultKind: "text",
   });
