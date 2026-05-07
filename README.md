@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/yanqiyao1-seekcode-badge.png)](https://mseep.ai/app/yanqiyao1-seekcode)
+
 # Seek Code
 
 <p align="center">
