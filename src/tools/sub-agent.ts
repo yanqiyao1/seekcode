@@ -70,7 +70,7 @@ async function spawnAgent(args: Record<string, unknown>): Promise<string> {
   const baseUrl = (typeof args.base_url === "string" ? args.base_url.trim() : "") ||
     process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
   const model = (typeof args.model === "string" && args.model.trim() ? args.model.trim() : "") ||
-    process.env.DEEPSEEK_MODEL || "deepseek-chat";
+    process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
 
   const agentId = `agent_${nextAgentId++}`;
   const nickname = taskName.replace(/[^a-z0-9_]/gi, "_").slice(0, 40);

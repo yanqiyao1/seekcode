@@ -7,6 +7,7 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname, parse } from "node:path";
+import { homeDir } from "../paths.js";
 
 export interface AgentsMdResult {
   content: string;
@@ -27,7 +28,7 @@ export function readAgentsMd(cwd: string = process.cwd()): AgentsMdResult {
   const sources: string[] = [];
   const segments: string[] = [];
   let current = resolve(cwd);
-  const home = resolve(process.env.HOME || "~");
+  const home = resolve(homeDir());
   const root = parse(current).root;
 
   const visited = new Set<string>();

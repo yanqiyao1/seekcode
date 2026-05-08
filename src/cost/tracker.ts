@@ -15,7 +15,7 @@ export class CostTracker {
   model: string;
   turns: TurnCost[] = [];
 
-  constructor(model = "deepseek-chat") { this.model = model; }
+  constructor(model = "deepseek-v4-pro") { this.model = model; }
 
   reset(model = this.model): void {
     this.model = model;

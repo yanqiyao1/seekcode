@@ -95,7 +95,7 @@ export function createSession(opts?: Partial<Session>): Session {
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     mode: "agent",
-    model: "deepseek-chat",
+    model: "deepseek-v4-pro",
     turns: [],
     messages: [],
     cumulative_tokens_in: 0,

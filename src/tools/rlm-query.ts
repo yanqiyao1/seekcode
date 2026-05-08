@@ -53,7 +53,7 @@ async function rlmQuery(args: Record<string, unknown>): Promise<string> {
 
   const apiKey = process.env.DEEPSEEK_API_KEY || "";
   const baseUrl = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
-  const flashModel = process.env.DEEPSEEK_FLASH_MODEL || "deepseek-chat";
+  const flashModel = process.env.DEEPSEEK_FLASH_MODEL || "deepseek-v4-flash";
   const client = new OpenAI({ apiKey, baseURL: baseUrl });
 
   const runOne = async (q: RLMQuery) => {

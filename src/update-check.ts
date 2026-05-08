@@ -128,8 +128,8 @@ export async function acquireUpdateLock(lockPath = getUpdateLockPath(), timeoutM
     await mkdir(dirname(lockPath), { recursive: true });
     await writeFile(lockPath, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }), { encoding: "utf-8", flag: "wx" });
     return true;
-  } catch (error: any) {
-    return error?.code === "EEXIST" ? false : false;
+  } catch {
+    return false;
   }
 }
 
