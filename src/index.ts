@@ -21,6 +21,7 @@ import { shouldUseAlternateScreen } from "./tui/alternate-screen.js";
 import { Transcript } from "./tui/transcript.js";
 import { TuiRuntimeViewModel } from "./tui/runtime-view-model.js";
 import { approvalModalLines, pickerModalLines, type TuiModalKind, type TuiModalState } from "./tui/modal.js";
+import { denyModeSwitchWhileRunning } from "./tui/live-mode-guard.js";
 
 import { explainConfig, loadConfig, migrateProjectConfig, migrateUserConfig, userConfigPath, validateConfig, writeUserApiKey, type Config } from "./config.js";
 import { DeepSeekClient } from "./client/deepseek.js";
@@ -366,12 +367,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       return false;
     },
     onModeCycle: () => {
-      cfg.mode = nextModeName(cfg.mode);
-      session.mode = cfg.mode;
-      modeObj = getMode(cfg.mode);
-      rebuildSystemPrompt();
-      rebuildRuntime();
-      return r.promptSymbol(cfg.mode);
+      return denyModeSwitchWhileRunning(appendUiOutput, r.promptSymbol(cfg.mode));
     },
     onScroll: scrollTranscript,
   });
@@ -942,7 +938,7 @@ async function handleSlashCommand(
       write(`
 ${p.blueBold("Commands")}
   /help          Show this help
-  Shift+Tab      Cycle mode (plan → agent → yolo)
+  Shift+Tab      Cycle mode when idle (plan → agent → yolo)
   /plan          Switch to Plan mode (read-only)
   /agent         Switch to Agent mode (interactive approval)
   /yolo          Switch to YOLO mode (auto-approved)

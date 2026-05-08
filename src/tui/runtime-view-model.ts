@@ -147,7 +147,7 @@ export class TuiRuntimeViewModel {
     this.transcript.append(r.welcomeBanner(options.version, options.model, options.mode, options.toolCount));
     this.transcript.append(p.dim(options.loaded
       ? `\nLoaded session: ${options.session.title || options.session.id}. Continue typing or /help.`
-      : "\nType a request or /help. Tab completes commands. Shift+Tab cycles modes."));
+      : "\nType a request or /help. Tab completes commands. Shift+Tab cycles modes when idle."));
     if (options.loaded) this.replayRuntimeEvents(sessionMessagesToRuntimeEvents(options.session.messages));
     this.transcript.scrollToBottom();
   }

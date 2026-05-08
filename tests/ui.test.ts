@@ -28,6 +28,7 @@ import { AssistantStream } from "../src/tui/assistant-stream.js";
 import { shouldUseAlternateScreen } from "../src/tui/alternate-screen.js";
 import { FrameRenderer, shouldUseSynchronizedOutput } from "../src/tui/frame-renderer.js";
 import { TuiLayout } from "../src/tui/layout.js";
+import { denyModeSwitchWhileRunning, RUNNING_MODE_SWITCH_BLOCKED_MESSAGE } from "../src/tui/live-mode-guard.js";
 import { approvalModalLines, pickerModalLines } from "../src/tui/modal.js";
 import { runtimeItemsToEngineRuntimeEvents, sessionMessagesToRuntimeEvents } from "../src/tui/runtime-replay.js";
 import { TuiRuntimeViewModel } from "../src/tui/runtime-view-model.js";
@@ -1099,6 +1100,21 @@ describe("InputController", () => {
     expect(mode).toBe("running");
     expect(controller.getState().prompt).toBe("b");
     expect(interrupted).toBe(1);
+  });
+
+  it("blocks mode cycling while running and explains why", () => {
+    const notices: string[] = [];
+    const controller = new InputController({
+      mode: "running",
+      prompt: "● ",
+      onModeCycle: () => denyModeSwitchWhileRunning(message => notices.push(message), "● "),
+    });
+
+    controller.handleData("\x1b[Z");
+
+    expect(controller.getState().prompt).toBe("● ");
+    expect(notices).toHaveLength(1);
+    expect(stripAnsi(notices[0]!)).toContain(RUNNING_MODE_SWITCH_BLOCKED_MESSAGE);
   });
 
   it("clears the current input on ctrl+c instead of treating it as exit", () => {
