@@ -230,7 +230,7 @@ export class TuiLayout {
     const promptWidth = visibleLength(prompt);
     const currentLogicalLine = logicalBeforeCursor.at(-1) ?? "";
     const width = promptWidth + visibleLength(currentLogicalLine);
-    const cursorCol = (width % cols) + 1;
+    const cursorCol = width > 0 && width % cols === 0 ? cols : (width % cols) + 1;
 
     const visibleCount = Math.min(3, Math.max(1, allRows.length));
     const maxStart = Math.max(0, allRows.length - visibleCount);

@@ -6,7 +6,7 @@ export const SEEKCODE_DATA_DIR = "seekcode";
 export const LEGACY_DEEPSEEK_DATA_DIR = "deepseek";
 
 export function homeDir(): string {
-  return process.env.HOME || "~";
+  return process.env.HOME || process.env.USERPROFILE || "/tmp";
 }
 
 export function xdgDataHome(): string {
