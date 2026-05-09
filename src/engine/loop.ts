@@ -86,9 +86,7 @@ export class Engine {
     let ephemeralMessage: Message | null = null;
 
     try {
-      const activeMode = this.session.mode && this.session.mode !== mode.name
-        ? getMode(this.session.mode)
-        : mode;
+      const activeMode = resolveActiveMode(this.config, this.session, mode);
       if (options.ephemeralInstructions?.trim()) {
         ephemeralMessage = {
           role: "system",
@@ -249,6 +247,11 @@ export class Engine {
                 tool_def: toolDef,
                 workspace_path: this.session.workspace_path,
               };
+              const approvalArgs = publicToolArgs(nextArgs);
+              const approvalCtx: ApprovalContext = {
+                ...nextCtx,
+                tool_args: approvalArgs,
+              };
               const nextSandbox = checkSandboxPolicy(this.config, nextCtx);
               if (nextSandbox.decision === "deny") {
                 await emitRuntimeEvent(callbacks, { type: "approval_audit", data: { tool: tc.name, decision: "deny", reason: nextSandbox.reason } });
@@ -257,18 +260,19 @@ export class Engine {
               }
 
               let approvedAfterMutation: boolean;
-              if (nextSandbox.decision === "ask" && approvalPolicy !== "never") {
+              if (nextSandbox.decision === "ask" && approvalPolicy === "never") {
+                approvedAfterMutation = true;
+              } else if (nextSandbox.decision === "ask") {
                 approvedAfterMutation = await callbacks?.requestApproval?.(
                   tc.name,
-                  nextArgs,
-                  `Sandbox approval required: ${nextSandbox.reason}\n\nArguments: ${JSON.stringify(nextArgs)}`,
+                  approvalArgs,
+                  `Sandbox approval required: ${nextSandbox.reason}\n\nArguments: ${JSON.stringify(approvalArgs)}`,
                 ) ?? false;
               } else {
                 approvedAfterMutation = nextSandbox.decision === "allow" && approvalPolicy === "never"
                   ? true
-                  : await activeMode.checkPermission(nextCtx, callbacks);
+                  : await activeMode.checkPermission(approvalCtx, callbacks);
               }
-              if (nextSandbox.decision === "ask" && approvalPolicy === "never") approvedAfterMutation = true;
               await emitRuntimeEvent(callbacks, {
                 type: "approval_audit",
                 data: { tool: tc.name, decision: approvedAfterMutation ? "allow" : "deny", reason: nextSandbox.reason },
@@ -553,6 +557,15 @@ function effectiveApprovalPolicy(config: Config, mode: BaseMode): Config["approv
   return mode.name === "yolo" ? "never" : config.approval_policy;
 }
 
+function resolveActiveMode(config: Config, session: Session, requestedMode: BaseMode): BaseMode {
+  if (requestedMode.name === "yolo" && config.mode !== "plan" && session.mode !== "plan") {
+    return requestedMode;
+  }
+  return session.mode && session.mode !== requestedMode.name
+    ? getMode(session.mode)
+    : requestedMode;
+}
+
 function isAbortLikeError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return error.name === "AbortError" || /aborted|abort/i.test(error.message);
@@ -580,6 +593,10 @@ function withWorkspaceDefaults(toolDef: ToolDef, args: Record<string, unknown>, 
     }
   }
   return next;
+}
+
+function publicToolArgs(args: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(args).filter(([key]) => !key.startsWith("__")));
 }
 
 function toolSchemaProperties(toolDef: ToolDef): Record<string, unknown> {

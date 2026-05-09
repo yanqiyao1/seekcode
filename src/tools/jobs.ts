@@ -33,6 +33,7 @@ export interface ShellJob {
 
 interface InternalJob extends ShellJob {
   proc?: ChildProcess;
+  timeoutTimer?: NodeJS.Timeout;
 }
 
 const MAX_OUTPUT_CHARS = 200_000;
@@ -103,7 +104,12 @@ class JobManager {
     };
     this.jobs.set(id, job);
     this.persistJob(job);
+    if (timeoutMs > 0) {
+      job.timeoutTimer = setTimeout(() => this.timeoutJob(job, timeoutMs), timeoutMs);
+      job.timeoutTimer.unref?.();
+    }
     proc.on("error", error => {
+      this.clearTimeout(job);
       job.status = "failed";
       job.endedAt = Date.now();
       job.output = appendOutput(job.output, `\nError: ${error.message}`);
@@ -111,6 +117,7 @@ class JobManager {
       this.persistJob(job);
     });
     proc.on("exit", () => {
+      this.clearTimeout(job);
       job.proc = undefined;
       this.refreshJob(job);
     });
@@ -151,6 +158,7 @@ class JobManager {
     if (job.status !== "running") return false;
     job.status = "killed";
     job.endedAt = Date.now();
+    this.clearTimeout(job);
     if (job.pid) killProcessGroup(job.pid);
     job.proc = undefined;
     this.persistJob(job);
@@ -175,13 +183,14 @@ class JobManager {
     for (const job of this.jobs.values()) {
       this.refreshJob(job);
       if (job.status === "running" && job.pid) killProcessGroup(job.pid);
+      this.clearTimeout(job);
     }
     this.jobs.clear();
     try { rmSync(this.dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 
   private snapshot(job: InternalJob): ShellJob {
-    const { proc: _proc, ...snapshot } = job;
+    const { proc: _proc, timeoutTimer: _timeoutTimer, ...snapshot } = job;
     return { ...snapshot };
   }
 
@@ -207,7 +216,7 @@ class JobManager {
   private persistJob(job: InternalJob): void {
     try {
       mkdirSync(this.dataDir, { recursive: true });
-      const { proc: _proc, ...snapshot } = job;
+      const { proc: _proc, timeoutTimer: _timeoutTimer, ...snapshot } = job;
       writeFileSync(join(this.dataDir, `${job.id}.json`), JSON.stringify(snapshot, null, 2), "utf-8");
     } catch {
       // keep in-memory job state
@@ -232,11 +241,13 @@ class JobManager {
 
   private refreshJob(job: InternalJob): InternalJob {
     let changed = false;
+    let outputChanged = false;
     if (job.logFile && existsSync(job.logFile)) {
       try {
         const output = readFileSync(job.logFile, "utf-8").slice(-MAX_OUTPUT_CHARS);
         if (output !== job.output) {
           job.output = output;
+          outputChanged = true;
           changed = true;
         }
       } catch {
@@ -244,7 +255,8 @@ class JobManager {
       }
     }
 
-    const status = readStatusFile(job.statusFile);
+    const status = readStatusFile(job.statusFile)
+      || (job.status === "running" && outputChanged ? waitForStatusFile(job.statusFile, 50) : null);
     if (status && job.status !== "killed") {
       const exitCode = status.exitCode;
       const endedAt = status.endedAt || statusFileMtime(job.statusFile) || Date.now();
@@ -253,6 +265,7 @@ class JobManager {
       job.exitCode = exitCode;
       job.signal = null;
       job.endedAt = endedAt;
+      this.clearTimeout(job);
       job.proc = undefined;
       this.archiveCompletedOutput(job);
     } else if (job.status === "running") {
@@ -261,6 +274,7 @@ class JobManager {
       } else {
         job.status = "stale";
         job.endedAt = Date.now();
+        this.clearTimeout(job);
         job.proc = undefined;
         job.output = appendOutput(job.output, "\n[stale] Supervisor is no longer running and no exit status was recorded.\n");
         changed = true;
@@ -269,6 +283,33 @@ class JobManager {
 
     if (changed) this.persistJob(job);
     return job;
+  }
+
+  private timeoutJob(job: InternalJob, timeoutMs: number): void {
+    if (job.status !== "running") return;
+    if (job.logFile && existsSync(job.logFile)) {
+      try {
+        job.output = readFileSync(job.logFile, "utf-8").slice(-MAX_OUTPUT_CHARS);
+      } catch {
+        // keep current output
+      }
+    }
+    job.status = "failed";
+    job.exitCode = 124;
+    job.signal = null;
+    job.endedAt = Date.now();
+    job.output = appendOutput(job.output, `\n[timeout after ${timeoutMs}ms]\n`);
+    this.clearTimeout(job);
+    if (job.pid) killProcessGroup(job.pid);
+    job.proc = undefined;
+    this.archiveCompletedOutput(job);
+    this.persistJob(job);
+  }
+
+  private clearTimeout(job: InternalJob): void {
+    if (!job.timeoutTimer) return;
+    clearTimeout(job.timeoutTimer);
+    job.timeoutTimer = undefined;
   }
 
   private archiveCompletedOutput(job: InternalJob): void {
@@ -472,6 +513,20 @@ function readStatusFile(path?: string): { exitCode: number; endedAt?: number } |
   }
 }
 
+function waitForStatusFile(path: string | undefined, timeoutMs: number): { exitCode: number; endedAt?: number } | null {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const status = readStatusFile(path);
+    if (status) return status;
+    sleepSync(5);
+  } while (Date.now() < deadline);
+  return null;
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function statusFileMtime(path?: string): number | undefined {
   if (!path) return undefined;
   try { return statSync(path).mtimeMs; } catch { return undefined; }
@@ -490,8 +545,10 @@ timeout_ms="\${7:-0}"
 echo "$$" > "$status.pid"
 touch "$log"
 exec 3<>"$fifo"
-now="$(date +%s%3N 2>/dev/null)"
-case "$now" in ""|*[!0-9]*) now="$(($(date +%s) * 1000))" ;; esac
+now_ms() {
+  perl -MTime::HiRes=time -e 'printf "%.0f\\n", time() * 1000' 2>/dev/null || echo "$(($(date +%s) * 1000))"
+}
+now="$(now_ms)"
 printf '{"readyAt":%s}\\n' "$now" > "$ready"
 cmd="$(cat "$command_file")"
 run_with_timeout() {
@@ -502,7 +559,7 @@ run_with_timeout() {
     "$@"
   fi
 }
-if [[ "$mode" == "pty" ]] && command -v script >/dev/null 2>&1; then
+if [[ "$mode" == "pty" ]] && command -v script >/dev/null 2>&1 && script --version >/dev/null 2>&1; then
   run_with_timeout script -q -f -e -c "$cmd" "$log" <&3
   code=$?
 else
@@ -512,8 +569,7 @@ fi
 if [[ "$code" == "124" || "$code" == "137" ]]; then
   printf '\\n[timeout after %sms]\\n' "$timeout_ms" >> "$log"
 fi
-ended="$(date +%s%3N 2>/dev/null)"
-case "$ended" in ""|*[!0-9]*) ended="$(($(date +%s) * 1000))" ;; esac
+ended="$(now_ms)"
 printf '{"exitCode":%s,"endedAt":%s}\\n' "$code" "$ended" > "$status"
 exit "$code"
 `;

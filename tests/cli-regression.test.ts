@@ -243,6 +243,8 @@ function runCli(
     DEEPCODE_ARTIFACTS_DIR: join(tmp, "artifacts"),
     FORCE_COLOR: "0",
     NO_COLOR: "1",
+    NO_UPDATE_NOTIFIER: "1",
+    NPM_CONFIG_UPDATE_NOTIFIER: "false",
     ...options.env,
   };
   const result = spawnSync(cli[0], [...cli[1], ...args], {
@@ -272,6 +274,8 @@ function runCliAsync(
     DEEPCODE_ARTIFACTS_DIR: join(tmp, "artifacts"),
     FORCE_COLOR: "0",
     NO_COLOR: "1",
+    NO_UPDATE_NOTIFIER: "1",
+    NPM_CONFIG_UPDATE_NOTIFIER: "false",
     ...options.env,
   };
   return new Promise(resolve => {

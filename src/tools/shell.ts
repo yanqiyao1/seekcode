@@ -7,6 +7,8 @@ import { checkCommand, isCommandReadOnly } from "./exec-policy.js";
 import { formatJob, getJobManager } from "./jobs.js";
 import { resolvePathAlias } from "./path-resolution.js";
 
+const MIN_FOREGROUND_TIMEOUT_MS = 250;
+
 function normalizeShellArgAliases(args: Record<string, unknown>): Record<string, unknown> {
   if (args.workdir !== undefined || args.cwd === undefined) return args;
   return { ...args, workdir: args.cwd };
@@ -126,7 +128,8 @@ function normalizeTimeout(value: unknown): number | undefined {
 }
 
 function normalizeForegroundTimeout(value: unknown): number {
-  return normalizeTimeout(value) ?? 120_000;
+  const timeout = normalizeTimeout(value);
+  return timeout === undefined ? 120_000 : Math.max(timeout, MIN_FOREGROUND_TIMEOUT_MS);
 }
 
 function normalizeTailChars(value: unknown): number {

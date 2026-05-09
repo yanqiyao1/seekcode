@@ -2,7 +2,6 @@
 
 import * as cheerio from "cheerio";
 import { lookup as callbackLookup } from "node:dns";
-import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { Agent, EnvHttpProxyAgent, ProxyAgent, type Dispatcher } from "undici";
 import type { Element } from "domhandler";
@@ -1723,17 +1722,8 @@ async function assertPublicUrl(rawUrl: string, config?: ResolvedWebConfig): Prom
     throw new Error(`blocked restricted host: ${parsed.hostname}`);
   }
 
-  try {
-    const addresses = await lookup(parsed.hostname, { all: true });
-    for (const address of addresses) {
-      if (isRestrictedIpAddress(address.address)) {
-        throw new Error(`blocked restricted resolved IP: ${address.address}`);
-      }
-    }
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith("blocked restricted")) throw error;
-  }
-
+  // Real direct fetches still use SAFE_DISPATCHER, whose DNS lookup rejects
+  // private/reserved resolved IPs without doing a separate preflight request.
   return parsed;
 }
 
