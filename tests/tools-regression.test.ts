@@ -1973,6 +1973,11 @@ describe("engine", () => {
       parallelOk: true,
       renderProgress: (progress) => ({ kind: "task", preview: `rendered ${progress.message}` }),
       renderResult: (result) => ({ kind: "json", preview: `rendered result ${result}` }),
+      renderMetadata: { userFacingName: "Progress", icon: "activity", resultKind: "json" },
+      getActivityDescription: () => "Inspecting progress",
+      getToolUseSummary: () => "Progress summary",
+      toAutoClassifierInput: () => ({ action: "progress" }),
+      getTranscriptSearchText: (result) => `searchable ${result}`,
       execute: async (_args, context) => {
         await context?.onProgress?.({ message: "halfway", percent: 50 });
         return "ok";
@@ -1995,12 +2000,26 @@ describe("engine", () => {
     });
 
     const progress = events.find(event => event.type === "tool_progress");
+    const toolCall = events.find(event => event.type === "tool_call");
     const resultEvent = events.find(event => event.type === "tool_result");
+    expect(toolCall).toMatchObject({
+      data: {
+        metadata: {
+          activity: "Inspecting progress",
+          summary: "Progress summary",
+          classifierInput: { action: "progress" },
+          render: { userFacingName: "Progress", icon: "activity", resultKind: "json" },
+        },
+      },
+    });
     expect(progress).toMatchObject({
       data: { tool: "progress_tool", progress: { message: "halfway", percent: 50 } },
       rendered: { preview: "rendered halfway" },
     });
-    expect(resultEvent).toMatchObject({ rendered: { kind: "json", preview: "rendered result ok" } });
+    expect(resultEvent).toMatchObject({
+      rendered: { kind: "json", preview: "rendered result ok" },
+      metadata: { transcriptSearchText: "searchable ok" },
+    });
     expect(previews[0]).toBe("rendered result ok");
   });
 

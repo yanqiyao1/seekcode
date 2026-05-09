@@ -31,7 +31,7 @@ export interface ApprovalRecord {
   toolName: string;
   key: string;
   approvedAt: number;
-  /** If "always", applies to all future calls of this tool in this session */
+  /** If "always", applies to future calls matching this approval key in this session. */
   scope: "once" | "always";
 }
 
@@ -43,7 +43,7 @@ class ApprovalCache {
   // ── Approval ──────────────────────────────────────────────
 
   rememberApproval(toolName: string, scope: "once" | "always" = "once", args?: Record<string, unknown>): void {
-    const key = cacheKey(toolName, scope === "always" ? undefined : args);
+    const key = cacheKey(toolName, args);
     this.approvals.set(key, {
       toolName,
       key,
@@ -54,8 +54,7 @@ class ApprovalCache {
 
   isApproved(toolName: string, args?: Record<string, unknown>): boolean {
     const exactKey = cacheKey(toolName, args);
-    const alwaysKey = cacheKey(toolName);
-    const record = this.approvals.get(exactKey) || this.approvals.get(alwaysKey);
+    const record = this.approvals.get(exactKey) || this.approvals.get(cacheKey(toolName));
     if (!record) return false;
     if (record.scope === "always") return true;
     // "once" approvals expire after use

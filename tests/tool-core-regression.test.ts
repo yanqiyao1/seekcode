@@ -2,9 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   PermissionLevel,
+  getToolPermissionPatterns,
+  getToolRenderMetadata,
+  getToolUseRuntimeMetadata,
   isToolConcurrencySafe,
   isToolDestructive,
   isToolReadOnly,
+  prepareToolPermissionMatcher,
   resolveToolPermission,
   toolToOpenAISchema,
   validateToolInput,
@@ -121,6 +125,42 @@ describe("tool base helpers", () => {
     expect(isToolReadOnly(tool)).toBe(false);
     expect(isToolDestructive(tool)).toBe(false);
     expect(isToolConcurrencySafe(tool)).toBe(true);
+  });
+
+  it("builds optional runtime metadata without requiring every tool to implement it", () => {
+    const tool = makeTool({
+      resultKind: "json",
+      renderMetadata: () => ({ userFacingName: "Audit", icon: "shield" }),
+      getActivityDescription: (args) => `Auditing ${args.path}`,
+      getToolUseSummary: (args) => `Audit ${args.path}`,
+      toAutoClassifierInput: (args) => ({ audit: args.path }),
+      getTranscriptSearchText: (result) => `visible:${result}`,
+    });
+
+    expect(getToolRenderMetadata(tool, { path: "src/index.ts" })).toEqual({
+      userFacingName: "Audit",
+      icon: "shield",
+      resultKind: "json",
+    });
+    expect(getToolUseRuntimeMetadata(tool, { path: "src/index.ts" }, "ok")).toEqual({
+      activity: "Auditing src/index.ts",
+      summary: "Audit src/index.ts",
+      classifierInput: { audit: "src/index.ts" },
+      transcriptSearchText: "visible:ok",
+      render: { userFacingName: "Audit", icon: "shield", resultKind: "json" },
+    });
+  });
+
+  it("lets tools prepare permission patterns and matchers", async () => {
+    const tool = makeTool({
+      getPermissionPatterns: (args) => [`path:${args.path}`],
+      preparePermissionMatcher: (args) => (pattern) => pattern === `path:${args.path}`,
+    });
+
+    expect(getToolPermissionPatterns(tool, { path: "src/index.ts" })).toEqual(["path:src/index.ts"]);
+    const matcher = await prepareToolPermissionMatcher(tool, { path: "src/index.ts" });
+    expect(matcher?.("path:src/index.ts")).toBe(true);
+    expect(matcher?.("path:README.md")).toBe(false);
   });
 });
 

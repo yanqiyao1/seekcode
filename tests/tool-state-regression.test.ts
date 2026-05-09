@@ -140,13 +140,14 @@ describe("approval cache", () => {
 });
 
 describe("permission rules", () => {
-  it("lets always-allow memory override custom deny rules until forgotten", () => {
+  it("lets pattern-specific always-allow memory override custom deny rules until forgotten", () => {
     addRule({ permission: "bash", pattern: "npm *", action: "deny" });
-    rememberAlwaysAllow("bash");
+    rememberAlwaysAllow("bash", { command: "npm test" });
 
     expect(checkPermission({ toolName: "bash", toolArgs: { command: "npm test" } })).toMatchObject({ action: "allow" });
+    expect(checkPermission({ toolName: "bash", toolArgs: { command: "npm run build" } })).toMatchObject({ action: "deny" });
 
-    forgetTool("bash");
+    forgetTool("bash", { command: "npm test" });
     expect(checkPermission({ toolName: "bash", toolArgs: { command: "npm test" } })).toMatchObject({
       action: "deny",
       matchedRule: "bash:npm *",
@@ -166,16 +167,31 @@ describe("permission rules", () => {
     });
   });
 
+  it("uses tool-prepared matchers before falling back to string patterns", () => {
+    addRule({ permission: "custom_shell", pattern: "semantic:install", action: "deny" });
+
+    expect(checkPermission({
+      toolName: "custom_shell",
+      patterns: ["npm test"],
+      matchesPattern: (pattern) => pattern === "semantic:install",
+    })).toMatchObject({
+      action: "deny",
+      matchedRule: "custom_shell:semantic:install",
+    });
+  });
+
   it("tracks session-level always allow and deny sets independently", () => {
-    rememberAlwaysAllow("read");
-    rememberAlwaysDeny("bash");
+    rememberAlwaysAllow("read", { path: "README.md" });
+    rememberAlwaysDeny("bash", { command: "rm -rf build" });
 
-    expect(isAlwaysAllowed("read")).toBe(true);
-    expect(isAlwaysDenied("bash")).toBe(true);
-    expect(getSessionMemory()).toEqual({ allow: ["read"], deny: ["bash"] });
-
-    forgetTool("bash");
+    expect(isAlwaysAllowed("read")).toBe(false);
+    expect(isAlwaysAllowed("read", { path: "README.md" })).toBe(true);
     expect(isAlwaysDenied("bash")).toBe(false);
+    expect(isAlwaysDenied("bash", { command: "rm -rf build" })).toBe(true);
+    expect(getSessionMemory()).toEqual({ allow: ["read(README.md)"], deny: ["bash(rm -rf build)"] });
+
+    forgetTool("bash", { command: "rm -rf build" });
+    expect(isAlwaysDenied("bash", { command: "rm -rf build" })).toBe(false);
   });
 
   it("replaces duplicate custom rules and removes them cleanly", () => {

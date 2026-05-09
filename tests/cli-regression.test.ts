@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type Server, type ServerResponse } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -173,7 +173,62 @@ describe("CLI and packaging", () => {
       expect(request.messages.at(-1)).toMatchObject({ role: "user", content: "hello from seek" });
       expect(request.stream).toBe(true);
       expect(request.model).toBe("deepseek-v4-pro");
+      expect(request.tools).toEqual(expect.arrayContaining([
+        expect.objectContaining({ function: expect.objectContaining({ name: "read" }) }),
+      ]));
     }
+  });
+
+  it("routes one-shot prompts through the engine tool loop", async () => {
+    const requests: any[] = [];
+    await startFakeOpenAIServer(requests, (_request, res, requestNumber) => {
+      if (requestNumber === 1) {
+        writeSse(res, {
+          choices: [{
+            delta: {
+              tool_calls: [{
+                index: 0,
+                id: "call_read_fixture",
+                type: "function",
+                function: { name: "read", arguments: "{\"path\":\"fixture.txt\"}" },
+              }],
+            },
+            finish_reason: null,
+          }],
+        });
+        writeSse(res, {
+          choices: [{ delta: {}, finish_reason: "tool_calls" }],
+          usage: { prompt_tokens: 11, completion_tokens: 2 },
+        });
+      } else {
+        writeSse(res, { choices: [{ delta: { content: "read via tool ok" }, finish_reason: null }] });
+        writeSse(res, {
+          choices: [{ delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 13, completion_tokens: 4 },
+        });
+      }
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+    const workspace = join(tmp, "workspace");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, "fixture.txt"), "fixture body from tool\n");
+
+    const result = await runCliAsync(distCli, ["--base-url", serverUrl, "--api-key", "test-key", "--reasoning-effort", "off", "summarize", "fixture"], {
+      cwd: workspace,
+      timeoutMs: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(stripAnsi(result.stdout)).toContain("read via tool ok");
+    expect(requests).toHaveLength(2);
+    expect(requests[0].tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ function: expect.objectContaining({ name: "read" }) }),
+    ]));
+    expect(requests[1].messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "tool", name: "read", content: expect.stringContaining("fixture body from tool") }),
+    ]));
   });
 
   it("reads the API key and base URL from ~/.seekcode/config.toml", async () => {
@@ -308,7 +363,9 @@ function writeUserConfig(content: string): void {
   writeFileSync(join(configDir, "config.toml"), content);
 }
 
-async function startFakeOpenAIServer(requests: any[]): Promise<void> {
+type FakeOpenAIResponder = (request: any, res: ServerResponse, requestNumber: number) => void;
+
+async function startFakeOpenAIServer(requests: any[], respond: FakeOpenAIResponder = defaultOpenAIResponder): Promise<void> {
   server = createServer((req, res) => {
     let body = "";
     req.setEncoding("utf-8");
@@ -318,21 +375,33 @@ async function startFakeOpenAIServer(requests: any[]): Promise<void> {
         res.writeHead(404).end("not found");
         return;
       }
-      requests.push({ ...JSON.parse(body), authorization: req.headers.authorization });
+      const request = { ...JSON.parse(body), authorization: req.headers.authorization };
+      requests.push(request);
       res.writeHead(200, {
         "content-type": "text/event-stream; charset=utf-8",
         "cache-control": "no-cache",
       });
-      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "one-shot ok" }, finish_reason: null }] })}\n\n`);
-      res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 7, completion_tokens: 3 } })}\n\n`);
-      res.write("data: [DONE]\n\n");
-      res.end();
+      respond(request, res, requests.length);
     });
   });
   await new Promise<void>(resolveListen => server!.listen(0, "127.0.0.1", () => resolveListen()));
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
   serverUrl = `http://127.0.0.1:${address.port}`;
+}
+
+function defaultOpenAIResponder(_request: any, res: ServerResponse): void {
+  writeSse(res, { choices: [{ delta: { content: "one-shot ok" }, finish_reason: null }] });
+  writeSse(res, {
+    choices: [{ delta: {}, finish_reason: "stop" }],
+    usage: { prompt_tokens: 7, completion_tokens: 3 },
+  });
+  res.write("data: [DONE]\n\n");
+  res.end();
+}
+
+function writeSse(res: ServerResponse, payload: Record<string, unknown>): void {
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
 function stripAnsi(text: string): string {

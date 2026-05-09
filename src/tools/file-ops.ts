@@ -354,6 +354,29 @@ function renderFileResult(kind: "text" | "diff") {
   });
 }
 
+function toolPath(args: Record<string, unknown>, fallback = "file"): string {
+  const normalized = normalizePathArg(args);
+  return typeof normalized.path === "string" && normalized.path.trim()
+    ? normalized.path.trim()
+    : fallback;
+}
+
+function filePermissionPatterns(args: Record<string, unknown>): string[] {
+  return [toolPath(args)].filter(path => path && path !== "file");
+}
+
+function fileActivity(action: string, fallback = "file") {
+  return (args: Record<string, unknown>) => `${action} ${toolPath(args, fallback)}`;
+}
+
+function fileSummary(action: string, fallback = "file") {
+  return (args: Record<string, unknown>) => `${action} ${toolPath(args, fallback)}`;
+}
+
+function textSearch(result: string): string {
+  return result;
+}
+
 export function registerFileTools(): void {
   const r = getRegistry();
   const t = (
@@ -373,6 +396,11 @@ export function registerFileTools(): void {
     resultKind: "text",
     renderResult: renderFileResult("text"),
     isSearchOrReadCommand: () => ({ isSearch: false, isRead: true }),
+    getPermissionPatterns: filePermissionPatterns,
+    getActivityDescription: fileActivity("Reading"),
+    getToolUseSummary: fileSummary("Read"),
+    getTranscriptSearchText: textSearch,
+    renderMetadata: { userFacingName: "Read", icon: "file-text", resultKind: "text" },
     validateInput: (args) => {
       const normalized = normalizePathArg(args);
       const message = requireString(normalized, "path");
@@ -392,6 +420,11 @@ export function registerFileTools(): void {
     resultKind: "diff",
     renderResult: renderFileResult("diff"),
     maxResultSizeChars: FILE_DIFF_MAX_CHARS,
+    getPermissionPatterns: filePermissionPatterns,
+    getActivityDescription: fileActivity("Writing"),
+    getToolUseSummary: fileSummary("Write"),
+    getTranscriptSearchText: textSearch,
+    renderMetadata: { userFacingName: "Write", icon: "file-plus", resultKind: "diff" },
     validateInput: (args) => {
       const normalized = normalizeWriteArgs(args);
       const pathError = requireString(normalized, "path");
@@ -409,6 +442,11 @@ export function registerFileTools(): void {
     resultKind: "diff",
     renderResult: renderFileResult("diff"),
     maxResultSizeChars: FILE_DIFF_MAX_CHARS,
+    getPermissionPatterns: filePermissionPatterns,
+    getActivityDescription: fileActivity("Editing"),
+    getToolUseSummary: fileSummary("Edit"),
+    getTranscriptSearchText: textSearch,
+    renderMetadata: { userFacingName: "Edit", icon: "file-pen", resultKind: "diff" },
     validateInput: (args) => {
       const normalized = normalizeEditArgs(args);
       for (const key of ["path", "old_string"]) {
@@ -430,6 +468,11 @@ export function registerFileTools(): void {
     readOnly: true,
     resultKind: "text",
     isSearchOrReadCommand: () => ({ isSearch: false, isRead: false, isList: true }),
+    getPermissionPatterns: filePermissionPatterns,
+    getActivityDescription: fileActivity("Listing", "files"),
+    getToolUseSummary: fileSummary("List", "files"),
+    getTranscriptSearchText: textSearch,
+    renderMetadata: { userFacingName: "List", icon: "folder", resultKind: "text" },
     validateInput: (args) => {
       const pathInput = optionalPathInput(args);
       if (!pathInput.ok) return { ok: false, message: pathInput.message };
@@ -444,6 +487,15 @@ export function registerFileTools(): void {
     resultKind: "text",
     maxResultSizeChars: 80_000,
     isSearchOrReadCommand: () => ({ isSearch: true, isRead: false }),
+    getPermissionPatterns: (args) => [typeof args.pattern === "string" ? args.pattern.trim() : "", toolPath(args, ".")].filter(Boolean),
+    getActivityDescription: (args) => typeof args.pattern === "string" && args.pattern.trim()
+      ? `Searching for ${args.pattern.trim()}`
+      : "Searching files",
+    getToolUseSummary: (args) => typeof args.pattern === "string" && args.pattern.trim()
+      ? `Search ${args.pattern.trim()}`
+      : "Search files",
+    getTranscriptSearchText: textSearch,
+    renderMetadata: { userFacingName: "Search", icon: "search", resultKind: "text" },
     validateInput: (args) => {
       const normalized = normalizePathArg(args);
       const message = requireString(args, "pattern");
@@ -465,6 +517,15 @@ export function registerFileTools(): void {
     resultKind: "text",
     maxResultSizeChars: 80_000,
     isSearchOrReadCommand: () => ({ isSearch: true, isRead: false, isList: true }),
+    getPermissionPatterns: (args) => [typeof args.pattern === "string" ? args.pattern.trim() : "", toolPath(args, ".")].filter(Boolean),
+    getActivityDescription: (args) => typeof args.pattern === "string" && args.pattern.trim()
+      ? `Finding ${args.pattern.trim()}`
+      : "Finding files",
+    getToolUseSummary: (args) => typeof args.pattern === "string" && args.pattern.trim()
+      ? `Glob ${args.pattern.trim()}`
+      : "Find files",
+    getTranscriptSearchText: textSearch,
+    renderMetadata: { userFacingName: "Glob", icon: "files", resultKind: "text" },
     validateInput: (args) => {
       const normalized = normalizePathArg(args);
       const message = requireString(args, "pattern");

@@ -2,6 +2,7 @@
 
 import type { EngineRuntimeEvent } from "../engine/events.js";
 import type { Message, Session } from "../session/types.js";
+import type { ToolUseRuntimeMetadata } from "../tools/base.js";
 import { renderMarkdown } from "../ui/markdown.js";
 import { p } from "../ui/palette.js";
 import * as r from "../ui/renderer.js";
@@ -229,13 +230,13 @@ export class TuiRuntimeViewModel {
         this.renderToolCallArgs(event.data.tool_call_id, event.data.name, event.data.arguments);
         break;
       case "tool_call":
-        this.renderToolCall(event.data.id || event.data.name, event.data.name, event.data.arguments);
+        this.renderToolCall(event.data.id || event.data.name, event.data.name, event.data.arguments, event.data.metadata);
         break;
       case "approval_required":
         this.renderApprovalRequired(event.data.tool, event.data.args);
         break;
       case "tool_result":
-        this.renderToolResult(event.data.name, event.preview, event.data.tool_call_id || event.data.name);
+        this.renderToolResult(event.data.name, event.preview, event.data.tool_call_id || event.data.name, event.metadata);
         break;
       case "tool_progress":
         this.renderToolProgress(event);
@@ -297,7 +298,7 @@ export class TuiRuntimeViewModel {
     this.options.renderNow?.();
   }
 
-  private renderToolCall(toolCallId: string, name: string, args: Record<string, unknown>): void {
+  private renderToolCall(toolCallId: string, name: string, args: Record<string, unknown>, metadata?: ToolUseRuntimeMetadata): void {
     if (!toolCallId && !name) return;
     if (toolCallId && name && toolCallId !== name) {
       this.promoteToolKey(name, toolCallId, name);
@@ -305,7 +306,7 @@ export class TuiRuntimeViewModel {
     if (!this.renderedToolCalls.has(toolCallId) && !this.renderedToolCalls.has(name)) {
       this.renderToolCallStart(name, toolCallId || name);
     }
-    this.updateToolActivity(toolCallId || name, name, describeToolActivity(name, args), true);
+    this.updateToolActivity(toolCallId || name, name, metadata?.activity || describeToolActivity(name, args), true);
     this.toolArgumentStreams.delete(toolCallId);
   }
 
@@ -325,8 +326,9 @@ export class TuiRuntimeViewModel {
     this.updateToolActivity(key, activeName, label, false);
   }
 
-  private renderToolResult(name: string, preview: string, toolCallId = name): void {
-    const line = r.toolCallStatus(name, preview.startsWith("Error:") ? "error" : "success", preview);
+  private renderToolResult(name: string, preview: string, toolCallId = name, metadata?: ToolUseRuntimeMetadata): void {
+    const label = metadata?.summary || metadata?.activity || metadata?.render?.userFacingName || name;
+    const line = r.toolCallStatus(label, preview.startsWith("Error:") ? "error" : "success", preview);
     const activeToolLine = this.activeToolLines.finish(toolCallId);
     this.activeToolNames.delete(toolCallId);
     this.activeToolLabels.delete(toolCallId);

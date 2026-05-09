@@ -11,8 +11,8 @@ export function applyApprovalChoice(
   const cache = getApprovalCache();
   if (choice === "always") {
     cache.rememberApproval(toolName, "always", args);
-    rememberAlwaysAllow(toolName);
-    return { level: "success", message: `Approved ${toolName} for this session.` };
+    rememberAlwaysAllow(toolName, args);
+    return { level: "success", message: `Approved ${toolName} for matching requests this session.` };
   }
   if (choice === "once") {
     cache.rememberApproval(toolName, "once", args);

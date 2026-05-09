@@ -1,7 +1,7 @@
 /** Stable runtime events emitted by the query engine. */
 
 import type { Message, ToolCall, ToolResult } from "../session/types.js";
-import type { ToolProgress, ToolRenderedResult } from "../tools/base.js";
+import type { ToolProgress, ToolRenderedResult, ToolUseRuntimeMetadata } from "../tools/base.js";
 import type { ToolStats } from "../tools/registry.js";
 import type { ContextIntervention } from "./context-manager.js";
 import type { PrefixMetadata } from "./prefix.js";
@@ -43,6 +43,7 @@ export interface PrefixInvalidatedEventData {
 export interface ToolResultRuntimeEvent extends EngineRuntimeEventBase<"tool_result", ToolResult> {
   preview: string;
   rendered?: ToolRenderedResult;
+  metadata?: ToolUseRuntimeMetadata;
 }
 
 export interface ToolProgressRuntimeEvent extends EngineRuntimeEventBase<"tool_progress", {
@@ -65,7 +66,7 @@ export interface EngineRuntimeEventMap {
   assistant_message: Message;
   tool_catalog_auto_activate: { tools: string[]; source: "user_input" };
   context_intervention: ContextIntervention;
-  tool_call: ToolCall;
+  tool_call: ToolCall & { metadata?: ToolUseRuntimeMetadata };
   tool_budget_exceeded: { tool: string; budget: number };
   approval_required: ApprovalRequiredEventData;
   approval_audit: ApprovalAuditEventData;

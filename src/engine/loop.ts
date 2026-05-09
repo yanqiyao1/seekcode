@@ -6,7 +6,7 @@ import type { StreamEvent, ContentDelta, ThinkingDelta, ToolCallBegin, ToolCallA
 import type { BaseMode, UICallbacks } from "../modes/base.js";
 import type { ConversationHistory } from "../session/history.js";
 import type { Message, Session, ToolCall, ToolResult } from "../session/types.js";
-import { validateToolInput, type ApprovalContext, type ToolDef } from "../tools/base.js";
+import { getToolUseRuntimeMetadata, validateToolInput, type ApprovalContext, type ToolDef } from "../tools/base.js";
 import { ToolRegistry } from "../tools/registry.js";
 import { CapacityController } from "./capacity.js";
 import { LayeredContextManager } from "./context-manager.js";
@@ -188,9 +188,13 @@ export class Engine {
             this.interrupted = true;
             break;
           }
-          await emitRuntimeEvent(callbacks, { type: "tool_call", data: tc });
-
           const toolDef = this.tools.lookup(tc.name);
+          await emitRuntimeEvent(callbacks, {
+            type: "tool_call",
+            data: toolDef
+              ? { ...tc, metadata: getToolUseRuntimeMetadata(toolDef, tc.arguments as Record<string, unknown>) }
+              : tc,
+          });
           if (!toolDef) {
             const err = `Error: Unknown tool '${tc.name}'`;
             const tr: ToolResult = {
@@ -349,6 +353,7 @@ export class Engine {
               tool_call_id: tc.id, name: tc.name, content: budgeted.content, is_error: isError,
             };
             const rendered = toolDef.renderResult?.(budgeted.replaced ? budgeted.content : resultContent, args);
+            const metadata = getToolUseRuntimeMetadata(toolDef, args, budgeted.replaced ? budgeted.content : resultContent);
             recordToolResult(tr);
             turnToolResults.push(tr);
             turnToolCalls.push(tc);
@@ -361,6 +366,7 @@ export class Engine {
               artifact_ids: artifactIds,
               preview: rendered?.preview ?? (budgeted.replaced ? budgeted.content : resultContent),
               rendered,
+              metadata,
             });
             for (const id of artifactIds) turnArtifactIds.add(id);
             const postHook = await fireHooks("PostToolUse", {

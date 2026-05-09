@@ -237,6 +237,33 @@ function shellSearchOrRead(args: Record<string, unknown>) {
   };
 }
 
+function matchShellPattern(pattern: string, command: string): boolean {
+  const trimmedPattern = pattern.trim();
+  const trimmedCommand = command.trim();
+  if (!trimmedPattern) return false;
+  const regexStr = "^" + trimmedPattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".") + "$";
+  try {
+    return new RegExp(regexStr, "i").test(trimmedCommand);
+  } catch {
+    return trimmedPattern === trimmedCommand;
+  }
+}
+
+function shellActivity(action: string) {
+  return (args: Record<string, unknown>) => {
+    const command = commandArg(args);
+    return command ? `${action} ${command}` : `${action} command`;
+  };
+}
+
+function shellSummary(args: Record<string, unknown>): string {
+  const command = commandArg(args);
+  return command ? `Shell ${command}` : "Shell command";
+}
+
 export function registerShellTool(): void {
   const r = getRegistry();
   r.register({
@@ -262,6 +289,19 @@ export function registerShellTool(): void {
     searchHint: "run shell command",
     resultKind: "text",
     isSearchOrReadCommand: shellSearchOrRead,
+    getPermissionPatterns: (args) => {
+      const command = commandArg(args);
+      return command ? [command] : [];
+    },
+    preparePermissionMatcher: (args) => {
+      const command = commandArg(args);
+      return (pattern) => matchShellPattern(pattern, command);
+    },
+    toAutoClassifierInput: (args) => commandArg(args),
+    getActivityDescription: shellActivity("Running"),
+    getToolUseSummary: shellSummary,
+    getTranscriptSearchText: (result) => result,
+    renderMetadata: { userFacingName: "Shell", icon: "terminal", resultKind: "text" },
     category: "shell",
     parallelOk: false,
   });
@@ -280,6 +320,10 @@ export function registerShellTool(): void {
     },
     searchHint: "poll background shell output",
     resultKind: "task",
+    getPermissionPatterns: (args) => typeof args.id === "string" ? [args.id.trim()] : typeof args.job_id === "string" ? [args.job_id.trim()] : [],
+    getToolUseSummary: (args) => `Poll ${typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "job"}`,
+    getTranscriptSearchText: (result) => result,
+    renderMetadata: { userFacingName: "Shell output", icon: "terminal", resultKind: "task" },
     category: "shell",
     parallelOk: true,
   });
@@ -298,6 +342,10 @@ export function registerShellTool(): void {
     },
     searchHint: "send stdin to job",
     resultKind: "task",
+    getPermissionPatterns: (args) => typeof args.id === "string" ? [args.id.trim()] : typeof args.job_id === "string" ? [args.job_id.trim()] : [],
+    getToolUseSummary: (args) => `Send input to ${typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "job"}`,
+    toAutoClassifierInput: (args) => ({ job: typeof args.id === "string" ? args.id : args.job_id, input: args.input }),
+    renderMetadata: { userFacingName: "Shell input", icon: "terminal", resultKind: "task" },
     category: "shell",
     parallelOk: false,
     deferLoading: true,
@@ -312,6 +360,10 @@ export function registerShellTool(): void {
     validateInput: validateJobIdArgs,
     searchHint: "cancel shell job",
     resultKind: "task",
+    getPermissionPatterns: (args) => typeof args.id === "string" ? [args.id.trim()] : typeof args.job_id === "string" ? [args.job_id.trim()] : [],
+    getToolUseSummary: (args) => `Cancel ${typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "job"}`,
+    toAutoClassifierInput: (args) => ({ cancel_job: typeof args.id === "string" ? args.id : args.job_id }),
+    renderMetadata: { userFacingName: "Cancel shell", icon: "x-circle", resultKind: "task" },
     category: "shell",
     parallelOk: true,
   });
@@ -327,6 +379,19 @@ export function registerShellTool(): void {
     searchHint: "start background shell command",
     resultKind: "task",
     isSearchOrReadCommand: shellSearchOrRead,
+    getPermissionPatterns: (args) => {
+      const command = commandArg(args);
+      return command ? [command] : [];
+    },
+    preparePermissionMatcher: (args) => {
+      const command = commandArg(args);
+      return (pattern) => matchShellPattern(pattern, command);
+    },
+    toAutoClassifierInput: (args) => commandArg(args),
+    getActivityDescription: shellActivity("Starting"),
+    getToolUseSummary: shellSummary,
+    getTranscriptSearchText: (result) => result,
+    renderMetadata: { userFacingName: "Background shell", icon: "terminal", resultKind: "task" },
     category: "shell",
     parallelOk: true,
   });
@@ -345,6 +410,10 @@ export function registerShellTool(): void {
     },
     searchHint: "poll task shell output",
     resultKind: "task",
+    getPermissionPatterns: (args) => typeof args.id === "string" ? [args.id.trim()] : typeof args.job_id === "string" ? [args.job_id.trim()] : [],
+    getToolUseSummary: (args) => `Poll ${typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "task shell"}`,
+    getTranscriptSearchText: (result) => result,
+    renderMetadata: { userFacingName: "Task shell output", icon: "terminal", resultKind: "task" },
     category: "shell",
     parallelOk: true,
   });

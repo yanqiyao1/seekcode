@@ -5,6 +5,8 @@
  * remembered decisions, and session-scoped persistence.
  */
 
+import { getToolPermissionPatterns, type ToolDef, type ToolPermissionMatcher } from "./base.js";
+
 // ── Types ────────────────────────────────────────────────────
 
 export type PermissionAction = "allow" | "deny" | "ask";
@@ -21,6 +23,8 @@ export interface PermissionRequest {
   sessionID?: string;
   /** Specific argument patterns the model is asking about */
   patterns?: string[];
+  /** Optional tool-prepared matcher for richer command/path rule semantics */
+  matchesPattern?: ToolPermissionMatcher;
 }
 
 export interface PermissionResult {
@@ -31,10 +35,9 @@ export interface PermissionResult {
 
 // ── Session-scoped memory ───────────────────────────────────
 
-// Tools the user has said "always allow" for
-const alwaysAllow: Set<string> = new Set();
-// Tools the user has said "always deny" for
-const alwaysDeny: Set<string> = new Set();
+// Pattern-specific session memory from interactive approval choices.
+const sessionAllowRules: PermissionRule[] = [];
+const sessionDenyRules: PermissionRule[] = [];
 // Custom rules
 const customRules: PermissionRule[] = [];
 // Built-in defaults
@@ -91,6 +94,15 @@ function matchWildcard(pattern: string, value: string): boolean {
   }
 }
 
+function safeMatch(matcher: ToolPermissionMatcher | undefined, pattern: string): boolean {
+  if (!matcher) return false;
+  try {
+    return matcher(pattern);
+  } catch {
+    return false;
+  }
+}
+
 function matchRule(rule: PermissionRule, request: PermissionRequest): boolean {
   // Match tool name
   if (!matchWildcard(rule.permission, request.toolName)) return false;
@@ -99,7 +111,9 @@ function matchRule(rule: PermissionRule, request: PermissionRequest): boolean {
   if (rule.pattern === "*") return true;
 
   // Check specific patterns from the request
-  if (request.patterns) {
+  if (safeMatch(request.matchesPattern, rule.pattern)) return true;
+
+  if (request.patterns?.length) {
     return request.patterns.some(p => matchWildcard(rule.pattern, p));
   }
 
@@ -115,14 +129,17 @@ function matchRule(rule: PermissionRule, request: PermissionRequest): boolean {
 // ── Main API ────────────────────────────────────────────────
 
 export function checkPermission(request: PermissionRequest): PermissionResult {
-  // Check always-allow first
-  if (alwaysAllow.has(request.toolName)) {
-    return { action: "allow", reason: "Always allowed for this session" };
+  // Check session-specific memory first. Deny wins on exact conflicts.
+  for (const rule of sessionDenyRules) {
+    if (matchRule(rule, request)) {
+      return { action: "deny", matchedRule: formatPermissionRule(rule), reason: "Denied for this session" };
+    }
   }
 
-  // Check always-deny
-  if (alwaysDeny.has(request.toolName)) {
-    return { action: "deny", reason: "Always denied for this session" };
+  for (const rule of sessionAllowRules) {
+    if (matchRule(rule, request)) {
+      return { action: "allow", matchedRule: formatPermissionRule(rule), reason: "Allowed for this session" };
+    }
   }
 
   // Check custom rules (highest priority)
@@ -172,43 +189,144 @@ export function getAllRules(): PermissionRule[] {
 
 // ── Session memory ──────────────────────────────────────────
 
-export function rememberAlwaysAllow(toolName: string): void {
-  alwaysAllow.add(toolName);
-  alwaysDeny.delete(toolName);
+export type PermissionPatternInput = string | string[] | Record<string, unknown> | undefined;
+
+export function rememberAlwaysAllow(toolName: string, input?: PermissionPatternInput): void {
+  rememberSessionRules(sessionAllowRules, sessionDenyRules, toolName, input, "allow");
 }
 
-export function rememberAlwaysDeny(toolName: string): void {
-  alwaysDeny.add(toolName);
-  alwaysAllow.delete(toolName);
+export function rememberAlwaysDeny(toolName: string, input?: PermissionPatternInput): void {
+  rememberSessionRules(sessionDenyRules, sessionAllowRules, toolName, input, "deny");
 }
 
-export function forgetTool(toolName: string): void {
-  alwaysAllow.delete(toolName);
-  alwaysDeny.delete(toolName);
+export function forgetTool(toolName: string, input?: PermissionPatternInput): void {
+  const patterns = input === undefined ? null : normalizePermissionPatterns(input);
+  removeSessionRules(sessionAllowRules, toolName, patterns);
+  removeSessionRules(sessionDenyRules, toolName, patterns);
 }
 
-export function isAlwaysAllowed(toolName: string): boolean {
-  return alwaysAllow.has(toolName);
+export function isAlwaysAllowed(toolName: string, input?: PermissionPatternInput): boolean {
+  return sessionRulesMatch(sessionAllowRules, toolName, input);
 }
 
-export function isAlwaysDenied(toolName: string): boolean {
-  return alwaysDeny.has(toolName);
+export function isAlwaysDenied(toolName: string, input?: PermissionPatternInput): boolean {
+  return sessionRulesMatch(sessionDenyRules, toolName, input);
 }
 
 export function getSessionMemory(): { allow: string[]; deny: string[] } {
   return {
-    allow: [...alwaysAllow],
-    deny: [...alwaysDeny],
+    allow: sessionAllowRules.map(formatPermissionRule),
+    deny: sessionDenyRules.map(formatPermissionRule),
   };
 }
 
 export function clearSessionMemory(): void {
-  alwaysAllow.clear();
-  alwaysDeny.clear();
+  sessionAllowRules.length = 0;
+  sessionDenyRules.length = 0;
 }
 
 export function clearAll(): void {
-  alwaysAllow.clear();
-  alwaysDeny.clear();
+  sessionAllowRules.length = 0;
+  sessionDenyRules.length = 0;
   customRules.length = 0;
+}
+
+export function permissionPatternsFromArgs(args?: Record<string, unknown>, toolDef?: ToolDef): string[] {
+  if (!args) return [];
+  const toolPatterns = getToolPermissionPatterns(toolDef, args);
+  if (toolPatterns.length) return toolPatterns;
+  const patterns: string[] = [];
+  const add = (value: unknown) => {
+    if (typeof value !== "string") return;
+    const trimmed = value.trim();
+    if (trimmed && !patterns.includes(trimmed)) patterns.push(trimmed);
+  };
+
+  for (const key of ["command", "cmd", "script"]) add(args[key]);
+  for (const key of ["path", "file", "file_path", "filepath", "filename", "target_file", "target_path", "output_path", "worktree_path"]) {
+    add(args[key]);
+  }
+  add(args.pattern);
+  if (typeof args.patch === "string") {
+    for (const path of extractPatchPaths(args.patch)) add(path);
+  }
+  if (patterns.length) return patterns;
+
+  for (const value of Object.values(args)) {
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      add(String(value));
+    }
+  }
+  return patterns;
+}
+
+function rememberSessionRules(
+  target: PermissionRule[],
+  opposite: PermissionRule[],
+  toolName: string,
+  input: PermissionPatternInput,
+  action: PermissionAction,
+): void {
+  for (const pattern of normalizePermissionPatterns(input)) {
+    upsertSessionRule(target, { permission: toolName, pattern, action });
+    removeSessionRules(opposite, toolName, [pattern]);
+  }
+}
+
+function upsertSessionRule(rules: PermissionRule[], rule: PermissionRule): void {
+  const idx = rules.findIndex(item => item.permission === rule.permission && item.pattern === rule.pattern);
+  if (idx >= 0) rules[idx] = rule;
+  else rules.push(rule);
+}
+
+function removeSessionRules(rules: PermissionRule[], toolName: string, patterns: string[] | null): void {
+  for (let i = rules.length - 1; i >= 0; i--) {
+    const rule = rules[i]!;
+    if (rule.permission !== toolName) continue;
+    if (patterns && !patterns.includes(rule.pattern)) continue;
+    rules.splice(i, 1);
+  }
+}
+
+function sessionRulesMatch(rules: PermissionRule[], toolName: string, input?: PermissionPatternInput): boolean {
+  if (input === undefined) {
+    return rules.some(rule => rule.permission === toolName && rule.pattern === "*");
+  }
+  return rules.some(rule => matchRule(rule, {
+    toolName,
+    patterns: normalizePermissionPatterns(input),
+    toolArgs: typeof input === "object" && !Array.isArray(input) ? input : undefined,
+  }));
+}
+
+function normalizePermissionPatterns(input: PermissionPatternInput): string[] {
+  if (input === undefined) return ["*"];
+  const rawPatterns = typeof input === "string"
+    ? [input]
+    : Array.isArray(input)
+      ? input
+      : permissionPatternsFromArgs(input);
+  const patterns = rawPatterns.map(pattern => pattern.trim()).filter(Boolean);
+  return patterns.length ? [...new Set(patterns)] : ["*"];
+}
+
+function extractPatchPaths(patch: string): string[] {
+  const paths: string[] = [];
+  for (const line of patch.split(/\r?\n/)) {
+    const match = line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/);
+    if (match?.[1]) paths.push(match[1].trim());
+  }
+  return paths;
+}
+
+function formatPermissionRule(rule: PermissionRule): string {
+  if (rule.pattern === "*") return rule.permission;
+  return `${rule.permission}(${escapeRuleContent(rule.pattern)})`;
+}
+
+function escapeRuleContent(content: string): string {
+  return content
+    .replace(/\\/g, "\\\\")
+    .replace(/\(/g, "\\(")
+    .replace(/\)/g, "\\)");
 }

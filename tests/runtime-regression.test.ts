@@ -59,7 +59,7 @@ describe("shell tool", () => {
 
     const result = await getRegistry().lookup("bash")!.execute({
       command: `bash -lc 'sleep 30 & echo $! > ${JSON.stringify(pidFile)}; wait'`,
-      timeout: 100,
+      timeout: 500,
       workdir: tmp,
     });
     const childPid = Number(readFileSync(pidFile, "utf-8").trim());

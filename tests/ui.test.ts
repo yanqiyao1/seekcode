@@ -379,6 +379,34 @@ describe("TuiRuntimeViewModel", () => {
     expect(plain).toContain("writing bytes");
   });
 
+  it("uses runtime tool metadata for activity and compact result labels", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "custom_tool", tool_call_id: "call-custom" } } as any);
+    view.handleRuntimeEvent({
+      type: "tool_call",
+      data: {
+        id: "call-custom",
+        name: "custom_tool",
+        arguments: {},
+        metadata: { activity: "Auditing workspace" },
+      },
+    } as any);
+    expect(stripAnsi(transcript.lines.at(-1)?.text || "")).toContain("Auditing workspace");
+
+    view.handleRuntimeEvent({
+      type: "tool_result",
+      data: { tool_call_id: "call-custom", name: "custom_tool", content: "ok", is_error: false },
+      preview: "ok",
+      metadata: { summary: "Workspace audit" },
+    } as any);
+
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+    expect(plain).toContain("Workspace audit");
+  });
+
   it("keeps concurrent write tool lines associated by tool call id", () => {
     const transcript = new Transcript();
     const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });

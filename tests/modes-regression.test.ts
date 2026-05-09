@@ -438,7 +438,7 @@ describe("sandbox and approval policy", () => {
     expect(checkSandboxPolicy(testConfig({ sandbox_mode: "read-only" }), ctx(customRead, "custom_reader", {}, tmp))).toMatchObject({ decision: "allow" });
   });
 
-  it("scopes one-shot approval cache entries by arguments and keeps always approvals broad", () => {
+  it("scopes one-shot approval cache entries by arguments, including always approvals", () => {
     const cache = getApprovalCache();
 
     cache.rememberApproval("write", "once", { path: "a.txt" });
@@ -451,7 +451,8 @@ describe("sandbox and approval policy", () => {
     expect(checkApprovalCache("write", "ask", { path: "safe.txt" })).toMatchObject({ decision: "ask" });
 
     cache.rememberApproval("bash", "always", { command: "npm test" });
-    expect(checkApprovalCache("bash", "ask", { command: "npm run build" })).toMatchObject({ decision: "approved" });
+    expect(checkApprovalCache("bash", "ask", { command: "npm test" })).toMatchObject({ decision: "approved" });
+    expect(checkApprovalCache("bash", "ask", { command: "npm run build" })).toMatchObject({ decision: "ask" });
     cache.clearTool("bash");
     expect(checkApprovalCache("bash", "ask", { command: "npm run build" })).toMatchObject({ decision: "ask" });
   });

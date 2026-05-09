@@ -12,6 +12,25 @@ function normalizePatchWorkdir(args: Record<string, unknown>): string | undefine
   return undefined;
 }
 
+function patchFiles(patch: string): string[] {
+  const files = new Set<string>();
+  for (const line of patch.split(/\r?\n/)) {
+    const match = line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/);
+    if (match?.[1]) files.add(match[1].trim());
+  }
+  return [...files];
+}
+
+function patchSummary(args: Record<string, unknown>): string {
+  if (typeof args.target_file === "string" && args.target_file.trim()) return `Patch ${args.target_file.trim()}`;
+  if (typeof args.patch === "string") {
+    const files = patchFiles(args.patch);
+    if (files.length === 1) return `Patch ${files[0]}`;
+    if (files.length > 1) return `Patch ${files.length} files`;
+  }
+  return "Apply patch";
+}
+
 async function applyPatch(args: Record<string, unknown>): Promise<string> {
   if (typeof args.patch !== "string" || !args.patch.trim()) {
     return "Patch failed:\npatch must be a non-empty string";
@@ -54,6 +73,16 @@ export function registerPatchTool(): void {
     destructive: true,
     searchHint: "apply unified diff",
     resultKind: "diff",
+    getPermissionPatterns: (args) => {
+      const files = typeof args.patch === "string" ? patchFiles(args.patch) : [];
+      if (typeof args.target_file === "string" && args.target_file.trim()) files.unshift(args.target_file.trim());
+      return [...new Set(files)];
+    },
+    toAutoClassifierInput: (args) => typeof args.patch === "string" ? args.patch : "",
+    getActivityDescription: (args) => patchSummary(args).replace(/^Patch /, "Applying patch to "),
+    getToolUseSummary: patchSummary,
+    getTranscriptSearchText: (result) => result,
+    renderMetadata: { userFacingName: "Patch", icon: "file-diff", resultKind: "diff" },
     validateInput: (args) => {
       const patch = args.patch;
       if (typeof patch !== "string" || !patch.trim()) {

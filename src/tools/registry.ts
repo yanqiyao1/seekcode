@@ -7,6 +7,7 @@ import {
   isToolStaticallyConcurrencySafe,
   isToolStaticallyDestructive,
   isToolStaticallyReadOnly,
+  getToolRenderMetadata,
   type ToolDef,
 } from "./base.js";
 import { toolToOpenAISchema } from "./base.js";
@@ -269,6 +270,7 @@ function normalizeToolDef(tool: ToolDef): ToolDef {
 }
 
 function toolSearchText(tool: ToolDef): string {
+  const render = getToolRenderMetadata(tool);
   return [
     tool.name,
     ...(tool.aliases || []),
@@ -276,6 +278,9 @@ function toolSearchText(tool: ToolDef): string {
     tool.description,
     tool.category,
     tool.resultKind || "",
+    render?.userFacingName || "",
+    render?.icon || "",
+    render?.accent || "",
     isToolStaticallyReadOnly(tool) ? "read-only readonly safe" : "",
     isToolStaticallyDestructive(tool) ? "destructive mutating mutation" : "",
     JSON.stringify(tool.parameters),

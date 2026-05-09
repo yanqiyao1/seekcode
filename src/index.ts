@@ -9,8 +9,7 @@ import {
   restoreTTYInput,
   type ScrollDirection,
 } from "./ui/input.js";
-import { movePickerIndex, pickerActionForSequence, pickerWindow, type PickItem } from "./ui/picker.js";
-import { basename, resolve } from "node:path";
+import { resolve } from "node:path";
 import { existsSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import * as r from "./ui/renderer.js";
@@ -20,39 +19,27 @@ import { TuiLayout } from "./tui/layout.js";
 import { shouldUseAlternateScreen } from "./tui/alternate-screen.js";
 import { Transcript } from "./tui/transcript.js";
 import { TuiRuntimeViewModel } from "./tui/runtime-view-model.js";
-import { approvalModalLines, pickerModalLines, type TuiModalKind, type TuiModalState } from "./tui/modal.js";
+import { approvalModalLines, pickerModalLines, type TuiModalState } from "./tui/modal.js";
 import { denyModeSwitchWhileRunning } from "./tui/live-mode-guard.js";
+import { handleSlashCommand, isLiveReadonlyCommand, type SlashCommandRuntime } from "./commands/registry.js";
 
 import { explainConfig, loadConfig, migrateProjectConfig, migrateUserConfig, userConfigPath, validateConfig, writeUserApiKey, type Config } from "./config.js";
 import { DeepSeekClient } from "./client/deepseek.js";
 import { getRegistry } from "./tools/registry.js";
 import { getMode, nextModeName, type UICallbacks } from "./modes/base.js";
-import { Engine } from "./engine/loop.js";
+import { prepareToolPermissionMatcher } from "./tools/base.js";
+import { Engine, type TurnResult } from "./engine/loop.js";
 import { ConversationHistory } from "./session/history.js";
-import { createSession } from "./session/types.js";
-import { CapacityController, formatCapacityDecision } from "./engine/capacity.js";
+import { createSession, type Session } from "./session/types.js";
+import { CapacityController } from "./engine/capacity.js";
 import { buildPinnedPrefix } from "./engine/prefix-builder.js";
 import { systemMessage } from "./engine/prefix.js";
 import { CostTracker } from "./cost/tracker.js";
-import { saveSession, loadSession, listSessions, deleteSession } from "./session/store.js";
+import { saveSession } from "./session/store.js";
 import { refreshSessionTitle } from "./session/title.js";
-import { revertLastTurn, restoreWorkspace } from "./rollback/restore.js";
-import { clearPlanState, formatTodoState } from "./tools/plan.js";
-import { clearGoalState } from "./tools/goal.js";
-import { clearAgentState } from "./tools/sub-agent.js";
-import { getApprovalCache, clearApprovalCache, DenialReason } from "./tools/approval-cache.js";
+import { getApprovalCache, clearApprovalCache } from "./tools/approval-cache.js";
 import { applyApprovalChoice } from "./tools/approval-session.js";
-import { getTaskManager, clearTaskManager } from "./engine/task-lifecycle.js";
-import {
-  activateSkill,
-  installSkill,
-  listRemoteSkills,
-  listSkills,
-  trustSkill,
-  uninstallSkill,
-  updateSkill,
-} from "./engine/skills.js";
-import { checkPermission, rememberAlwaysAllow, clearAll as clearPermissions, getAllRules, getSessionMemory } from "./tools/permission-ruleset.js";
+import { checkPermission, clearAll as clearPermissions, permissionPatternsFromArgs } from "./tools/permission-ruleset.js";
 
 // Register all tools
 import { registerFileTools } from "./tools/file-ops.js";
@@ -69,13 +56,11 @@ import { registerToolSearchTool } from "./tools/tool-search.js";
 import { registerTaskTools } from "./tools/tasks.js";
 import { registerDiagnosticsTools } from "./tools/diagnostics.js";
 import { registerArtifactTools } from "./tools/artifacts.js";
-import { formatJob, getJobManager } from "./tools/jobs.js";
-import { defaultBaseUrlForProvider, extractCachedInputTokens, parseProvider, providerCapability, type ApiProvider } from "./client/capabilities.js";
-import { addMCPServer, getMCPManager, reloadMCPManager, removeMCPServer, setMCPServerEnabled } from "./mcp/manager.js";
+import { extractCachedInputTokens } from "./client/capabilities.js";
+import { reloadMCPManager } from "./mcp/manager.js";
 import { linkArtifact } from "./artifacts/store.js";
 import { VERSION } from "./version.js";
 import { assertMinimumVersion, maybePromptForUpdate, runUpdateCommand } from "./update-check.js";
-import { estimateMessagesTokens, projectMessagesForRequest } from "./engine/compact.js";
 
 function parseOptionalInt(value: string | undefined): number | undefined {
   if (value === undefined || value === "") return undefined;
@@ -85,22 +70,6 @@ function parseOptionalInt(value: string | undefined): number | undefined {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && (error.name === "AbortError" || /aborted|abort/i.test(error.message));
-}
-
-const LIVE_READONLY_COMMANDS = new Set([
-  "/tasks",
-  "/jobs",
-  "/tokens",
-  "/cost",
-  "/permissions",
-  "/sessions",
-  "/version",
-  "/help",
-]);
-
-function isLiveReadonlyCommand(input: string): boolean {
-  if (!input.startsWith("/")) return false;
-  return LIVE_READONLY_COMMANDS.has(input.trim().split(/\s+/)[0].toLowerCase());
 }
 
 function setupTools(cfg?: ReturnType<typeof loadConfig>) {
@@ -146,31 +115,88 @@ async function ensureRuntimeApiKey(cfg: Config, cliOverrides: Record<string, unk
   }
 }
 
+function recordCompletedTurn(
+  session: Session,
+  costTracker: CostTracker,
+  result: TurnResult,
+  userInput: string,
+): { tokensIn: number; tokensOut: number; cachedTokensIn: number; cost: number; turnIndex: number } {
+  const tokensIn = (result.usage?.prompt_tokens as number) || 0;
+  const tokensOut = (result.usage?.completion_tokens as number) || 0;
+  session.cumulative_tokens_in += tokensIn;
+  session.cumulative_tokens_out += tokensOut;
+  const cachedTokensIn = extractCachedInputTokens(result.usage);
+  const cost = costTracker.recordTurn(tokensIn, tokensOut, cachedTokensIn, result.duration_s).cost;
+  session.cumulative_cost += cost;
+  const turnIndex = session.turns.length + 1;
+  session.turns.push({
+    index: turnIndex,
+    user_message: userInput,
+    assistant_messages: session.messages.filter(message => message.role === "assistant").slice(-1),
+    tool_calls: result.tool_calls,
+    tool_results: result.tool_results,
+    tokens_in: tokensIn,
+    tokens_out: tokensOut,
+    cost,
+    duration_s: result.duration_s,
+    artifact_ids: result.artifact_ids,
+  });
+  if (result.artifact_ids.length) {
+    const turnKey = `turn:${turnIndex}`;
+    session.artifact_index[turnKey] = [...new Set([...(session.artifact_index[turnKey] || []), ...result.artifact_ids])];
+    session.artifact_index.session = [...new Set([...(session.artifact_index.session || []), ...result.artifact_ids])];
+    for (const artifactId of result.artifact_ids) {
+      linkArtifact(artifactId, "session", session.id, { turn_index: turnIndex });
+      linkArtifact(artifactId, "turn", `${session.id}:${turnIndex}`, { session_id: session.id, turn_index: turnIndex });
+    }
+  }
+  refreshSessionTitle(session);
+  return { tokensIn, tokensOut, cachedTokensIn, cost, turnIndex };
+}
+
 async function runOneShot(cfg: ReturnType<typeof loadConfig>, prompt: string) {
   if (!cfg.api_key) throw new Error("DEEPSEEK_API_KEY is required. Set it in the environment, config file, or --api-key.");
+  setupTools(cfg);
+  await reloadMCPManager(cfg).catch(() => undefined);
+  const tools = getRegistry();
+  const modeObj = getMode(cfg.mode);
+  const costTracker = new CostTracker(cfg.model);
+
+  const session = createSession({ mode: cfg.mode, model: cfg.model, workspace_path: resolve(".") });
+  const history = new ConversationHistory(session);
   const client = new DeepSeekClient({ apiKey: cfg.api_key, baseUrl: cfg.base_url, model: cfg.model, provider: cfg.provider });
-  const messages = [{ role: "user" as const, content: prompt, tool_calls: null, tool_call_id: null, name: null, reasoning_content: null }];
+
+  const prefix = buildPinnedPrefix(cfg, session.workspace_path, tools);
+  session.prefix_hash = prefix.hash;
+  history.addSystem(prefix.systemPrompt);
+
+  const engine = new Engine(cfg, session, history, client, tools, prefix);
 
   process.stdout.write("\n");
   let wasThinking = false;
-  for await (const event of client.send(messages, null, { stream: true, reasoning_effort: cfg.reasoning_effort, max_tokens: cfg.max_tokens })) {
-    switch (event.type) {
-      case "thinking":
-        if (cfg.reasoning_effort === "off" || !cfg.thinking_visible) break;
-        wasThinking = true;
-        process.stdout.write(`\x1b[90m${(event as any).text}\x1b[0m`);
-        break;
-      case "content":
-        if (wasThinking) { process.stdout.write("\n\n"); wasThinking = false; }
-        process.stdout.write((event as any).text);
-        break;
-      case "done":
-        process.stdout.write("\n");
-        const usage = (event as any).usage;
-        if (usage) console.log(`\n--- Tokens: ${usage.prompt_tokens ?? 0} in / ${usage.completion_tokens ?? 0} out ---`);
-        break;
-    }
-  }
+  const ui: UICallbacks = {
+    async onThinking(text) {
+      if (cfg.reasoning_effort === "off" || !cfg.thinking_visible) return;
+      wasThinking = true;
+      process.stdout.write(`\x1b[90m${text}\x1b[0m`);
+    },
+    async onContent(text) {
+      if (wasThinking) {
+        process.stdout.write("\n\n");
+        wasThinking = false;
+      }
+      process.stdout.write(text);
+    },
+    async requestApproval(toolName, _args, description) {
+      process.stderr.write(`\nTool '${toolName}' requires approval in one-shot mode.\n${description}\n`);
+      return false;
+    },
+  };
+
+  const result = await engine.runTurn(prompt, modeObj, ui);
+  process.stdout.write("\n");
+  const recorded = recordCompletedTurn(session, costTracker, result, prompt);
+  if (result.usage) console.log(`\n--- Tokens: ${recorded.tokensIn} in / ${recorded.tokensOut} out ---`);
 }
 
 async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
@@ -404,7 +430,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
 
   const clearPrompt = () => renderScreen("", 0, []);
 
-  const renderPicker = (idx: number, items: PickItem[], title: string, maxVisibleItems = 12, kind: TuiModalKind = "picker") => {
+  const renderPicker: NonNullable<SlashCommandRuntime["renderPicker"]> = (idx, items, title, maxVisibleItems = 12, kind = "picker") => {
     setModal({ kind, lines: pickerModalLines(idx, items, title, maxVisibleItems) });
   };
 
@@ -481,10 +507,12 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
     async requestApproval(toolName, args, _description) {
       if (turnToken !== activeTurnToken || activeAbortController?.signal.aborted) return false;
       // Check permission ruleset first
+      const toolDef = tools.lookup(toolName);
       const permResult = checkPermission({
         toolName,
         toolArgs: args as Record<string, unknown>,
-        patterns: Object.values(args as Record<string, unknown>).map(String),
+        patterns: permissionPatternsFromArgs(args as Record<string, unknown>, toolDef),
+        matchesPattern: await prepareToolPermissionMatcher(toolDef, args as Record<string, unknown>),
       });
       if (permResult.action === "allow") return true;
       if (permResult.action === "deny") {
@@ -664,38 +692,9 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         renderScreen();
         engineRunning = false;
         runtimeView?.finishTurn();
-        const tokensIn = (result.usage?.prompt_tokens as number) || 0;
-        const tokensOut = (result.usage?.completion_tokens as number) || 0;
-        session.cumulative_tokens_in += tokensIn;
-        session.cumulative_tokens_out += tokensOut;
-        const cachedTokensIn = extractCachedInputTokens(result.usage);
-        lastCacheTokens = cachedTokensIn;
+        const recorded = recordCompletedTurn(session, costTracker, result, input);
+        lastCacheTokens = recorded.cachedTokensIn;
         lastTurnDurationMs = Math.round(result.duration_s * 1000);
-        const cost = costTracker.recordTurn(tokensIn, tokensOut, cachedTokensIn, result.duration_s).cost;
-        session.cumulative_cost += cost;
-        const turnIndex = session.turns.length + 1;
-        session.turns.push({
-          index: turnIndex,
-          user_message: input,
-          assistant_messages: session.messages.filter(message => message.role === "assistant").slice(-1),
-          tool_calls: result.tool_calls,
-          tool_results: result.tool_results,
-          tokens_in: tokensIn,
-          tokens_out: tokensOut,
-          cost,
-          duration_s: result.duration_s,
-          artifact_ids: result.artifact_ids,
-        });
-        if (result.artifact_ids.length) {
-          const turnKey = `turn:${turnIndex}`;
-          session.artifact_index[turnKey] = [...new Set([...(session.artifact_index[turnKey] || []), ...result.artifact_ids])];
-          session.artifact_index.session = [...new Set([...(session.artifact_index.session || []), ...result.artifact_ids])];
-          for (const artifactId of result.artifact_ids) {
-            linkArtifact(artifactId, "session", session.id, { turn_index: turnIndex });
-            linkArtifact(artifactId, "turn", `${session.id}:${turnIndex}`, { session_id: session.id, turn_index: turnIndex });
-          }
-        }
-        refreshSessionTitle(session);
         if (turnCount % 5 === 0) {
           try { saveSession(session); }
           catch (e: any) { transcript.append(p.warning(`\nCould not save session: ${e.message}`)); }
@@ -737,692 +736,6 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
   } else {
     console.log(p.dim("Goodbye!"));
   }
-}
-
-type PickerRenderer = (idx: number, items: PickItem[], title: string, maxVisibleItems?: number, kind?: TuiModalKind) => void;
-
-interface SlashCommandRuntime {
-  renderPicker?: PickerRenderer;
-  clearModal?: () => void;
-  write?: (message: unknown, isError?: boolean) => void;
-  getRequestTokenCount?: () => number;
-  applyLoadedSession: (loaded: ReturnType<typeof createSession>) => void;
-  rebuildRuntime: () => void;
-  rebuildSystemPrompt: () => void;
-  renderLoadedSession: () => void;
-  setExitSummary?: (message: string) => void;
-  setActiveSkill?: (instruction: string) => void;
-  clearActiveSkill?: () => void;
-  liveReadonly?: boolean;
-}
-
-async function pickFromList(
-  items: PickItem[],
-  title = "Select",
-  render?: PickerRenderer,
-  clearRender?: () => void,
-  kind: TuiModalKind = "picker",
-): Promise<string | null> {
-  const { stdin, stdout } = process;
-  if (!stdin.isTTY || !items.length) return null;
-
-  let idx = 0;
-  const len = items.length;
-  let first = true;
-  let previousTotalLines = 0;
-  let resizeTimer: NodeJS.Timeout | null = null;
-
-  const maxVisibleItems = () => Math.max(1, Math.min(len, (process.stdout.rows || 24) - 6));
-
-  const renderPicker = () => {
-    const visibleItems = maxVisibleItems();
-    const totalLines = visibleItems + 3;
-    const window = pickerWindow(items, idx, visibleItems);
-    if (render) { render(idx, items, title, visibleItems, kind); return; }
-    stdout.write("\x1b[?25l");
-    if (!first && previousTotalLines > 0) stdout.write(`\x1b[${previousTotalLines}A`);
-    first = false;
-    if (window.start > 0) {
-      stdout.write("\r\x1b[2K" + p.dim(`  ↑ ${window.start} newer session${window.start === 1 ? "" : "s"}`) + "\n");
-    } else {
-      stdout.write("\r\x1b[2K\n");
-    }
-    for (const entry of window.entries) {
-      const item = entry.item;
-      const prefix = entry.selected ? p.blue("❯ ") : "  ";
-      const line = item.desc ? `${prefix}${item.name}  ${p.dim(item.desc)}` : `${prefix}${item.name}`;
-      stdout.write("\r\x1b[2K" + line + "\n");
-    }
-    while (window.entries.length < visibleItems) stdout.write("\r\x1b[2K\n");
-    if (window.end < window.total) {
-      stdout.write("\r\x1b[2K" + p.dim(`  ↓ ${window.total - window.end} older session${window.total - window.end === 1 ? "" : "s"}`) + "\n");
-    } else {
-      stdout.write("\r\x1b[2K\n");
-    }
-    stdout.write("\r\x1b[2K" + p.dim(`${title}  ↑↓ select  Enter confirm  Esc cancel`) + "\n");
-    previousTotalLines = totalLines;
-  };
-
-  return new Promise((resolve) => {
-    let detachInput: (() => void) | null = null;
-    let controller: InputController | null = null;
-    let settled = false;
-    if (!render) stdout.write("\r\x1b[2K\n");
-    renderPicker();
-
-    const handleKey = (key: string) => {
-      if (settled) return true;
-      const action = pickerActionForSequence(key);
-      if (!action) return false;
-      if (action === "confirm") { cleanup(); resolve(items[idx].name); return true; }
-      if (action === "cancel") { cleanup(); resolve(null); return true; }
-      const nextIndex = movePickerIndex(idx, len, action, maxVisibleItems());
-      if (nextIndex !== idx) {
-        idx = nextIndex;
-        renderPicker();
-      }
-      return false;
-    };
-
-    const onResize = () => {
-      if (resizeTimer) return;
-      resizeTimer = setTimeout(() => {
-        resizeTimer = null;
-        idx = Math.max(0, Math.min(len - 1, idx));
-        renderPicker();
-      }, 16);
-    };
-
-    const cleanup = () => {
-      if (settled) return;
-      settled = true;
-      detachInput?.();
-      controller?.dispose();
-      if (resizeTimer) {
-        clearTimeout(resizeTimer);
-        resizeTimer = null;
-      }
-      if (render) {
-        clearRender?.();
-      } else {
-        stdout.write(`${previousTotalLines > 0 ? `\x1b[${previousTotalLines}A` : ""}\x1b[J\r`);
-        stdout.write("\x1b[?25h");
-      }
-    };
-
-    controller = new InputController({
-      mode: "picker",
-      editable: false,
-      onUnhandledSequence: (key) => handleKey(key),
-      onCtrlC: () => {
-        cleanup();
-        resolve(null);
-        return true;
-      },
-    });
-    detachInput = controller.attach({
-      stdin,
-      stdout,
-      resizeTarget: stdout,
-      bracketedPaste: false,
-      onResize,
-    });
-  });
-}
-
-const MODELS: PickItem[] = [
-  { name: "deepseek-v4-pro", desc: "1M context, reasoning, best for complex tasks" },
-  { name: "deepseek-v4-flash", desc: "1M context, fast & cheap, best for parallel/simple" },
-];
-
-const PROVIDERS: PickItem[] = [
-  { name: "deepseek", desc: "Official DeepSeek API" },
-  { name: "deepseek-cn", desc: "DeepSeek China endpoint" },
-  { name: "nvidia-nim", desc: "NVIDIA NIM hosted DeepSeek" },
-  { name: "openrouter", desc: "OpenRouter DeepSeek routes" },
-  { name: "novita", desc: "Novita AI DeepSeek routes" },
-  { name: "fireworks", desc: "Fireworks AI DeepSeek routes" },
-  { name: "sglang", desc: "Self-hosted SGLang endpoint" },
-];
-
-async function pickModel(
-  current: string,
-  render?: PickerRenderer,
-  clearRender?: () => void,
-): Promise<string | null> {
-  const idx = MODELS.findIndex(m => m.name === current);
-  const items = idx > 0 ? [...MODELS.slice(idx), ...MODELS.slice(0, idx)] : [...MODELS];
-  return pickFromList(items, "Select model", render, clearRender);
-}
-
-async function pickProvider(
-  current: string,
-  render?: PickerRenderer,
-  clearRender?: () => void,
-): Promise<string | null> {
-  const idx = PROVIDERS.findIndex(provider => provider.name === current);
-  const items = idx > 0 ? [...PROVIDERS.slice(idx), ...PROVIDERS.slice(0, idx)] : [...PROVIDERS];
-  return pickFromList(items, "Select provider", render, clearRender);
-}
-
-async function confirmPrompt(
-  message: string,
-  render?: PickerRenderer,
-  clearRender?: () => void,
-): Promise<boolean> {
-  const selected = await pickFromList([
-    { name: "no", desc: "Cancel" },
-    { name: "yes", desc: "Delete permanently" },
-  ], message, render, clearRender, "confirm");
-  return selected === "yes";
-}
-
-async function handleSlashCommand(
-  input: string, cfg: ReturnType<typeof loadConfig>, session: ReturnType<typeof createSession>,
-  history: ConversationHistory, costTracker: CostTracker,
-  runtime: SlashCommandRuntime,
-): Promise<boolean | "exit"> {
-  const parts = input.trim().split(/\s+/);
-  const cmd = parts[0].toLowerCase();
-  const write = runtime.write ?? ((message: unknown) => {
-    console.log(typeof message === "string" ? message : JSON.stringify(message, null, 2));
-  });
-
-  if (runtime.liveReadonly && !LIVE_READONLY_COMMANDS.has(cmd)) {
-    write(p.warning(`Command ${cmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
-    return false;
-  }
-
-  switch (cmd) {
-    case "/help":
-      write(`
-${p.blueBold("Commands")}
-  /help          Show this help
-  Shift+Tab      Cycle mode when idle (plan → agent → yolo)
-  /plan          Switch to Plan mode (read-only)
-  /agent         Switch to Agent mode (interactive approval)
-  /yolo          Switch to YOLO mode (auto-approved)
-  /provider [p]  Show or switch provider
-  /model [name]  Show or switch model (pro/flash)
-  /capabilities  Show current provider/model capability matrix
-  /reasoning     Cycle reasoning effort (off → high → max)
-  /clear         Clear conversation history
-  /save          Save current session
-  /load <id>     Load a saved session
-  /delete [id]   Delete a saved session
-  /sessions      List saved sessions
-  /exit          Save session and exit (resume next time)
-  /restore       List/revert workspace snapshots
-  /cost          Show detailed cost breakdown
-  /tokens        Show token usage
-  /tasks         Show task status
-  /jobs          Show background shell jobs
-  /mcp           Manage MCP servers
-  /skills        List skills (--remote browses registry)
-  /skill <name>  Apply/install/update/uninstall/trust skills
-  /permissions   Show permission rules
-  /version       Show version
-  Ctrl+C         Clear current input
-`);
-      break;
-
-    case "/plan":
-      cfg.mode = "plan"; session.mode = "plan";
-      runtime.rebuildSystemPrompt();
-      runtime.rebuildRuntime();
-      write(p.modePlan("Switched to Plan mode (read-only)."));
-      return true;
-    case "/agent":
-      cfg.mode = "agent"; session.mode = "agent";
-      runtime.rebuildSystemPrompt();
-      runtime.rebuildRuntime();
-      write(p.success("Switched to Agent mode (interactive approval)."));
-      return true;
-    case "/yolo":
-      cfg.mode = "yolo"; session.mode = "yolo";
-      runtime.rebuildSystemPrompt();
-      runtime.rebuildRuntime();
-      write(p.warning("Switched to YOLO mode (auto-approved)."));
-      return true;
-
-    case "/provider": {
-      let rawProvider: string | undefined = parts[1];
-      if (!rawProvider) {
-        rawProvider = await pickProvider(cfg.provider, runtime.renderPicker, runtime.clearModal) || undefined;
-      }
-      if (!rawProvider) {
-        write(JSON.stringify({
-          provider: cfg.provider,
-          base_url: cfg.base_url,
-          model: cfg.model,
-          capability: providerCapability(cfg.provider as ApiProvider, cfg.model),
-        }, null, 2));
-        break;
-      }
-      const provider = parseProvider(rawProvider);
-      const modelArg = parts[2] || cfg.model;
-      const capability = providerCapability(provider, modelArg);
-      (cfg as any).provider = provider;
-      cfg.base_url = defaultBaseUrlForProvider(provider);
-      cfg.model = capability.resolved_model;
-      session.model = capability.resolved_model;
-      runtime.rebuildRuntime();
-      runtime.rebuildSystemPrompt();
-      write(p.success(`Provider: ${provider}`));
-      write(p.success(`Model: ${capability.resolved_model}`));
-      write(p.dim(`Base URL: ${cfg.base_url}`));
-      break;
-    }
-
-    case "/model": {
-      const model = parts[1];
-      if (model) {
-        const capability = providerCapability(cfg.provider as ApiProvider, model);
-        if (capability.resolved_model) {
-          cfg.model = capability.resolved_model;
-          session.model = capability.resolved_model;
-          runtime.rebuildRuntime();
-          write(p.success(`Model: ${capability.resolved_model}`));
-          if (capability.deprecation) write(p.warning(`${capability.deprecation.alias} is deprecated; use ${capability.deprecation.replacement}`));
-        } else {
-          write(p.warning(`Unknown model: ${model}. Available: deepseek-v4-pro, deepseek-v4-flash`));
-        }
-      } else {
-        // Interactive picker with arrow key support
-        const selected = await pickModel(cfg.model, runtime.renderPicker, runtime.clearModal);
-        if (selected) {
-          cfg.model = selected;
-          session.model = selected;
-          runtime.rebuildRuntime();
-          write(p.success(`Model: ${selected}`));
-        }
-      }
-      break;
-    }
-    case "/capabilities": {
-      const capability = providerCapability(cfg.provider as ApiProvider, cfg.model);
-      write(JSON.stringify(capability, null, 2));
-      break;
-    }
-    case "/reasoning": {
-      const cycle: Record<string, string> = { off: "low", low: "medium", medium: "high", high: "max", max: "xhigh", xhigh: "off" };
-      (cfg as any).reasoning_effort = cycle[cfg.reasoning_effort] || "high";
-      write(p.success(`Reasoning effort: ${cfg.reasoning_effort}`));
-      break;
-    }
-    case "/clear":
-      session.messages = [];
-      history.clear();
-      runtime.clearActiveSkill?.();
-      clearPlanState();
-      clearGoalState();
-      clearAgentState();
-      clearApprovalCache();
-      clearTaskManager();
-      clearPermissions();
-      session.turns = [];
-      session.cumulative_tokens_in = 0;
-      session.cumulative_tokens_out = 0;
-      session.cumulative_cost = 0;
-      session.title = "Untitled session";
-      costTracker.reset(cfg.model);
-      runtime.rebuildSystemPrompt();
-      write(p.success("Conversation cleared."));
-      break;
-    case "/save": {
-      try {
-        const id = saveSession(session);
-        write(p.success(`Session saved: ${id} — ${session.title}`));
-      } catch (e: any) {
-        write(p.error(`Could not save session: ${e.message}`));
-      }
-      break;
-    }
-    case "/load": {
-      const id = parts[1];
-      if (id) {
-        const loaded = loadSession(id);
-        if (!loaded) { write(p.error(`Session not found: ${id}`)); break; }
-        runtime.applyLoadedSession(loaded);
-        runtime.renderLoadedSession();
-        write(p.success(`Loaded session: ${loaded.title} (${loaded.messages.filter(message => message.role !== "system").length} messages)`));
-        return true;
-      }
-      const sessions = listSessions();
-      if (!sessions.length) { write(p.dim("No saved sessions.")); break; }
-      const selected = await pickFromList(
-        sessions.map(s => ({
-          name: s.id,
-          desc: `${s.title}  ${p.dim(`${s.updated_at?.slice(0, 16) || ""}  ${s.message_count} msgs  ${s.mode}  ${basename(s.workspace_path || "")}`)}`,
-        })),
-        "Select session to load",
-        runtime.renderPicker,
-        runtime.clearModal,
-      );
-      if (!selected) break;
-      const loaded = loadSession(selected);
-      if (!loaded) { write(p.error(`Session not found: ${selected}`)); break; }
-      runtime.applyLoadedSession(loaded);
-      runtime.renderLoadedSession();
-      write(p.success(`Loaded session: ${loaded.title} (${loaded.messages.filter(message => message.role !== "system").length} messages)`));
-      return true;
-    }
-    case "/delete": {
-      let id: string | undefined = parts[1];
-      const sessions = listSessions();
-      if (!id) {
-        if (!sessions.length) { write(p.dim("No saved sessions.")); break; }
-        id = await pickFromList(
-          sessions.map(s => ({
-            name: s.id,
-            desc: `${s.title}  ${p.dim(`${s.updated_at?.slice(0, 16) || ""}  ${s.message_count} msgs  ${s.mode}  ${basename(s.workspace_path || "")}`)}`,
-          })),
-          "Select session to delete",
-          runtime.renderPicker,
-          runtime.clearModal,
-        ) || undefined;
-        if (!id) break;
-      }
-
-      const loadedTarget = loadSession(id);
-      const target = sessions.find(s => s.id === id) || (loadedTarget ? {
-        id,
-        title: loadedTarget.title || id,
-        created_at: "",
-        updated_at: "",
-        mode: "",
-        model: "",
-        workspace_path: "",
-        message_count: 0,
-      } : null);
-      if (!target) { write(p.error(`Session not found: ${id}`)); break; }
-      const confirmed = await confirmPrompt(`Delete session ${id}?`, runtime.renderPicker, runtime.clearModal);
-      if (!confirmed) { write(p.dim("Delete cancelled.")); break; }
-
-      if (deleteSession(id)) {
-        if (id === session.id) {
-          session.id = createSession().id;
-        }
-        write(p.success(`Deleted session: ${id} — ${target.title}`));
-      } else {
-        write(p.error(`Could not delete session: ${id}`));
-      }
-      break;
-    }
-    case "/sessions": {
-      const sessions = listSessions();
-      if (!sessions.length) { write(p.dim("No saved sessions.")); break; }
-      write(p.blueBold(`Saved sessions (${sessions.length}):`));
-      for (const s of sessions.slice(0, 10)) {
-        write(`  ${p.blue(s.id)} | ${s.title} | ${s.updated_at?.slice(0, 16) || ""} | ${s.message_count} msgs | ${s.mode} | ${basename(s.workspace_path || "")}`);
-      }
-      break;
-    }
-    case "/restore": {
-      if (parts[1] === "revert") {
-        const result = await revertLastTurn(resolve("."));
-        write(p.success(result));
-      } else {
-        const snapshots = await restoreWorkspace(resolve("."));
-        if (!snapshots.length) { write(p.dim("No snapshots available.")); break; }
-        write(p.blueBold("Snapshots:"));
-        for (const s of snapshots.slice(0, 10)) {
-          write(`  ${p.blue(s.hash.slice(0, 8))} ${s.message} [${s.date?.slice(0, 19) || ""}]`);
-        }
-      }
-      break;
-    }
-    case "/tokens": {
-      const tokens = runtime.getRequestTokenCount?.() ?? history.approximateTokenCount();
-      const limit = cfg.context_limit;
-      const pct = limit ? (tokens / limit) * 100 : 0;
-      const bar = "█".repeat(Math.floor(pct / 5)) + "░".repeat(20 - Math.floor(pct / 5));
-      write(`Context: [${bar}] ${tokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct.toFixed(0)}%)`);
-      write(formatCapacityDecision(new CapacityController().observe(tokens, limit)));
-      const rawTokens = estimateMessagesTokens(session.messages);
-      const projectedMessages = projectMessagesForRequest(session.messages);
-      if (projectedMessages.length !== session.messages.length || rawTokens !== tokens) {
-        write(p.dim(`Raw event log: ${rawTokens.toLocaleString()} tokens across ${session.messages.length} messages; request projection is compacted before API calls.`));
-      }
-      break;
-    }
-    case "/tasks": {
-      const tm = getTaskManager();
-      const subcmd = parts[1];
-      const id = parts[2];
-      if (runtime.liveReadonly && ["cancel", "complete"].includes(subcmd || "")) {
-        write(p.warning(`/${cmd.slice(1)} ${subcmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
-        break;
-      }
-      if (subcmd === "read" && id) {
-        const task = tm.getTask(id) || tm.getHistory().find(item => item.id === id);
-        write(task ? JSON.stringify(task, null, 2) : p.error(`Task not found: ${id}`));
-        break;
-      }
-      if (subcmd === "cancel" && id) {
-        write(tm.killTask(id) ? p.success(`Cancelled task ${id}.`) : p.error(`Task not active: ${id}`));
-        break;
-      }
-      if (subcmd === "complete" && id) {
-        write(tm.completeTask(id, parts.slice(3).join(" ") || undefined) ? p.success(`Completed task ${id}.`) : p.error(`Task not active: ${id}`));
-        break;
-      }
-      const checklist = formatTodoState();
-      if (checklist) write(checklist);
-      const stats = tm.getTaskStats();
-      write(p.blueBold(`Durable tasks: ${stats.active} active, ${stats.total} total`));
-      write(`  Completed: ${stats.completed} | Failed: ${stats.failed} | Killed: ${stats.killed}`);
-      if (Object.keys(stats.byType).length) {
-        write("  By type: " + Object.entries(stats.byType).map(([k, v]) => `${k}:${v}`).join(" "));
-      }
-      const active = tm.getActiveTasks();
-      for (const t of active.slice(0, 10)) {
-        const dur = ((Date.now() - t.startTime) / 1000).toFixed(0);
-        write(`  ${t.status === "running" ? "◎" : "○"} [${t.type}] ${t.description} (${dur}s)`);
-      }
-      break;
-    }
-    case "/jobs": {
-      const subcmd = parts[1];
-      const id = parts[2];
-      if (runtime.liveReadonly && ["cancel", "prune"].includes(subcmd || "")) {
-        write(p.warning(`/${cmd.slice(1)} ${subcmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
-        break;
-      }
-      if (subcmd === "cancel" && id) {
-        write(getJobManager().cancel(id) ? p.success(`Cancelled job ${id}.`) : p.error(`Job not running: ${id}`));
-        break;
-      }
-      if (subcmd === "show" && id) {
-        const job = getJobManager().get(id);
-        write(job ? formatJob(job, 4000) : p.error(`Job not found: ${id}`));
-        break;
-      }
-      if (subcmd === "prune") {
-        write(p.success(`Pruned ${getJobManager().prune()} old job(s).`));
-        break;
-      }
-      const jobs = getJobManager().list();
-      if (!jobs.length) {
-        write(p.dim("No background jobs."));
-        break;
-      }
-      for (const job of jobs.slice(0, 10)) {
-        write(formatJob(job, 800));
-        write("");
-      }
-      break;
-    }
-    case "/skills": {
-      if (parts[1] === "--remote" || parts[1] === "remote") {
-        try {
-          write(await listRemoteSkills(cfg.skills_registry_url, cfg.skills_max_install_size_bytes));
-        } catch (e: any) {
-          write(p.error(`Could not fetch remote skills: ${e.message}`));
-        }
-        break;
-      }
-      write(listSkills(resolve("."), cfg.skills_dir));
-      break;
-    }
-    case "/skill": {
-      const subcmdOrName = parts[1];
-      if (!subcmdOrName) {
-        write(p.error("Usage: /skill <name|new|install <spec>|update <name>|uninstall <name>|trust <name>>"));
-        break;
-      }
-      try {
-        if (subcmdOrName === "install") {
-          const spec = parts.slice(2).join(" ");
-          if (!spec) { write(p.error("Usage: /skill install <github:owner/repo|https://...|registry-name>")); break; }
-          const result = await installSkill(spec, {
-            skillsDir: cfg.skills_dir,
-            registryUrl: cfg.skills_registry_url,
-            maxSizeBytes: cfg.skills_max_install_size_bytes,
-          });
-          runtime.rebuildSystemPrompt();
-          write(p.success(`Installed skill '${result.skill.name}' at ${result.skill.path}`));
-          break;
-        }
-        if (subcmdOrName === "update") {
-          const name = parts[2];
-          if (!name) { write(p.error("Usage: /skill update <name>")); break; }
-          const result = await updateSkill(name, {
-            skillsDir: cfg.skills_dir,
-            registryUrl: cfg.skills_registry_url,
-            maxSizeBytes: cfg.skills_max_install_size_bytes,
-          });
-          runtime.rebuildSystemPrompt();
-          write(p.success(`Skill '${result.skill.name}' ${result.status}.`));
-          break;
-        }
-        if (subcmdOrName === "uninstall") {
-          const name = parts[2];
-          if (!name) { write(p.error("Usage: /skill uninstall <name>")); break; }
-          write(p.success(uninstallSkill(name, { skillsDir: cfg.skills_dir })));
-          runtime.rebuildSystemPrompt();
-          break;
-        }
-        if (subcmdOrName === "trust") {
-          const name = parts[2];
-          if (!name) { write(p.error("Usage: /skill trust <name>")); break; }
-          write(p.success(trustSkill(name, { skillsDir: cfg.skills_dir, workspaceDir: resolve(".") })));
-          break;
-        }
-        const result = activateSkill(subcmdOrName, { workspaceDir: resolve("."), skillsDir: cfg.skills_dir });
-        if (!result.ok || !result.instruction) {
-          write(p.error(result.message));
-          break;
-        }
-        runtime.setActiveSkill?.(result.instruction);
-        write(p.success(result.message));
-      } catch (e: any) {
-        write(p.error(`Skill error: ${e.message}`));
-      }
-      break;
-    }
-    case "/permissions": {
-      const rules = getAllRules();
-      const mem = getSessionMemory();
-      write(p.blueBold(`Permissions: ${rules.length} rules`));
-      write(`  Always allowed: ${mem.allow.join(", ") || "none"}`);
-      write(`  Always denied: ${mem.deny.join(", ") || "none"}`);
-      write("  Default rules:");
-      for (const r of rules.slice(0, 20)) {
-        write(`    ${r.permission}:${r.pattern} → ${r.action}`);
-      }
-      break;
-    }
-    case "/mcp": {
-      const subcmd = parts[1] || "list";
-      try {
-        if (subcmd === "list") {
-          write(JSON.stringify(getMCPManager(cfg).list(), null, 2));
-          break;
-        }
-        if (subcmd === "reload") {
-          const manager = await reloadMCPManager(cfg);
-          write(JSON.stringify({ reloaded: true, servers: manager.list() }, null, 2));
-          break;
-        }
-        if (subcmd === "enable" || subcmd === "disable") {
-          const name = parts[2];
-          if (!name) { write(p.error("Usage: /mcp enable|disable <name>")); break; }
-          setMCPServerEnabled(name, subcmd === "enable");
-          write(p.success(`${subcmd === "enable" ? "Enabled" : "Disabled"} MCP server ${name}. Run /mcp reload to apply.`));
-          break;
-        }
-        if (subcmd === "remove" || subcmd === "delete") {
-          const name = parts[2];
-          if (!name) { write(p.error("Usage: /mcp remove <name>")); break; }
-          removeMCPServer(name);
-          write(p.success(`Removed MCP server ${name}. Run /mcp reload to apply.`));
-          break;
-        }
-        if (subcmd === "add") {
-          const name = parts[2];
-          const command = parts[3];
-          if (!name || !command) {
-            write(p.error("Usage: /mcp add <name> <command> [args...]"));
-            break;
-          }
-          addMCPServer({ name, transport: "stdio", command, args: parts.slice(4), env: {}, enabled: true });
-          write(p.success(`Added MCP server ${name}. Run /mcp reload to apply.`));
-          break;
-        }
-        write(p.error("Usage: /mcp [list|add|enable|disable|remove|reload]"));
-      } catch (e: any) {
-        write(p.error(`MCP error: ${e.message}`));
-      }
-      break;
-    }
-    case "/config": {
-      const subcmd = parts[1] || "explain";
-      if (subcmd === "validate") {
-        const report = validateConfig();
-        write(JSON.stringify(report, null, 2));
-        break;
-      }
-      if (subcmd === "migrate") {
-        const target = parts[2] || "user";
-        const dryRun = parts.includes("--dry-run");
-        const report = target === "project" ? migrateProjectConfig({ dryRun }) : migrateUserConfig({ dryRun });
-        write(JSON.stringify(report, null, 2));
-        break;
-      }
-      if (subcmd === "explain") {
-        write(JSON.stringify(explainConfig(), null, 2));
-        break;
-      }
-      write(p.error("Usage: /config [validate|migrate user|migrate project|explain] [--dry-run]"));
-      break;
-    }
-    case "/cost":
-      write(costTracker.formatDetailed());
-      break;
-    case "/exit": {
-      try {
-        const sid = saveSession(session);
-        runtime.setExitSummary?.([
-          p.dim("Goodbye!"),
-          p.success(`Session saved as ${sid} — ${session.title}`),
-          p.dim(`Resume with: seek    then: /load ${sid}`),
-        ].join("\n"));
-      } catch (e: any) {
-        runtime.setExitSummary?.([
-          p.dim("Goodbye!"),
-          p.warning(`Could not save session: ${e.message}`),
-        ].join("\n"));
-      }
-      return "exit";
-    }
-    case "/version":
-      write(`seek-code v${VERSION}`);
-      break;
-    default:
-      write(p.error(`Unknown command: ${cmd}`));
-  }
-  return false;
 }
 
 // CLI setup

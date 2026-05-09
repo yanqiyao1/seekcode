@@ -92,13 +92,20 @@ describe("approval cache matrix", () => {
 
   it.each([
     ["once approval consumed after one use", "once", { path: "a.txt" }, ["approved", "ask"]],
-    ["always approval stays broad", "always", { command: "npm test" }, ["approved", "approved"]],
+    ["always approval stays reusable for matching args", "always", { command: "npm test" }, ["approved", "approved"]],
   ])("%s", (_label, scope, args, expected) => {
     const cache = getApprovalCache();
     cache.rememberApproval("bash", scope as "once" | "always", args);
 
     expect(checkApprovalCache("bash", "ask", args).decision).toBe(expected[0]);
     expect(checkApprovalCache("bash", "ask", args).decision).toBe(expected[1]);
+  });
+
+  it("does not apply always approval cache entries to different args", () => {
+    const cache = getApprovalCache();
+    cache.rememberApproval("bash", "always", { command: "npm test" });
+
+    expect(checkApprovalCache("bash", "ask", { command: "npm run build" }).decision).toBe("ask");
   });
 
   it.each([
@@ -168,15 +175,16 @@ describe("permission rules matrix", () => {
     expect(checkPermission(request as any).action).toBe(expected);
   });
 
-  it("lets session memory override custom rules until forgotten", () => {
+  it("lets pattern-specific session memory override custom rules until forgotten", () => {
     addRule({ permission: "bash", pattern: "npm *", action: "deny" });
-    rememberAlwaysAllow("bash");
+    rememberAlwaysAllow("bash", { command: "npm test" });
     expect(checkPermission({ toolName: "bash", toolArgs: { command: "npm test" } }).action).toBe("allow");
+    expect(checkPermission({ toolName: "bash", toolArgs: { command: "npm run build" } }).action).toBe("deny");
 
-    rememberAlwaysDeny("bash");
+    rememberAlwaysDeny("bash", { command: "npm test" });
     expect(checkPermission({ toolName: "bash", toolArgs: { command: "npm test" } }).action).toBe("deny");
 
-    forgetTool("bash");
+    forgetTool("bash", { command: "npm test" });
     expect(checkPermission({ toolName: "bash", toolArgs: { command: "npm test" } })).toMatchObject({
       action: "deny",
       matchedRule: "bash:npm *",

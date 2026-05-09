@@ -1,0 +1,89 @@
+import { p } from "../ui/palette.js";
+import { agentCommand, clearCommand, costCommand, helpCommand, permissionsCommand, planCommand, reasoningCommand, tokensCommand, versionCommand, yoloCommand } from "./core.js";
+import { capabilitiesCommand, modelCommand, providerCommand } from "./model.js";
+import { configCommand } from "./config.js";
+import { deleteCommand, exitCommand, loadCommand, saveCommand, sessionsCommand } from "./sessions.js";
+import { jobsCommand, tasksCommand } from "./tasks.js";
+import { mcpCommand } from "./mcp.js";
+import { restoreCommand } from "./workspace.js";
+import { skillCommand, skillsCommand } from "./skills.js";
+import type { Config } from "../config.js";
+import type { CostTracker } from "../cost/tracker.js";
+import type { ConversationHistory } from "../session/history.js";
+import type { Session } from "../session/types.js";
+import type { SlashCommandHandler, SlashCommandRuntime, SlashCommandResult } from "./types.js";
+
+export type { SlashCommandRuntime, PickerRenderer } from "./types.js";
+
+export const LIVE_READONLY_COMMANDS = new Set([
+  "/tasks",
+  "/jobs",
+  "/tokens",
+  "/cost",
+  "/permissions",
+  "/sessions",
+  "/version",
+  "/help",
+]);
+
+const COMMAND_HANDLERS = new Map<string, SlashCommandHandler>([
+  ["/help", helpCommand],
+  ["/plan", planCommand],
+  ["/agent", agentCommand],
+  ["/yolo", yoloCommand],
+  ["/provider", providerCommand],
+  ["/model", modelCommand],
+  ["/capabilities", capabilitiesCommand],
+  ["/reasoning", reasoningCommand],
+  ["/clear", clearCommand],
+  ["/save", saveCommand],
+  ["/load", loadCommand],
+  ["/delete", deleteCommand],
+  ["/sessions", sessionsCommand],
+  ["/restore", restoreCommand],
+  ["/tokens", tokensCommand],
+  ["/tasks", tasksCommand],
+  ["/jobs", jobsCommand],
+  ["/skills", skillsCommand],
+  ["/skill", skillCommand],
+  ["/permissions", permissionsCommand],
+  ["/mcp", mcpCommand],
+  ["/config", configCommand],
+  ["/cost", costCommand],
+  ["/exit", exitCommand],
+  ["/version", versionCommand],
+]);
+
+export function isLiveReadonlyCommand(input: string): boolean {
+  if (!input.startsWith("/")) return false;
+  return LIVE_READONLY_COMMANDS.has(input.trim().split(/\s+/)[0].toLowerCase());
+}
+
+export async function handleSlashCommand(
+  input: string,
+  cfg: Config,
+  session: Session,
+  history: ConversationHistory,
+  costTracker: CostTracker,
+  runtime: SlashCommandRuntime,
+): Promise<SlashCommandResult> {
+  const parts = input.trim().split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+  const write = runtime.write ?? ((message: unknown) => {
+    console.log(typeof message === "string" ? message : JSON.stringify(message, null, 2));
+  });
+
+  if (runtime.liveReadonly && !LIVE_READONLY_COMMANDS.has(cmd)) {
+    write(p.warning(`Command ${cmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
+    return false;
+  }
+
+  const handler = COMMAND_HANDLERS.get(cmd);
+  if (!handler) {
+    write(p.error(`Unknown command: ${cmd}`));
+    return false;
+  }
+
+  return (await handler({ input, parts, cmd, cfg, session, history, costTracker, runtime, write })) ?? false;
+}
+
