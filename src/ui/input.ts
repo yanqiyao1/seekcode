@@ -2,6 +2,7 @@
 
 import { p } from "./palette.js";
 import { visibleLength } from "./ansi.js";
+import { discoverClaudeCommands } from "../commands/compat.js";
 
 export const COMMANDS: [string, string][] = [
   ["help", "Show help"], ["plan", "Plan mode"], ["agent", "Agent mode"],
@@ -33,11 +34,18 @@ export function disableBracketedPaste(stdout: Pick<NodeJS.WriteStream, "write"> 
   stdout.write("\x1b[?2004l");
 }
 
-function matches(prefix: string): [string, string][] {
+function matches(prefix: string, workspacePath?: string): [string, string][] {
   if (!prefix.startsWith("/")) return [];
   const p = prefix.slice(1).toLowerCase();
-  if (!p) return COMMANDS;
-  return COMMANDS.filter(([n]) => n.startsWith(p));
+  const commands = [
+    ...COMMANDS,
+    ...discoverClaudeCommands(workspacePath).map(command => [
+      command.name,
+      `${command.description} (${command.scope} .claude/commands)`,
+    ] as [string, string]),
+  ];
+  if (!p) return commands;
+  return commands.filter(([n]) => n.startsWith(p));
 }
 
 function commonPrefix(strings: string[]): string {
@@ -105,8 +113,8 @@ export interface InputKeyContext {
   now: number;
 }
 
-export function commandCompletionProvider(value: string): InputCompletionItem[] {
-  return matches(value).map(([name, desc]) => {
+export function commandCompletionProvider(value: string, workspacePath?: string): InputCompletionItem[] {
+  return matches(value, workspacePath).map(([name, desc]) => {
     const partial = value.startsWith("/") ? value.slice(1).toLowerCase() : "";
     const highlighted = partial
       ? p.blue(name.slice(0, partial.length)) + p.text(name.slice(partial.length))
@@ -126,6 +134,7 @@ export interface ReadInputOptions {
   onModeCycle?: () => string | void;
   onScroll?: (direction: "up" | "down" | "top" | "bottom", amount: number) => void;
   onRender?: (state: { prompt: string; value: string; cursor: number; completions: string[] }) => void;
+  completionProvider?: InputCompletionProvider;
 }
 
 export type ScrollDirection = "up" | "down" | "top" | "bottom";
@@ -682,7 +691,7 @@ export async function readInput(
     controller = new InputController({
       mode: "idle",
       prompt,
-      completionProvider: commandCompletionProvider,
+      completionProvider: opts?.completionProvider ?? commandCompletionProvider,
       onRender: redraw,
       onCtrlC: () => {
         controller?.reset({ render: true });

@@ -107,6 +107,16 @@ export class Transcript {
     return this.wrappedRowsRange(width, 0, this.desiredHeight(width));
   }
 
+  wrappedRowOffsetForLine(index: number, width: number): number {
+    if (width <= 0 || !this.lines.length) return 0;
+    const end = Math.max(0, Math.min(Math.floor(index), this.lines.length));
+    let rows = 0;
+    for (let lineIndex = 0; lineIndex < end; lineIndex++) {
+      rows += this.wrapLine(this.lines[lineIndex], width).length;
+    }
+    return rows;
+  }
+
   wrappedRowsRange(width: number, start: number, end: number): string[] {
     if (width <= 0 || end <= start || !this.lines.length) return [];
     const totalRows = this.desiredHeight(width);

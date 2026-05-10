@@ -14,6 +14,7 @@ export interface LayoutRenderOptions {
   completions?: string[];
   completionLimit?: number;
   freezeHistory?: boolean;
+  mutableTranscriptStartLine?: number | null;
 }
 
 export type TuiLayoutMode = "fullscreen" | "inline";
@@ -121,9 +122,13 @@ export class TuiLayout {
     const transcriptRows = this.visibleTranscriptRows(options, size.rows, size.cols);
     const totalWrappedRows = this.transcript.desiredHeight(size.cols);
     const fixedStatusLine = options.statusLine ? fitAnsi(options.statusLine, size.cols) : null;
-    const commitTarget = options.freezeHistory
+    const desiredCommitTarget = options.freezeHistory
       ? Math.min(this.committedInlineRows, totalWrappedRows)
       : Math.max(0, totalWrappedRows - transcriptRows);
+    const commitLimit = options.mutableTranscriptStartLine === undefined || options.mutableTranscriptStartLine === null
+      ? totalWrappedRows
+      : this.transcript.wrappedRowOffsetForLine(options.mutableTranscriptStartLine, size.cols);
+    const commitTarget = Math.min(desiredCommitTarget, commitLimit);
 
     screen.hideCursor();
     if (this.lastInlineRows > 0) {

@@ -27,6 +27,14 @@ export interface InstallationInfo {
   reason: string;
 }
 
+export interface PreparedUpdateCheck {
+  result: Exclude<UpdateCheckResult, "skipped" | "updated" | "failed" | "locked">;
+  packageName: string;
+  currentVersion: string;
+  latestVersion?: string;
+  installation?: InstallationInfo;
+}
+
 export type UpdateCheckOptions = {
   packageName?: string;
   currentVersion?: string;
@@ -320,22 +328,43 @@ async function installLatestWithNpm(packageName: string, installation?: Installa
   return locked === "locked" ? 3 : locked;
 }
 
-export async function maybePromptForUpdate(options: UpdateCheckOptions = {}): Promise<UpdateCheckResult> {
+export async function prepareUpdateCheck(options: UpdateCheckOptions = {}): Promise<PreparedUpdateCheck> {
   const stdin = options.stdin || process.stdin;
   const stdout = options.stdout || process.stdout;
-  if (!shouldCheckForUpdates({ env: options.env, stdin, stdout })) return "disabled";
-
   const packageName = options.packageName || PACKAGE_NAME;
   const currentVersion = options.currentVersion || VERSION;
+  if (!shouldCheckForUpdates({ env: options.env, stdin, stdout })) {
+    return { result: "disabled", packageName, currentVersion };
+  }
+
   const timeoutMs = options.timeoutMs ?? 2500;
   const fetchLatest = options.fetchLatestVersion || fetchLatestNpmVersion;
   const latestVersion = await fetchLatest(packageName, timeoutMs);
-  if (!latestVersion || compareVersions(latestVersion, currentVersion) <= 0) return "current";
+  if (!latestVersion) return { result: "current", packageName, currentVersion };
+  if (compareVersions(latestVersion, currentVersion) <= 0) {
+    return { result: "current", packageName, currentVersion, latestVersion };
+  }
   const installation = options.detectInstallation
     ? await options.detectInstallation()
     : await detectInstallation({ packageName });
-  if (!installation.canAutoUpdate && !options.installLatest) return "unsupported";
+  if (!installation.canAutoUpdate && !options.installLatest) {
+    return { result: "unsupported", packageName, currentVersion, latestVersion, installation };
+  }
+  return { result: "available", packageName, currentVersion, latestVersion, installation };
+}
 
+export async function promptForPreparedUpdate(
+  prepared: PreparedUpdateCheck,
+  options: UpdateCheckOptions = {},
+): Promise<UpdateCheckResult> {
+  if (prepared.result !== "available") return prepared.result;
+
+  const stdin = options.stdin || process.stdin;
+  const stdout = options.stdout || process.stdout;
+  const packageName = prepared.packageName;
+  const currentVersion = prepared.currentVersion;
+  const latestVersion = prepared.latestVersion!;
+  const installation = prepared.installation!;
   stdout.write(`\n${p.warning(`Seek Code ${latestVersion} is available. Current version: ${currentVersion}.`)}\n`);
   stdout.write(`${p.dim(`Installation: ${installation.kind} (${installation.reason}).`)}\n`);
   const rl = createInterface({ input: stdin, output: stdout, terminal: true });
@@ -365,6 +394,10 @@ export async function maybePromptForUpdate(options: UpdateCheckOptions = {}): Pr
   }
   stdout.write(`${p.warning(`Update failed. You can retry with: ${installation.updateCommand}`)}\n`);
   return "failed";
+}
+
+export async function maybePromptForUpdate(options: UpdateCheckOptions = {}): Promise<UpdateCheckResult> {
+  return promptForPreparedUpdate(await prepareUpdateCheck(options), options);
 }
 
 export async function runUpdateCommand(options: RunUpdateOptions = {}): Promise<UpdateCheckResult> {

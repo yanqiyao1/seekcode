@@ -17,6 +17,14 @@ export class ActiveToolLines {
     return this.byId.get(id);
   }
 
+  earliestLine(): number | undefined {
+    let earliest: number | undefined;
+    for (const line of this.byId.values()) {
+      if (earliest === undefined || line < earliest) earliest = line;
+    }
+    return earliest;
+  }
+
   clear(): void {
     this.byId.clear();
   }

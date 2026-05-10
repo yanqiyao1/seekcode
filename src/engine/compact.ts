@@ -1,7 +1,8 @@
 /** Controlled context compaction with explicit cache-breaking boundaries. */
 
+import { get_encoding, type Tiktoken } from "tiktoken";
 import type { Config } from "../config.js";
-import type { Message } from "../session/types.js";
+import { messageToApiDict, type Message } from "../session/types.js";
 import type { ConversationHistory } from "../session/history.js";
 
 const TOOL_PREVIEW_CHARS = 280;
@@ -9,8 +10,11 @@ const SUMMARY_TARGET_CHARS = 2400;
 const SUMMARY_WINDOW_MESSAGES = 10;
 const RECENT_MESSAGE_KEEP = 20;
 const MIN_RECENT_MESSAGES = 4;
+const MAX_COMPACTION_FAILURES = 2;
+const CIRCUIT_BREAKER_ATTEMPTS = 3;
 
 export interface CompactionResult {
+  status?: "compacted" | "failed" | "skipped";
   actions: string[];
   finalTokens: number;
   message: string;
@@ -21,6 +25,10 @@ export interface CompactionResult {
   preserved_messages?: number;
   prefix_invalidated?: boolean;
   prefix_invalidation_reason?: string;
+  error?: string;
+  failure_count?: number;
+  circuit_open?: boolean;
+  circuit_open_until_attempt?: number;
 }
 
 interface CompactionProjection {
@@ -49,6 +57,9 @@ interface BoundaryMetadata {
 export class ContextCompactor {
   private readonly config: Config;
   private compactionCount = 0;
+  private compactionAttempts = 0;
+  private consecutiveFailures = 0;
+  private circuitOpenUntilAttempt = 0;
 
   constructor(config: Config) {
     this.config = config;
@@ -59,6 +70,51 @@ export class ContextCompactor {
   }
 
   compact(history: ConversationHistory): CompactionResult {
+    const attempt = ++this.compactionAttempts;
+    const originalTokens = estimateMessagesTokens(projectMessagesForRequest(history.session.messages));
+    if (attempt <= this.circuitOpenUntilAttempt) {
+      return {
+        status: "skipped",
+        actions: [],
+        finalTokens: originalTokens,
+        message: `Compaction circuit breaker is open after ${this.consecutiveFailures} failed attempt(s).`,
+        original_tokens: originalTokens,
+        removed_messages: 0,
+        preserved_messages: projectMessagesForRequest(history.session.messages).length,
+        prefix_invalidated: false,
+        failure_count: this.consecutiveFailures,
+        circuit_open: true,
+        circuit_open_until_attempt: this.circuitOpenUntilAttempt,
+      };
+    }
+
+    const originalLength = history.session.messages.length;
+    let result: CompactionResult;
+    try {
+      result = this.performCompaction(history);
+    } catch (error: any) {
+      history.session.messages.splice(originalLength);
+      return this.recordFailure(originalTokens, `Compaction failed: ${error?.message || String(error)}`, error?.message || String(error));
+    }
+
+    const madeProgress = !!result.prefix_invalidated
+      && typeof result.original_tokens === "number"
+      && result.finalTokens < result.original_tokens;
+    if (madeProgress) {
+      this.consecutiveFailures = 0;
+      return { status: "compacted", ...result, failure_count: 0, circuit_open: false };
+    }
+
+    if (result.prefix_invalidated) history.session.messages.splice(originalLength);
+    return this.recordFailure(
+      originalTokens,
+      result.message || "Compaction did not reduce projected tokens.",
+      result.error,
+      result,
+    );
+  }
+
+  private performCompaction(history: ConversationHistory): CompactionResult {
     this.compactionCount++;
     const messages = history.session.messages;
     const originalMessages = messages.length;
@@ -67,6 +123,7 @@ export class ContextCompactor {
 
     if (!projection.summaryCandidates.length) {
       return {
+        status: "failed",
         actions: [],
         finalTokens: originalTokens,
         message: "Compaction attempted, but no compactable content was found.",
@@ -112,6 +169,7 @@ export class ContextCompactor {
     boundaryPlaceholder.content = buildBoundaryContent(metadata, finalActions);
 
     return {
+      status: "compacted",
       actions: finalActions,
       finalTokens: finalProjectedTokens,
       message: `Context compacted with boundary ${boundaryId}; prompt projection now uses summary + recent messages.`,
@@ -122,6 +180,33 @@ export class ContextCompactor {
       summary_message_name: summary.name || "context_summary",
       prefix_invalidated: true,
       prefix_invalidation_reason: "context_compaction",
+    };
+  }
+
+  private recordFailure(
+    originalTokens: number,
+    message: string,
+    error?: string,
+    base?: CompactionResult,
+  ): CompactionResult {
+    this.consecutiveFailures++;
+    if (this.consecutiveFailures >= MAX_COMPACTION_FAILURES) {
+      this.circuitOpenUntilAttempt = this.compactionAttempts + CIRCUIT_BREAKER_ATTEMPTS;
+    }
+    return {
+      ...(base || {}),
+      status: "failed",
+      actions: base?.actions || [],
+      finalTokens: base?.finalTokens ?? originalTokens,
+      message,
+      original_tokens: base?.original_tokens ?? originalTokens,
+      removed_messages: base?.removed_messages ?? 0,
+      preserved_messages: base?.preserved_messages,
+      prefix_invalidated: false,
+      error,
+      failure_count: this.consecutiveFailures,
+      circuit_open: this.compactionAttempts < this.circuitOpenUntilAttempt,
+      circuit_open_until_attempt: this.circuitOpenUntilAttempt || undefined,
     };
   }
 }
@@ -148,16 +233,24 @@ export function projectMessagesForRequest(messages: Message[]): Message[] {
 }
 
 export function estimateMessagesTokens(messages: Message[]): number {
-  let total = 0;
-  for (const msg of messages) {
-    let text = msg.content || "";
-    if (msg.reasoning_content) text += msg.reasoning_content;
-    if (msg.tool_calls) {
-      for (const tc of msg.tool_calls) text += tc.name + JSON.stringify(tc.arguments);
-    }
-    total += text.length;
-  }
-  return Math.ceil(total / 4);
+  return estimateValueTokens(messages.map(messageToApiDict));
+}
+
+export function estimateRequestTokens(messages: Message[], tools?: Record<string, unknown>[] | null): number {
+  return estimateValueTokens({
+    messages: messages.map(messageToApiDict),
+    ...(tools?.length ? { tools } : {}),
+  });
+}
+
+export function estimateValueTokens(value: unknown): number {
+  return estimateTextTokens(typeof value === "string" ? value : stableStringify(value));
+}
+
+export function estimateTextTokens(text: string): number {
+  const encoder = getTokenEncoder();
+  if (!encoder) return Math.ceil(text.length / 4);
+  return encoder.encode(text).length;
 }
 
 export function isCompactionMarker(message: Message): boolean {
@@ -334,4 +427,25 @@ function parseNumberField(content: string, key: string): number | null {
   if (!match) return null;
   const value = Number(match[1]);
   return Number.isFinite(value) ? value : null;
+}
+
+let tokenEncoder: Tiktoken | null | undefined;
+
+function getTokenEncoder(): Tiktoken | null {
+  if (tokenEncoder !== undefined) return tokenEncoder;
+  try {
+    tokenEncoder = get_encoding("cl100k_base");
+  } catch {
+    tokenEncoder = null;
+  }
+  return tokenEncoder;
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, child]) => child !== undefined)
+    .sort(([a], [b]) => a.localeCompare(b));
+  return `{${entries.map(([key, child]) => `${JSON.stringify(key)}:${stableStringify(child)}`).join(",")}}`;
 }

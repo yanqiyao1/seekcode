@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { Config } from "../src/config.js";
-import { ContextCompactor, estimateMessagesTokens, isCompactionMarker, projectMessagesForRequest } from "../src/engine/compact.js";
+import { ContextCompactor, estimateMessagesTokens, estimateTextTokens, isCompactionMarker, projectMessagesForRequest } from "../src/engine/compact.js";
 import { buildSystemPrompt, buildToolsDescription } from "../src/engine/context.js";
-import { buildPinnedPrefix } from "../src/engine/prefix-builder.js";
+import { buildPinnedPrefix, loadPinnedPrefixContext } from "../src/engine/prefix-builder.js";
 import { ImmutablePrefix, PrefixManager, stripPinnedPrefixMessages, systemMessage } from "../src/engine/prefix.js";
 import { clearHooks, fireHooks, registerHook } from "../src/engine/hooks.js";
 import { injectAgentsMd, readAgentsMd } from "../src/engine/agents-md.js";
@@ -240,6 +240,20 @@ describe("AGENTS.md and pinned prefix building", () => {
     expect(injectAgentsMd("base", child)).toContain("Project Context (AGENTS.md)");
   });
 
+  it("loads Claude-compatible project instruction files as migration context", () => {
+    const root = join(tmp, "claude-repo");
+    const child = join(root, "pkg");
+    mkdirSync(join(child, ".claude"), { recursive: true });
+    writeFileSync(join(root, "CLAUDE.md"), "root claude rules\n");
+    writeFileSync(join(child, ".claude", "CLAUDE.md"), "child dot-claude rules\n");
+
+    const result = readAgentsMd(child);
+    expect(result.content).toContain("Claude Compatibility Context");
+    expect(result.content).toContain("root claude rules");
+    expect(result.content).toContain("child dot-claude rules");
+    expect(injectAgentsMd("base", child)).toContain("Claude-compatible project instructions");
+  });
+
   it("builds pinned prefixes with tool schemas and AGENTS.md-derived memory index", () => {
     const workspace = join(tmp, "workspace");
     mkdirSync(workspace, { recursive: true });
@@ -258,6 +272,29 @@ describe("AGENTS.md and pinned prefix building", () => {
     expect(prefix.toolSchemas()).toHaveLength(1);
     expect(prefix.memoryIndex).toContain("Project Context");
     expect(prefix.systemPrompt).toContain("workspace rules");
+  });
+
+  it("reuses prefetched AGENTS.md and skills context when building pinned prefixes", () => {
+    const workspace = join(tmp, "workspace-prefetch");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, "AGENTS.md"), "prefetched workspace rules\n");
+    const cfg = config();
+    getRegistry().register({
+      name: "read",
+      description: "Read files",
+      parameters: { type: "object", properties: {} },
+      execute: async () => "ok",
+      permission: "always_allow" as any,
+      category: "file",
+      parallelOk: true,
+    });
+
+    const prefetched = loadPinnedPrefixContext(cfg, workspace);
+    const direct = buildPinnedPrefix(cfg, workspace, getRegistry());
+    const eager = buildPinnedPrefix(cfg, workspace, getRegistry(), prefetched);
+
+    expect(eager.hash).toBe(direct.hash);
+    expect(eager.systemPrompt).toContain("prefetched workspace rules");
   });
 
   it("limits pinned prefixes to plan-safe tools in plan mode", () => {
@@ -316,6 +353,13 @@ describe("AGENTS.md and pinned prefix building", () => {
 });
 
 describe("context compaction and projection", () => {
+  it("uses tokenizer-backed exact text token estimation", () => {
+    expect(estimateTextTokens("hello")).toBe(1);
+    expect(estimateMessagesTokens([
+      { role: "user", content: "hello", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+    ])).toBeGreaterThan(1);
+  });
+
   it("estimates tokens from content, reasoning, and tool calls", () => {
     const tokens = estimateMessagesTokens([
       {
@@ -344,6 +388,28 @@ describe("context compaction and projection", () => {
     const result = compactor.compact(history);
     expect(result.prefix_invalidated).toBe(false);
     expect(result.removed_messages).toBe(0);
+  });
+
+  it("opens a circuit breaker after repeated compaction failures", () => {
+    const history = new ConversationHistory(createSession({
+      messages: [
+        systemMessage("sys"),
+        { role: "user", content: "one", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+        { role: "assistant", content: "two", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+      ],
+    }));
+    const compactor = new ContextCompactor(config({ context_limit: 1 }));
+
+    const first = compactor.compact(history);
+    const second = compactor.compact(history);
+    const third = compactor.compact(history);
+
+    expect(first.status).toBe("failed");
+    expect(second.status).toBe("failed");
+    expect(second.circuit_open).toBe(true);
+    expect(third.status).toBe("skipped");
+    expect(third.circuit_open).toBe(true);
+    expect(history.session.messages.some(isCompactionMarker)).toBe(false);
   });
 
   it("creates compaction boundaries and summary markers under pressure", () => {

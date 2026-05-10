@@ -7,6 +7,7 @@ import { jobsCommand, tasksCommand } from "./tasks.js";
 import { mcpCommand } from "./mcp.js";
 import { restoreCommand } from "./workspace.js";
 import { skillCommand, skillsCommand } from "./skills.js";
+import { expandClaudeCommand, findClaudeCommand } from "./compat.js";
 import type { Config } from "../config.js";
 import type { CostTracker } from "../cost/tracker.js";
 import type { ConversationHistory } from "../session/history.js";
@@ -80,10 +81,17 @@ export async function handleSlashCommand(
 
   const handler = COMMAND_HANDLERS.get(cmd);
   if (!handler) {
+    const compat = findClaudeCommand(input, session.workspace_path || process.cwd());
+    if (compat) {
+      return {
+        type: "prompt",
+        input: expandClaudeCommand(compat.command, compat.args),
+        label: `/${compat.command.name}`,
+      };
+    }
     write(p.error(`Unknown command: ${cmd}`));
     return false;
   }
 
   return (await handler({ input, parts, cmd, cfg, session, history, costTracker, runtime, write })) ?? false;
 }
-

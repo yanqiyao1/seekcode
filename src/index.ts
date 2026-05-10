@@ -23,7 +23,7 @@ import { approvalModalLines, pickerModalLines, type TuiModalState } from "./tui/
 import { denyModeSwitchWhileRunning } from "./tui/live-mode-guard.js";
 import { handleSlashCommand, isLiveReadonlyCommand, type SlashCommandRuntime } from "./commands/registry.js";
 
-import { explainConfig, loadConfig, migrateProjectConfig, migrateUserConfig, userConfigPath, validateConfig, writeUserApiKey, type Config } from "./config.js";
+import { explainConfig, loadConfig, migrateProjectConfig, migrateUserConfig, userConfigPath, validateConfig, type ConfigValidationReport, writeUserApiKey, type Config } from "./config.js";
 import { DeepSeekClient } from "./client/deepseek.js";
 import { getRegistry } from "./tools/registry.js";
 import { getMode, nextModeName, type UICallbacks } from "./modes/base.js";
@@ -32,7 +32,7 @@ import { Engine, type TurnResult } from "./engine/loop.js";
 import { ConversationHistory } from "./session/history.js";
 import { createSession, type Session } from "./session/types.js";
 import { CapacityController } from "./engine/capacity.js";
-import { buildPinnedPrefix } from "./engine/prefix-builder.js";
+import { buildPinnedPrefix, loadPinnedPrefixContext, type PinnedPrefixContext } from "./engine/prefix-builder.js";
 import { systemMessage } from "./engine/prefix.js";
 import { CostTracker } from "./cost/tracker.js";
 import { saveSession } from "./session/store.js";
@@ -59,8 +59,9 @@ import { registerArtifactTools } from "./tools/artifacts.js";
 import { extractCachedInputTokens } from "./client/capabilities.js";
 import { reloadMCPManager } from "./mcp/manager.js";
 import { linkArtifact } from "./artifacts/store.js";
-import { VERSION } from "./version.js";
-import { assertMinimumVersion, maybePromptForUpdate, runUpdateCommand } from "./update-check.js";
+import { PACKAGE_NAME, VERSION } from "./version.js";
+import { assertMinimumVersion, prepareUpdateCheck, promptForPreparedUpdate, runUpdateCommand, type PreparedUpdateCheck } from "./update-check.js";
+import { createStartupProfiler, type StartupProfiler } from "./startup-profiler.js";
 
 function parseOptionalInt(value: string | undefined): number | undefined {
   if (value === undefined || value === "") return undefined;
@@ -89,6 +90,62 @@ function setupTools(cfg?: ReturnType<typeof loadConfig>) {
   registerTaskTools();
   registerArtifactTools();
   registerDiagnosticsTools();
+  return reg;
+}
+
+interface RuntimeStartup {
+  workspacePath: string;
+  tools: ReturnType<typeof getRegistry>;
+  mcpReady: Promise<void>;
+  prefixContext: Promise<PinnedPrefixContext>;
+}
+
+function startRuntimeStartup(cfg: Config, workspacePath: string, profiler: StartupProfiler): RuntimeStartup {
+  const tools = profiler.profileSync("tools.register", () => setupTools(cfg), registry => `${registry.size} registered`);
+  const mcpReady = profiler.profileAsync("mcp.reload", async () => {
+    await reloadMCPManager(cfg).catch(() => undefined);
+  });
+  const prefixContext = profiler.profileAsync(
+    "prefix.context",
+    async () => loadPinnedPrefixContext(cfg, workspacePath),
+    context => `${context.agentsMd.sourceFiles.length} instruction files, ${context.skills.length} skills`,
+  );
+  return { workspacePath, tools, mcpReady, prefixContext };
+}
+
+async function finishRuntimeStartup(cfg: Config, startup: RuntimeStartup, profiler: StartupProfiler) {
+  const [, prefixContext] = await Promise.all([startup.mcpReady, startup.prefixContext]);
+  const prefix = profiler.profileSync(
+    "prefix.build",
+    () => buildPinnedPrefix(cfg, startup.workspacePath, startup.tools, prefixContext),
+    value => `${value.metadata.tool_count} tools`,
+  );
+  return { tools: startup.tools, prefix };
+}
+
+function startConfigValidation(
+  cliOverrides: Record<string, unknown>,
+  profiler: StartupProfiler,
+): Promise<ConfigValidationReport> {
+  return profiler.profileAsync(
+    "config.validate",
+    async () => {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      return validateConfig(cliOverrides);
+    },
+    report => `${report.ok ? "ok" : "invalid"}, ${report.issues.length} issues`,
+  ).catch((error: any) => ({
+    ok: false,
+    issues: [{ level: "error", source: "startup", message: error?.message || String(error) }],
+  }));
+}
+
+function startUpdatePrefetch(profiler: StartupProfiler): Promise<PreparedUpdateCheck> {
+  return profiler.profileAsync(
+    "update.prefetch",
+    () => prepareUpdateCheck(),
+    prepared => prepared.result,
+  ).catch(() => ({ result: "current", packageName: PACKAGE_NAME, currentVersion: VERSION }));
 }
 
 async function ensureRuntimeApiKey(cfg: Config, cliOverrides: Record<string, unknown>): Promise<Config> {
@@ -154,23 +211,23 @@ function recordCompletedTurn(
   return { tokensIn, tokensOut, cachedTokensIn, cost, turnIndex };
 }
 
-async function runOneShot(cfg: ReturnType<typeof loadConfig>, prompt: string) {
+async function runOneShot(cfg: ReturnType<typeof loadConfig>, prompt: string, profiler = createStartupProfiler()) {
   if (!cfg.api_key) throw new Error("DEEPSEEK_API_KEY is required. Set it in the environment, config file, or --api-key.");
-  setupTools(cfg);
-  await reloadMCPManager(cfg).catch(() => undefined);
-  const tools = getRegistry();
+  const workspacePath = resolve(".");
+  const startup = startRuntimeStartup(cfg, workspacePath, profiler);
   const modeObj = getMode(cfg.mode);
   const costTracker = new CostTracker(cfg.model);
 
-  const session = createSession({ mode: cfg.mode, model: cfg.model, workspace_path: resolve(".") });
+  const session = createSession({ mode: cfg.mode, model: cfg.model, workspace_path: workspacePath });
   const history = new ConversationHistory(session);
   const client = new DeepSeekClient({ apiKey: cfg.api_key, baseUrl: cfg.base_url, model: cfg.model, provider: cfg.provider });
 
-  const prefix = buildPinnedPrefix(cfg, session.workspace_path, tools);
+  const { tools, prefix } = await finishRuntimeStartup(cfg, startup, profiler);
   session.prefix_hash = prefix.hash;
   history.addSystem(prefix.systemPrompt);
 
   const engine = new Engine(cfg, session, history, client, tools, prefix);
+  profiler.report();
 
   process.stdout.write("\n");
   let wasThinking = false;
@@ -199,24 +256,26 @@ async function runOneShot(cfg: ReturnType<typeof loadConfig>, prompt: string) {
   if (result.usage) console.log(`\n--- Tokens: ${recorded.tokensIn} in / ${recorded.tokensOut} out ---`);
 }
 
-async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
+async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = createStartupProfiler()) {
   if (!cfg.api_key) throw new Error("DEEPSEEK_API_KEY is required. Set it in the environment, config file, or --api-key.");
-  setupTools(cfg);
-  await reloadMCPManager(cfg).catch(() => undefined);
-  const tools = getRegistry();
+  const workspacePath = resolve(".");
+  const startup = startRuntimeStartup(cfg, workspacePath, profiler);
   let modeObj = getMode(cfg.mode);
   const costTracker = new CostTracker(cfg.model);
   const capacity = new CapacityController();
 
-  const session = createSession({ mode: cfg.mode, model: cfg.model, workspace_path: resolve(".") });
+  const session = createSession({ mode: cfg.mode, model: cfg.model, workspace_path: workspacePath });
   const history = new ConversationHistory(session);
   let client = new DeepSeekClient({ apiKey: cfg.api_key, baseUrl: cfg.base_url, model: cfg.model, provider: cfg.provider });
 
-  let prefix = buildPinnedPrefix(cfg, session.workspace_path, tools);
+  const runtime = await finishRuntimeStartup(cfg, startup, profiler);
+  const tools = runtime.tools;
+  let prefix = runtime.prefix;
   session.prefix_hash = prefix.hash;
   history.addSystem(prefix.systemPrompt);
 
   let engine = new Engine(cfg, session, history, client, tools, prefix);
+  profiler.report();
 
   const initialRawMode = process.stdin.isRaw;
   const useAlternateScreen = shouldUseAlternateScreen(cfg.tui_alternate_screen);
@@ -278,6 +337,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
       completions: modalLines ?? completions,
       completionLimit: modalLines?.length,
       freezeHistory: false,
+      mutableTranscriptStartLine: runtimeView?.mutableTranscriptStartLine ?? null,
     });
   };
   const requestRender = (input = promptState.value, cursor = promptState.cursor, completions = promptState.completions) => {
@@ -372,7 +432,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
 
   liveInputController = new InputController({
     mode: "running",
-    completionProvider: commandCompletionProvider,
+    completionProvider: value => commandCompletionProvider(value, session.workspace_path),
     completionLimit: 8,
     clearOnSubmit: true,
     onRender: (state, meta) => {
@@ -613,6 +673,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
         clearPrompt();
       } else {
         const result = await readInput(r.promptSymbol(cfg.mode), {
+          completionProvider: value => commandCompletionProvider(value, session.workspace_path),
           onInterrupt: () => {
             if (engineRunning) {
               activeAbortController?.abort();
@@ -660,9 +721,15 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>) {
           clearActiveSkill: () => { activeSkillInstruction = null; },
         });
         if (changed === "exit") break;
-        if (changed) modeObj = getMode(cfg.mode);
-        renderScreen();
-        continue;
+        if (typeof changed === "object" && changed.type === "prompt") {
+          input = changed.input;
+          transcript.append(p.dim(`  Expanded ${changed.label || "compatible slash command"}.`));
+          renderScreen();
+        } else {
+          if (changed) modeObj = getMode(cfg.mode);
+          renderScreen();
+          continue;
+        }
       }
 
       turnCount++;
@@ -776,16 +843,27 @@ program
   .option("--alt-screen", "Use fullscreen alternate screen")
   .option("--no-alt-screen", "Use inline mode with terminal-native scrollback")
   .action(async (promptParts: string[] | undefined, options) => {
-    const cliOverrides = configOverridesFromCliOptions(options);
-    const cfg = await ensureRuntimeApiKey(loadConfig(cliOverrides), cliOverrides);
-
+    const startupProfiler = createStartupProfiler();
+    startupProfiler.mark("cli.action");
     const prompt = (promptParts || []).join(" ").trim();
+    const cliOverrides = configOverridesFromCliOptions(options);
+    const validationPromise = startConfigValidation(cliOverrides, startupProfiler);
+    const updateCheckPromise = prompt ? null : startUpdatePrefetch(startupProfiler);
+    const loadedConfig = startupProfiler.profileSync("config.load", () => loadConfig(cliOverrides));
+    const cfg = await startupProfiler.profileAsync("api_key.ensure", () => ensureRuntimeApiKey(loadedConfig, cliOverrides));
+
     if (prompt) {
-      await runOneShot(cfg, prompt);
+      await validationPromise;
+      await runOneShot(cfg, prompt, startupProfiler);
     } else {
-      const updateResult = await maybePromptForUpdate();
-      if (updateResult === "updated") return;
-      await runInteractive(cfg);
+      const preparedUpdate = await updateCheckPromise!;
+      const updateResult = await startupProfiler.profileAsync("update.prompt", () => promptForPreparedUpdate(preparedUpdate));
+      await validationPromise;
+      if (updateResult === "updated") {
+        startupProfiler.report();
+        return;
+      }
+      await runInteractive(cfg, startupProfiler);
     }
   });
 

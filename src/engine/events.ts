@@ -55,7 +55,7 @@ export interface ToolProgressRuntimeEvent extends EngineRuntimeEventBase<"tool_p
 }
 
 export interface EngineRuntimeEventMap {
-  api_call_start: { prefix_hash?: string; tool_schema_count?: number };
+  api_call_start: { prefix_hash?: string; tool_schema_count?: number; retry?: number; prompt_recovery?: boolean };
   prefix_pinned: PrefixMetadata;
   prefix_invalidated: PrefixInvalidatedEventData;
   thinking_delta: { text: string };

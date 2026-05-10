@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { handleSlashCommand, isLiveReadonlyCommand, type SlashCommandRuntime } from "../src/commands/registry.js";
@@ -5,6 +8,7 @@ import type { Config } from "../src/config.js";
 import { CostTracker } from "../src/cost/tracker.js";
 import { ConversationHistory } from "../src/session/history.js";
 import { createSession, type Session } from "../src/session/types.js";
+import { commandCompletionProvider } from "../src/ui/input.js";
 
 describe("slash command registry", () => {
   it("identifies commands that are safe while a turn is running", () => {
@@ -53,6 +57,57 @@ describe("slash command registry", () => {
 
     expect(writes.join("\n")).toContain("Unknown command: /does-not-exist");
     expect(cfg.mode).toBe("agent");
+  });
+
+  it("expands Claude-compatible markdown slash commands into prompts", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "seek-code-claude-command-"));
+    try {
+      mkdirSync(join(tmp, ".claude", "commands", "review"), { recursive: true });
+      writeFileSync(join(tmp, ".claude", "commands", "review", "security.md"), [
+        "---",
+        "description: Security review a target",
+        "arguments: target",
+        "---",
+        "Review $target for security issues.",
+        "Raw args: $ARGUMENTS",
+      ].join("\n"));
+      const cfg = testConfig();
+      const session = createSession({ mode: cfg.mode, model: cfg.model, workspace_path: tmp });
+      const result = await handleSlashCommand(
+        "/project:review:security src/auth.ts",
+        cfg,
+        session,
+        new ConversationHistory(session),
+        new CostTracker(cfg.model),
+        testRuntime(session, []),
+      );
+
+      expect(result).toMatchObject({ type: "prompt", label: "/project:review:security" });
+      expect(typeof result === "object" && result.input).toContain("Review src/auth.ts for security issues.");
+      expect(typeof result === "object" && result.input).toContain("Source:");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("includes Claude-compatible commands in slash completion", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "seek-code-claude-complete-"));
+    try {
+      mkdirSync(join(tmp, ".claude", "commands"), { recursive: true });
+      writeFileSync(join(tmp, ".claude", "commands", "verify.md"), [
+        "---",
+        "description: Run project verification",
+        "---",
+        "Run verification for $ARGUMENTS",
+      ].join("\n"));
+
+      const completions = commandCompletionProvider("/project:v", tmp);
+
+      expect(completions.some(item => item.completeText === "/project:verify")).toBe(true);
+      expect(completions.map(item => item.display).join("\n")).toContain("Run project verification");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
 
@@ -131,4 +186,3 @@ function testConfig(): Config {
     },
   };
 }
-

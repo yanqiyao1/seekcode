@@ -5,7 +5,7 @@ import type { Session } from "../session/types.js";
 import type { TuiModalKind } from "../tui/modal.js";
 import type { PickItem } from "../ui/picker.js";
 
-export type SlashCommandResult = boolean | "exit";
+export type SlashCommandResult = boolean | "exit" | { type: "prompt"; input: string; label?: string };
 export type SlashCommandWrite = (message: unknown, isError?: boolean) => void;
 export type PickerRenderer = (
   idx: number,
@@ -45,4 +45,3 @@ export interface SlashCommandContext {
 export type SlashCommandHandler = (
   context: SlashCommandContext,
 ) => Promise<SlashCommandResult | void> | SlashCommandResult | void;
-

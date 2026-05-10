@@ -81,6 +81,24 @@ export class LayeredContextManager {
     };
   }
 
+  compactNow(history: ConversationHistory, _workspacePath: string, reason: string): ContextIntervention {
+    const before = estimateMessagesTokens(projectMessagesForRequest(history.session.messages));
+    const compaction = this.compactor.compact(history);
+    const injected = compaction.status === "compacted"
+      ? this.injectVerification(history, "Prompt was too long for the provider. Continue from the compacted summary, verify assumptions with tools if needed, then retry the user request.")
+      : undefined;
+    return {
+      action: "verify_and_replan",
+      risk: "high",
+      reason,
+      tokens_before: before,
+      tokens_after: estimateMessagesTokens(projectMessagesForRequest(history.session.messages)),
+      layers: this.inspect(history),
+      injected_message: injected,
+      compaction,
+    };
+  }
+
   private injectRefresh(history: ConversationHistory, workspacePath: string, reason: string): string {
     this.refreshCounter++;
     const refresh = buildWorkspaceRefresh(workspacePath);
@@ -107,16 +125,8 @@ function layer(kind: ContextLayerKind, label: string, messages: Message[]): Cont
     kind,
     label,
     message_count: messages.length,
-    tokens: Math.ceil(messages.map(messageText).join("\n").length / 4),
+    tokens: estimateMessagesTokens(messages),
   };
-}
-
-function messageText(message: Message): string {
-  return [
-    message.content || "",
-    message.reasoning_content || "",
-    message.tool_calls?.map(tool => `${tool.name} ${JSON.stringify(tool.arguments)}`).join("\n") || "",
-  ].join("\n");
 }
 
 function markerMessage(kind: "refresh" | "verification", content: string): Message {

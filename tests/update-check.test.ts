@@ -9,6 +9,8 @@ import {
   detectInstallation,
   getUpdateLockPath,
   maybePromptForUpdate,
+  prepareUpdateCheck,
+  promptForPreparedUpdate,
   runUpdateCommand,
   shouldCheckForUpdates,
   type InstallationInfo,
@@ -97,6 +99,47 @@ describe("update checker", () => {
     });
 
     expect(result).toBe("skipped");
+  });
+
+  it("prepares update checks without prompting until the prepared result is consumed", async () => {
+    const output = ttyOutput();
+    const installs: string[] = [];
+    const installation: InstallationInfo = {
+      kind: "global",
+      packageName: "seekcode",
+      packageRoot: join(tmp, "prefix", "lib", "node_modules", "seekcode"),
+      executablePath: join(tmp, "prefix", "bin", "seek"),
+      npmPrefix: join(tmp, "prefix"),
+      localProjectRoot: null,
+      updateCommand: "npm install -g seekcode@latest",
+      canAutoUpdate: true,
+      reason: "test global install",
+    };
+
+    const prepared = await prepareUpdateCheck({
+      currentVersion: "0.1.3",
+      packageName: "seekcode",
+      stdin: ttyInput(""),
+      stdout: output,
+      fetchLatestVersion: async () => "0.1.4",
+      detectInstallation: async () => installation,
+    });
+
+    expect(prepared).toMatchObject({ result: "available", latestVersion: "0.1.4" });
+    expect(output.chunks.join("")).toBe("");
+
+    const result = await promptForPreparedUpdate(prepared, {
+      stdin: ttyInput("y\n"),
+      stdout: output,
+      installLatest: async packageName => {
+        installs.push(packageName);
+        return 0;
+      },
+    });
+
+    expect(result).toBe("updated");
+    expect(installs).toEqual(["seekcode"]);
+    expect(output.chunks.join("")).toContain("0.1.4");
   });
 
   it("detects source checkout installs as dev installs", async () => {

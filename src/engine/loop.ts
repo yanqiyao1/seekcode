@@ -6,17 +6,26 @@ import type { StreamEvent, ContentDelta, ThinkingDelta, ToolCallBegin, ToolCallA
 import type { BaseMode, UICallbacks } from "../modes/base.js";
 import type { ConversationHistory } from "../session/history.js";
 import type { Message, Session, ToolCall, ToolResult } from "../session/types.js";
-import { getToolUseRuntimeMetadata, validateToolInput, type ApprovalContext, type ToolDef } from "../tools/base.js";
+import {
+  getToolUseRuntimeMetadata,
+  isToolConcurrencySafe,
+  PermissionLevel,
+  validateToolInput,
+  type ApprovalContext,
+  type ToolDef,
+  type ToolRenderedResult,
+  type ToolUseRuntimeMetadata,
+} from "../tools/base.js";
 import { ToolRegistry } from "../tools/registry.js";
 import { CapacityController } from "./capacity.js";
-import { LayeredContextManager } from "./context-manager.js";
+import { LayeredContextManager, type ContextIntervention } from "./context-manager.js";
 import { checkSandboxPolicy } from "../tools/sandbox.js";
 import { runAutoDiagnostics } from "../tools/diagnostics.js";
 import { fireHooks } from "./hooks.js";
 import { applyToolResultBudget } from "./tool-result-budget.js";
 import { emitRuntimeEvent } from "./events.js";
 import { ImmutablePrefix, PrefixManager, stripPinnedPrefixMessages } from "./prefix.js";
-import { estimateMessagesTokens, projectMessagesForRequest } from "./compact.js";
+import { estimateRequestTokens, projectMessagesForRequest } from "./compact.js";
 import { getMode } from "../modes/base.js";
 
 export type { UICallbacks };
@@ -33,6 +42,31 @@ export interface TurnResult {
 export interface RunTurnOptions {
   signal?: AbortSignal;
   ephemeralInstructions?: string;
+}
+
+interface EngineModelResponse {
+  content: string;
+  reasoning_content: string | null;
+  tool_calls: ToolCall[];
+  finish_reason: string;
+  usage: UsageTelemetry | null;
+}
+
+interface ToolPostHookPayload {
+  toolName: string;
+  args: Record<string, unknown>;
+  resultContent: string;
+}
+
+interface ToolExecutionOutcome {
+  toolCall: ToolCall;
+  result: ToolResult;
+  preview: string;
+  artifactIds?: string[];
+  rendered?: ToolRenderedResult;
+  metadata?: ToolUseRuntimeMetadata;
+  postHook?: ToolPostHookPayload;
+  interrupted?: boolean;
 }
 
 export class Engine {
@@ -142,31 +176,36 @@ export class Engine {
         const capacityDecision = this.capacity.observe(projectedTokens, this.config.context_limit);
         const intervention = this.contextManager.apply(this.history, capacityDecision, this.session.workspace_path);
         if (intervention) {
-          await emitRuntimeEvent(callbacks, { type: "context_intervention", data: intervention });
-          if (intervention.compaction?.prefix_invalidated) {
-            await emitRuntimeEvent(callbacks, {
-              type: "prefix_invalidated",
-              data: {
-                reason: intervention.compaction.prefix_invalidation_reason || "context_compaction",
-                boundary_id: intervention.compaction.boundary_id,
-                compaction: {
-                  actions: intervention.compaction.actions,
-                  finalTokens: intervention.compaction.finalTokens,
-                  original_tokens: intervention.compaction.original_tokens,
-                  removed_messages: intervention.compaction.removed_messages,
-                  preserved_messages: intervention.compaction.preserved_messages,
-                  summary_message_name: intervention.compaction.summary_message_name,
-                },
-              },
-            });
-          }
+          await this.emitContextIntervention(callbacks, intervention);
         }
 
-        await emitRuntimeEvent(callbacks, {
-          type: "api_call_start",
-          data: { prefix_hash: this.prefix.hash, tool_schema_count: schemas.length },
-        });
-        const response = await this.callApi(schemas, callbacks, options.signal);
+        let response: EngineModelResponse;
+        let apiAttempt = 0;
+        while (true) {
+          await emitRuntimeEvent(callbacks, {
+            type: "api_call_start",
+            data: {
+              prefix_hash: this.prefix.hash,
+              tool_schema_count: schemas.length,
+              retry: apiAttempt || undefined,
+              prompt_recovery: apiAttempt > 0 || undefined,
+            },
+          });
+          try {
+            response = await this.callApi(schemas, callbacks, options.signal);
+            break;
+          } catch (error) {
+            if (!isPromptTooLongError(error) || apiAttempt >= 2 || options.signal?.aborted || this.interrupted) throw error;
+            const intervention = this.contextManager.compactNow(
+              this.history,
+              this.session.workspace_path,
+              promptTooLongReason(error),
+            );
+            await this.emitContextIntervention(callbacks, intervention);
+            if (intervention.compaction?.status !== "compacted") throw error;
+            apiAttempt++;
+          }
+        }
         lastUsage = response.usage;
         totalUsage = mergeUsage(totalUsage, response.usage);
 
@@ -175,19 +214,19 @@ export class Engine {
 
         if (!response.tool_calls.length) break;
 
-        for (const tc of response.tool_calls) {
-          if (this.interrupted) break;
-          if (turnToolCalls.length >= this.config.tool_call_budget_per_turn) {
-            const err = `Error: tool call budget exceeded for this turn (${this.config.tool_call_budget_per_turn}).`;
-            const tr: ToolResult = { tool_call_id: tc.id, name: tc.name, content: err, is_error: true };
-            recordToolResult(tr);
-            turnToolCalls.push(tc);
-            turnToolResults.push(tr);
-            await emitRuntimeEvent(callbacks, { type: "tool_budget_exceeded", data: { tool: tc.name, budget: this.config.tool_call_budget_per_turn } });
-            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: err.slice(0, 200) });
-            this.interrupted = true;
-            break;
-          }
+        const makeToolErrorOutcome = (
+          tc: ToolCall,
+          content: string,
+          preview = content.slice(0, 200),
+          interrupted = false,
+        ): ToolExecutionOutcome => ({
+          toolCall: tc,
+          result: { tool_call_id: tc.id, name: tc.name, content, is_error: true },
+          preview,
+          interrupted,
+        });
+
+        const executeToolCall = async (tc: ToolCall): Promise<ToolExecutionOutcome> => {
           const toolDef = this.tools.lookup(tc.name);
           await emitRuntimeEvent(callbacks, {
             type: "tool_call",
@@ -196,41 +235,16 @@ export class Engine {
               : tc,
           });
           if (!toolDef) {
-            const err = `Error: Unknown tool '${tc.name}'`;
-            const tr: ToolResult = {
-              tool_call_id: tc.id, name: tc.name, content: err, is_error: true,
-            };
-            recordToolResult(tr);
-            turnToolCalls.push(tc);
-            turnToolResults.push(tr);
-            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: err.slice(0, 200) });
-            continue;
+            return makeToolErrorOutcome(tc, `Error: Unknown tool '${tc.name}'`);
           }
           if (!this.prefix.hasTool(tc.name) || !allowedToolNames.has(tc.name)) {
-            const err = `Tool '${tc.name}' is not active in the current mode or prefix. Enable it explicitly if needed.`;
-            const tr: ToolResult = {
-              tool_call_id: tc.id, name: tc.name, content: err, is_error: true,
-            };
-            recordToolResult(tr);
-            turnToolCalls.push(tc);
-            turnToolResults.push(tr);
-            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: err.slice(0, 200) });
-            continue;
+            return makeToolErrorOutcome(tc, `Tool '${tc.name}' is not active in the current mode or prefix. Enable it explicitly if needed.`);
           }
 
           try {
-            let resultContent: string;
-            const pushToolError = async (content: string): Promise<void> => {
-              const tr: ToolResult = {
-                tool_call_id: tc.id,
-                name: tc.name,
-                content,
-                is_error: true,
-              };
-              recordToolResult(tr);
-              turnToolResults.push(tr);
-              turnToolCalls.push(tc);
-              await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: content.slice(0, 200) });
+            let earlyOutcome: ToolExecutionOutcome | null = null;
+            const pushToolError = (content: string): void => {
+              earlyOutcome = makeToolErrorOutcome(tc, content);
             };
             const normalizeArgs = async (nextArgs: Record<string, unknown>): Promise<Record<string, unknown> | null> => {
               const validation = await validateToolInput(toolDef, nextArgs, {
@@ -238,8 +252,7 @@ export class Engine {
                 workspace_path: this.session.workspace_path,
               });
               if (!validation.ok) {
-                const err = `Error: invalid input for tool '${tc.name}': ${validation.message || "validation failed"}`;
-                await pushToolError(err);
+                pushToolError(`Error: invalid input for tool '${tc.name}': ${validation.message || "validation failed"}`);
                 return null;
               }
               return withWorkspaceDefaults(toolDef, validation.args ?? nextArgs, this.session.workspace_path);
@@ -259,7 +272,7 @@ export class Engine {
               const nextSandbox = checkSandboxPolicy(this.config, nextCtx);
               if (nextSandbox.decision === "deny") {
                 await emitRuntimeEvent(callbacks, { type: "approval_audit", data: { tool: tc.name, decision: "deny", reason: nextSandbox.reason } });
-                await pushToolError(`Tool '${tc.name}' was denied by sandbox: ${nextSandbox.reason}.`);
+                pushToolError(`Tool '${tc.name}' was denied by sandbox: ${nextSandbox.reason}.`);
                 return false;
               }
 
@@ -282,14 +295,14 @@ export class Engine {
                 data: { tool: tc.name, decision: approvedAfterMutation ? "allow" : "deny", reason: nextSandbox.reason },
               });
               if (!approvedAfterMutation) {
-                await pushToolError(`Tool '${tc.name}' was denied.`);
+                pushToolError(`Tool '${tc.name}' was denied.`);
                 return false;
               }
               return true;
             };
             let args = withWorkspaceDefaults(toolDef, tc.arguments as Record<string, unknown>, this.session.workspace_path);
             const normalizedArgs = await normalizeArgs(args);
-            if (!normalizedArgs) continue;
+            if (!normalizedArgs) return earlyOutcome ?? makeToolErrorOutcome(tc, `Error: invalid input for tool '${tc.name}': validation failed`);
             args = normalizedArgs;
             const preHook = await fireHooks("PreToolUse", {
               tool_name: tc.name,
@@ -299,26 +312,19 @@ export class Engine {
             });
             await emitRuntimeEvent(callbacks, { type: "hook", data: { event: "PreToolUse", tool: tc.name, ...preHook } });
             if (preHook.decision === "deny") {
-              const deny = `Tool '${tc.name}' was denied by hook: ${preHook.message || "no reason provided"}.`;
-              const tr: ToolResult = {
-                tool_call_id: tc.id, name: tc.name, content: deny, is_error: true,
-              };
-              recordToolResult(tr);
-              turnToolResults.push(tr);
-              turnToolCalls.push(tc);
-              await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: deny.slice(0, 200) });
-              continue;
+              return makeToolErrorOutcome(tc, `Tool '${tc.name}' was denied by hook: ${preHook.message || "no reason provided"}.`);
             }
             if (preHook.modified_input) {
               args = withWorkspaceDefaults(toolDef, { ...args, ...preHook.modified_input }, this.session.workspace_path);
               const revalidatedArgs = await normalizeArgs(args);
-              if (!revalidatedArgs) continue;
+              if (!revalidatedArgs) return earlyOutcome ?? makeToolErrorOutcome(tc, `Error: invalid input for tool '${tc.name}': validation failed`);
               args = revalidatedArgs;
             }
-            if (!(await authorizeArgs(args))) continue;
-            // Map argument names (Python snake_case → JS camelCase already handled by Zod/JSON parsing)
+            if (!(await authorizeArgs(args))) {
+              return earlyOutcome ?? makeToolErrorOutcome(tc, `Tool '${tc.name}' was denied.`);
+            }
             const toolStart = Date.now();
-            resultContent = await toolDef.execute(args, {
+            let resultContent = await toolDef.execute(args, {
               signal: options.signal,
               toolCallId: tc.id,
               sessionId: this.session.id,
@@ -349,57 +355,114 @@ export class Engine {
               maxChars: toolDef.maxResultSizeChars,
             });
             const artifactIds = [...new Set([...originalArtifactIds, ...budgeted.artifactIds])];
-            const tr: ToolResult = {
+            const result: ToolResult = {
               tool_call_id: tc.id, name: tc.name, content: budgeted.content, is_error: isError,
             };
             const rendered = toolDef.renderResult?.(budgeted.replaced ? budgeted.content : resultContent, args);
             const metadata = getToolUseRuntimeMetadata(toolDef, args, budgeted.replaced ? budgeted.content : resultContent);
-            recordToolResult(tr);
-            turnToolResults.push(tr);
-            turnToolCalls.push(tc);
             const stats = this.tools.recordCall(tc.name, !isError, Date.now() - toolStart);
             const degraded = isError ? this.tools.degradeIfUnhealthy(tc.name, this.config.tool_failure_degrade_threshold) : null;
             await emitRuntimeEvent(callbacks, { type: "tool_stats", data: { stats, degraded } });
-            await emitRuntimeEvent(callbacks, {
-              type: "tool_result",
-              data: tr,
-              artifact_ids: artifactIds,
+            return {
+              toolCall: tc,
+              result,
+              artifactIds,
               preview: rendered?.preview ?? (budgeted.replaced ? budgeted.content : resultContent),
               rendered,
               metadata,
-            });
-            for (const id of artifactIds) turnArtifactIds.add(id);
-            const postHook = await fireHooks("PostToolUse", {
-              tool_name: tc.name,
-              tool_input: args,
-              tool_result: resultContent,
-              session_id: this.session.id,
-              cwd: this.session.workspace_path,
-            });
-            await emitRuntimeEvent(callbacks, { type: "hook", data: { event: "PostToolUse", tool: tc.name, ...postHook } });
+              postHook: { toolName: tc.name, args, resultContent },
+            };
           } catch (e: any) {
             if (this.interrupted || options.signal?.aborted || isAbortLikeError(e)) {
               this.interrupted = true;
               const reason = options.signal?.aborted ? "abort requested" : "interrupt requested";
               const tr = interruptedToolResult(tc, reason);
-              recordToolResult(tr);
-              turnToolResults.push(tr);
-              turnToolCalls.push(tc);
-              await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: tr.content });
-              break;
+              return { toolCall: tc, result: tr, preview: tr.content, interrupted: true };
             }
             const err = `Error executing ${tc.name}: ${e.message}`;
-            const tr: ToolResult = {
-              tool_call_id: tc.id, name: tc.name, content: err, is_error: true,
-            };
-            recordToolResult(tr);
-            turnToolResults.push(tr);
-            turnToolCalls.push(tc);
             const stats = this.tools.recordCall(tc.name, false, 0);
             const degraded = this.tools.degradeIfUnhealthy(tc.name, this.config.tool_failure_degrade_threshold);
             await emitRuntimeEvent(callbacks, { type: "tool_stats", data: { stats, degraded } });
-            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: err.slice(0, 200) });
+            return makeToolErrorOutcome(tc, err);
           }
+        };
+
+        const commitToolOutcome = async (outcome: ToolExecutionOutcome): Promise<void> => {
+          recordToolResult(outcome.result);
+          turnToolResults.push(outcome.result);
+          turnToolCalls.push(outcome.toolCall);
+          await emitRuntimeEvent(callbacks, {
+            type: "tool_result",
+            data: outcome.result,
+            artifact_ids: outcome.artifactIds,
+            preview: outcome.preview,
+            rendered: outcome.rendered,
+            metadata: outcome.metadata,
+          });
+          for (const id of outcome.artifactIds || []) turnArtifactIds.add(id);
+          if (outcome.postHook) {
+            const postHook = await fireHooks("PostToolUse", {
+              tool_name: outcome.postHook.toolName,
+              tool_input: outcome.postHook.args,
+              tool_result: outcome.postHook.resultContent,
+              session_id: this.session.id,
+              cwd: this.session.workspace_path,
+            });
+            await emitRuntimeEvent(callbacks, { type: "hook", data: { event: "PostToolUse", tool: outcome.postHook.toolName, ...postHook } });
+          }
+          if (outcome.interrupted) this.interrupted = true;
+        };
+
+        const runToolBatch = async (batch: ToolCall[]): Promise<void> => {
+          if (!batch.length) return;
+          const outcomes = batch.length === 1
+            ? [await executeToolCall(batch[0])]
+            : await Promise.all(batch.map(tc => executeToolCall(tc)));
+          for (const outcome of outcomes) {
+            await commitToolOutcome(outcome);
+          }
+        };
+
+        const isParallelBatchCandidate = (tc: ToolCall): boolean => {
+          const toolDef = this.tools.lookup(tc.name);
+          if (!toolDef || !this.prefix.hasTool(tc.name) || !allowedToolNames.has(tc.name)) return false;
+          if (toolDef.permission !== PermissionLevel.ALWAYS_ALLOW || toolDef.readOnly !== true) return false;
+          const args = withWorkspaceDefaults(toolDef, tc.arguments as Record<string, unknown>, this.session.workspace_path);
+          return isToolConcurrencySafe(toolDef, args);
+        };
+
+        let toolCallIndex = 0;
+        while (toolCallIndex < response.tool_calls.length) {
+          if (this.interrupted) break;
+          const tc = response.tool_calls[toolCallIndex];
+          if (turnToolCalls.length >= this.config.tool_call_budget_per_turn) {
+            const err = `Error: tool call budget exceeded for this turn (${this.config.tool_call_budget_per_turn}).`;
+            const tr: ToolResult = { tool_call_id: tc.id, name: tc.name, content: err, is_error: true };
+            recordToolResult(tr);
+            turnToolCalls.push(tc);
+            turnToolResults.push(tr);
+            await emitRuntimeEvent(callbacks, { type: "tool_budget_exceeded", data: { tool: tc.name, budget: this.config.tool_call_budget_per_turn } });
+            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: err.slice(0, 200) });
+            this.interrupted = true;
+            break;
+          }
+
+          if (!isParallelBatchCandidate(tc)) {
+            await runToolBatch([tc]);
+            toolCallIndex++;
+            continue;
+          }
+
+          const batch: ToolCall[] = [];
+          while (
+            toolCallIndex < response.tool_calls.length
+            && turnToolCalls.length + batch.length < this.config.tool_call_budget_per_turn
+            && isParallelBatchCandidate(response.tool_calls[toolCallIndex])
+          ) {
+            batch.push(response.tool_calls[toolCallIndex]);
+            toolCallIndex++;
+          }
+          await runToolBatch(batch);
         }
         if (this.interrupted) {
           await addInterruptedToolResults(response.tool_calls, options.signal?.aborted ? "abort requested" : "interrupt requested");
@@ -424,11 +487,32 @@ export class Engine {
     }
   }
 
+  private async emitContextIntervention(callbacks: UICallbacks | undefined, intervention: ContextIntervention): Promise<void> {
+    await emitRuntimeEvent(callbacks, { type: "context_intervention", data: intervention });
+    if (intervention.compaction?.prefix_invalidated) {
+      await emitRuntimeEvent(callbacks, {
+        type: "prefix_invalidated",
+        data: {
+          reason: intervention.compaction.prefix_invalidation_reason || "context_compaction",
+          boundary_id: intervention.compaction.boundary_id,
+          compaction: {
+            actions: intervention.compaction.actions,
+            finalTokens: intervention.compaction.finalTokens,
+            original_tokens: intervention.compaction.original_tokens,
+            removed_messages: intervention.compaction.removed_messages,
+            preserved_messages: intervention.compaction.preserved_messages,
+            summary_message_name: intervention.compaction.summary_message_name,
+          },
+        },
+      });
+    }
+  }
+
   private async callApi(
     schemas: Record<string, unknown>[],
     callbacks?: UICallbacks,
     signal?: AbortSignal,
-  ): Promise<{ content: string; reasoning_content: string | null; tool_calls: ToolCall[]; finish_reason: string; usage: UsageTelemetry | null }> {
+  ): Promise<EngineModelResponse> {
     let content = "";
     let reasoning = "";
     const toolCalls: ToolCall[] = [];
@@ -497,7 +581,7 @@ export class Engine {
   }
 
   requestTokenCount(): number {
-    return estimateMessagesTokens(this.requestMessages());
+    return estimateRequestTokens(this.requestMessages(), this.prefix.toolSchemas());
   }
 
   private async maybeRunPostEditDiagnostics(toolName: string, args: Record<string, unknown>): Promise<string | null> {
@@ -575,6 +659,42 @@ function resolveActiveMode(config: Config, session: Session, requestedMode: Base
 function isAbortLikeError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return error.name === "AbortError" || /aborted|abort/i.test(error.message);
+}
+
+function isPromptTooLongError(error: unknown): boolean {
+  const value = error as {
+    code?: unknown;
+    type?: unknown;
+    status?: unknown;
+    statusCode?: unknown;
+    error?: { code?: unknown; type?: unknown; message?: unknown };
+  };
+  const code = typeof value?.code === "string"
+    ? value.code
+    : typeof value?.error?.code === "string" ? value.error.code : "";
+  const type = typeof value?.type === "string"
+    ? value.type
+    : typeof value?.error?.type === "string" ? value.error.type : "";
+  const status = typeof value?.status === "number"
+    ? value.status
+    : typeof value?.statusCode === "number" ? value.statusCode : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  const nestedMessage = typeof value?.error?.message === "string" ? value.error.message : "";
+  const combined = `${code} ${type} ${message} ${nestedMessage}`.toLowerCase();
+  return combined.includes("context_length_exceeded")
+    || combined.includes("maximum context length")
+    || combined.includes("context length")
+    || combined.includes("prompt is too long")
+    || combined.includes("prompt too long")
+    || combined.includes("too many tokens")
+    || combined.includes("token limit")
+    || combined.includes("max context")
+    || (status === 400 && combined.includes("tokens"));
+}
+
+function promptTooLongReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return `provider rejected prompt as too long: ${message}`;
 }
 
 function withWorkspaceDefaults(toolDef: ToolDef, args: Record<string, unknown>, workspacePath: string): Record<string, unknown> {

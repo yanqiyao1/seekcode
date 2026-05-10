@@ -9,6 +9,11 @@ export class AssistantStream {
   private lineCount = 0;
   private raw = "";
 
+  get mutableStartLine(): number | null {
+    if (!this.active) return null;
+    return this.startLine + this.completeLogicalLineCount();
+  }
+
   append(transcript: Transcript, text: string): void {
     if (!this.active) {
       const reusingBlankLine = Boolean(transcript.lines.length && !transcript.lines.at(-1)?.text.trim());
@@ -30,5 +35,9 @@ export class AssistantStream {
     this.startLine = 0;
     this.lineCount = 0;
     this.raw = "";
+  }
+
+  private completeLogicalLineCount(): number {
+    return this.raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").length - 1;
   }
 }

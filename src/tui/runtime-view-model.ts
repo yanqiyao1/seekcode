@@ -107,6 +107,14 @@ export class TuiRuntimeViewModel {
     return this.state.activeToolCount;
   }
 
+  get mutableTranscriptStartLine(): number | null {
+    const assistantStart = this.assistantStream.mutableStartLine;
+    const toolStart = this.activeToolLines.earliestLine();
+    if (assistantStart === null) return toolStart ?? null;
+    if (toolStart === undefined) return assistantStart;
+    return Math.min(assistantStart, toolStart);
+  }
+
   getSnapshot(): Readonly<TuiRuntimeViewState> {
     return this.store.getState();
   }

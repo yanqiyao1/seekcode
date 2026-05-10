@@ -1317,6 +1317,138 @@ describe("engine", () => {
     ]));
   });
 
+  it("runs adjacent read-only concurrency-safe tool calls in parallel and commits results in call order", async () => {
+    const first = deferred<void>();
+    const second = deferred<void>();
+    const started: string[] = [];
+    getRegistry().register({
+      name: "read_one",
+      description: "read one",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      readOnly: true,
+      execute: async () => {
+        started.push("read_one");
+        await first.promise;
+        return "one";
+      },
+    });
+    getRegistry().register({
+      name: "read_two",
+      description: "read two",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      readOnly: true,
+      execute: async () => {
+        started.push("read_two");
+        await second.promise;
+        return "two";
+      },
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [
+        { id: "call_1", name: "read_one", arguments: {} },
+        { id: "call_2", name: "read_two", arguments: {} },
+      ] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const turn = engine.runTurn("go", getMode("agent"));
+    await waitFor(() => started.length === 2);
+    second.resolve();
+    await sleep(10);
+    expect(session.messages.filter(message => message.role === "tool")).toHaveLength(0);
+    first.resolve();
+    const result = await turn;
+
+    expect(started).toEqual(["read_one", "read_two"]);
+    expect(result.tool_results.map(result => result.tool_call_id)).toEqual(["call_1", "call_2"]);
+    expect(session.messages.filter(message => message.role === "tool").map(message => message.tool_call_id)).toEqual(["call_1", "call_2"]);
+  });
+
+  it("keeps write and unsafe tool calls as serial barriers between parallel-safe reads", async () => {
+    const readBefore = deferred<void>();
+    const write = deferred<void>();
+    const readAfter = deferred<void>();
+    const started: string[] = [];
+    getRegistry().register({
+      name: "read_before",
+      description: "read before",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      readOnly: true,
+      execute: async () => {
+        started.push("read_before");
+        await readBefore.promise;
+        return "before";
+      },
+    });
+    getRegistry().register({
+      name: "write_tool",
+      description: "write",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: false,
+      readOnly: false,
+      execute: async () => {
+        started.push("write_tool");
+        await write.promise;
+        return "wrote";
+      },
+    });
+    getRegistry().register({
+      name: "read_after",
+      description: "read after",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      readOnly: true,
+      execute: async () => {
+        started.push("read_after");
+        await readAfter.promise;
+        return "after";
+      },
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [
+        { id: "call_1", name: "read_before", arguments: {} },
+        { id: "call_2", name: "write_tool", arguments: {} },
+        { id: "call_3", name: "read_after", arguments: {} },
+      ] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const turn = engine.runTurn("go", getMode("agent"));
+    await waitFor(() => started.includes("read_before"));
+    expect(started).toEqual(["read_before"]);
+    readBefore.resolve();
+    await waitFor(() => started.includes("write_tool"));
+    expect(started).toEqual(["read_before", "write_tool"]);
+    write.resolve();
+    await waitFor(() => started.includes("read_after"));
+    expect(started).toEqual(["read_before", "write_tool", "read_after"]);
+    readAfter.resolve();
+    const result = await turn;
+
+    expect(result.tool_results.map(result => result.tool_call_id)).toEqual(["call_1", "call_2", "call_3"]);
+  });
+
   it("stores oversized tool results as artifacts and sends only a preview to the model", async () => {
     const largeOutput = [
       "head-marker",
@@ -2335,7 +2467,7 @@ describe("engine", () => {
     history.addSystem("system");
     history.addUser("inspect");
     history.addAssistant("calling tool", [{ id: "call_1", name: "read", arguments: { path: "big.txt" } }], null);
-    const toolPayload = "A".repeat(1200);
+    const toolPayload = tokenFlood("tool_payload", 260);
     history.addToolResult({ tool_call_id: "call_1", name: "read", content: toolPayload, is_error: false });
     for (let i = 0; i < 8; i++) {
       history.addUser(`follow up ${i}`);
@@ -2349,7 +2481,7 @@ describe("engine", () => {
     const summary = session.messages.find(message => message.name === "context_summary");
     expect(toolMessage?.content).toBe(toolPayload);
     expect(summary?.content).toContain("tool read [ok]");
-    expect(summary?.content).toContain("AAA");
+    expect(summary?.content).toContain("tool_payload_0");
   });
 
   it("emits prefix_invalidated after compaction and sends a projected request", async () => {
@@ -2357,7 +2489,7 @@ describe("engine", () => {
     const history = new ConversationHistory(session);
     history.addSystem("system");
     for (let i = 0; i < 16; i++) {
-      history.addUser(`old user ${i} ${"x".repeat(240)}`);
+      history.addUser(`old user ${i} ${tokenFlood(`old_user_${i}`, 160)}`);
       history.addAssistant(`old assistant ${i}`);
     }
     const client = new FakeClient([
@@ -2381,6 +2513,36 @@ describe("engine", () => {
     expect(requestMessages.some(message => message.role === "user" && message.content?.includes("old user 0"))).toBe(false);
     expect(requestMessages.some(message => message.role === "user" && message.content?.includes("old user 15"))).toBe(true);
     expect(requestMessages.some(message => message.role === "user" && message.content === "go")).toBe(true);
+  });
+
+  it("compacts and retries when the provider rejects a prompt as too long", async () => {
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    for (let i = 0; i < 16; i++) {
+      history.addUser(`old user ${i} ${"x".repeat(320)}`);
+      history.addAssistant(`old assistant ${i}`, null, "reasoning".repeat(40));
+    }
+    const client = new PromptTooLongThenOkClient();
+    const events: EngineRuntimeEvent[] = [];
+    const engine = new Engine({ ...testConfig(), context_limit: 100_000 }, session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("continue", getMode("agent"), {
+      onRuntimeEvent: async (event) => { events.push(event); },
+    });
+
+    const apiStarts = events.filter(event => event.type === "api_call_start");
+    const secondRequestMessages = client.calls[1].messages as Array<{ name?: string; role?: string; content?: string }>;
+    expect(result.iterations).toBe(1);
+    expect(client.calls).toHaveLength(2);
+    expect(session.messages.some(message => message.name === "context_compaction_boundary")).toBe(true);
+    expect(session.messages.some(message => message.name === "context_verification")).toBe(true);
+    expect(events.some(event => event.type === "prefix_invalidated")).toBe(true);
+    expect(apiStarts[0].data.prompt_recovery).toBeUndefined();
+    expect(apiStarts[1].data).toMatchObject({ retry: 1, prompt_recovery: true });
+    expect(secondRequestMessages.some(message => message.name === "context_compaction_boundary")).toBe(true);
+    expect(secondRequestMessages.some(message => message.name === "context_summary")).toBe(true);
+    expect(secondRequestMessages.some(message => message.role === "user" && message.content?.includes("old user 0"))).toBe(false);
   });
 
   it("keeps request projection anchored to only the latest compaction boundary after repeated compactions", () => {
@@ -5143,6 +5305,20 @@ function writeTarString(buffer: Buffer, offset: number, length: number, value: s
   buffer.write(value.slice(0, length), offset, Math.min(length, Buffer.byteLength(value)), "utf-8");
 }
 
+function tokenFlood(prefix: string, count: number): string {
+  return Array.from({ length: count }, (_, index) => `${prefix}_${index}`).join(" ");
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value?: T | PromiseLike<T>) => void } {
+  let resolve!: (value?: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>(nextResolve => { resolve = nextResolve; });
+  return { promise, resolve };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 class FakeClient extends DeepSeekClient {
   private batches: StreamEvent[][];
   lastSignal?: AbortSignal;
@@ -5161,6 +5337,24 @@ class FakeClient extends DeepSeekClient {
       if (options?.signal?.aborted) throw new DOMException("Request aborted", "AbortError");
       yield event;
     }
+  }
+}
+
+class PromptTooLongThenOkClient extends DeepSeekClient {
+  calls: Array<{ messages: any; tools: any; options?: { signal?: AbortSignal } }> = [];
+
+  constructor() {
+    super({ apiKey: "test", baseUrl: "http://localhost", model: "test" });
+  }
+
+  override async *send(messages?: any, tools?: any, options?: { signal?: AbortSignal }): AsyncIterable<StreamEvent> {
+    this.calls.push({ messages, tools, options });
+    if (this.calls.length === 1) {
+      const error = new Error("maximum context length exceeded");
+      (error as any).code = "context_length_exceeded";
+      throw error;
+    }
+    yield { type: "done", finish_reason: "stop", usage: null, content: "recovered", reasoning_content: null, tool_calls: [] };
   }
 }
 

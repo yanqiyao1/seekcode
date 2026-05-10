@@ -277,6 +277,20 @@ describe("AssistantStream", () => {
 
     expect(transcript.lines.map(line => stripAnsi(line.text))).toEqual(["hello"]);
   });
+
+  it("reports only the unfinished logical line as mutable", () => {
+    const transcript = new Transcript();
+    const stream = new AssistantStream();
+
+    stream.append(transcript, "one\ntwo");
+    expect(stream.mutableStartLine).toBe(1);
+
+    stream.append(transcript, "\nthree");
+    expect(stream.mutableStartLine).toBe(2);
+
+    stream.reset();
+    expect(stream.mutableStartLine).toBeNull();
+  });
 });
 
 describe("TuiRuntimeViewModel", () => {
@@ -1759,6 +1773,15 @@ describe("TuiLayout", () => {
     expect(transcript.wrappedRows(3).map(stripAnsi)).toEqual(["abc", "def"]);
   });
 
+  it("can map transcript line indexes to wrapped row offsets", () => {
+    const transcript = new Transcript();
+    transcript.append("abcdef\nxy");
+
+    expect(transcript.wrappedRowOffsetForLine(0, 3)).toBe(0);
+    expect(transcript.wrappedRowOffsetForLine(1, 3)).toBe(2);
+    expect(transcript.wrappedRowOffsetForLine(2, 3)).toBe(3);
+  });
+
   it("moves inline cursor below the rendered TUI on finish", () => {
     const originalWrite = process.stdout.write;
     const originalColumns = process.stdout.columns;
@@ -1808,6 +1831,69 @@ describe("TuiLayout", () => {
       const output = chunks.join("");
       expect(output).not.toContain("\x1b[J");
       expect(output).toContain("\x1b[2K");
+    } finally {
+      process.stdout.write = originalWrite;
+      process.stdout.columns = originalColumns;
+      process.stdout.rows = originalRows;
+    }
+  });
+
+  it("does not commit mutable streamed markdown rows to inline scrollback", () => {
+    const originalWrite = process.stdout.write;
+    const originalColumns = process.stdout.columns;
+    const originalRows = process.stdout.rows;
+    const chunks: string[] = [];
+    const committedRows = () => chunks
+      .filter(chunk => chunk.startsWith("\r\x1b[2K") && chunk.endsWith("\n"))
+      .map(chunk => stripAnsi(chunk).replace(/[\r\n]/g, ""));
+
+    process.stdout.columns = 24;
+    process.stdout.rows = 6;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      chunks.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      const transcript = new Transcript();
+      const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+      const layout = new TuiLayout(transcript, "inline");
+      const render = () => layout.render({
+        footer: "─\nstatus",
+        prompt: "> ",
+        input: "",
+        mutableTranscriptStartLine: view.mutableTranscriptStartLine,
+      });
+
+      view.beginTurn();
+      view.handleRuntimeEvent({
+        type: "content_delta",
+        data: {
+          text: [
+            "方案对比一览",
+            "| 方案 | 核心思路 | 是否需 retrain | 是否需 external verifier | 新颖度 | 风险 |",
+            "|---|---|---|---|---|---|",
+            "| A: Lookahead Branch | divergence 点做 3-5 token 前瞻+语法筛选 | ❌",
+          ].join("\n"),
+        },
+      } as any);
+      render();
+      view.handleRuntimeEvent({
+        type: "content_delta",
+        data: { text: " | ❌ | 中 | 语法筛选可能误杀，需要保守回退；".repeat(4) },
+      } as any);
+      render();
+
+      expect(view.mutableTranscriptStartLine).not.toBeNull();
+      const beforeFinish = committedRows().join("\n");
+      expect(committedRows().length).toBeGreaterThan(0);
+      expect(beforeFinish).toContain("方案对比");
+      expect(beforeFinish).not.toContain("Lookahead Branch");
+
+      chunks.length = 0;
+      view.finishTurn();
+      render();
+
+      expect(committedRows().join("\n")).toContain("Lookahead Branch");
     } finally {
       process.stdout.write = originalWrite;
       process.stdout.columns = originalColumns;
@@ -1883,8 +1969,10 @@ describe("ActiveToolLines", () => {
     lines.start("call-3", 9);
 
     expect(lines.current("call-2")).toBe(7);
+    expect(lines.earliestLine()).toBe(3);
     expect(lines.finish("call-1")).toBe(3);
     expect(lines.finish("call-1")).toBeUndefined();
+    expect(lines.earliestLine()).toBe(7);
     expect(lines.finish("call-3")).toBe(9);
   });
 });
