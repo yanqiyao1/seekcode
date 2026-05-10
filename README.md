@@ -1,6 +1,8 @@
 # Seek Code
 
-Seek Code 是一个专为 DeepSeek 打造的终端 Code Agent。它不是通用聊天壳，而是围绕 `deepseek-v4-pro` / `deepseek-v4-flash`、长上下文、工具调用、工程验证和本地安全策略设计的一整套开发运行时。
+[简体中文](./README.zh-CN.md)
+
+Seek Code is a DeepSeek-first terminal code agent. It is built around `deepseek-v4-pro` / `deepseek-v4-flash`, long-context engineering work, tool use, local verification, permissions, MCP, skills, tasks, rollback, and a server runtime.
 
 ```bash
 npm install -g seekcode
@@ -8,24 +10,24 @@ export DEEPSEEK_API_KEY="sk-your-api-key"
 seek
 ```
 
-Node.js 需要 `>=22`。
+Node.js `>=22` is required.
 
-## 为什么专为 DeepSeek
+## Built For DeepSeek
 
-- 默认模型是 `deepseek-v4-pro`，默认 fast model 是 `deepseek-v4-flash`。
-- 默认上下文、reasoning、流式 thinking、工具循环和 token/cost 统计都按 DeepSeek 工作方式调优。
-- 支持 DeepSeek 官方、DeepSeek CN、NVIDIA NIM、OpenRouter、Novita、Fireworks、SGLang 等 DeepSeek 部署方式。
-- CLI、TUI、权限、MCP、Skills、任务、回滚和 Server 能力都围绕“在真实仓库里长时间工作”设计。
+- Defaults to `deepseek-v4-pro`; the fast companion model defaults to `deepseek-v4-flash`.
+- Context limits, reasoning effort, thinking streams, tool loops, token usage, and cost reporting are tuned for DeepSeek-style coding work.
+- Supported providers: `deepseek`, `deepseek-cn`, `nvidia-nim`, `openrouter`, `novita`, `fireworks`, `sglang`.
+- Designed for real repository sessions, not just short chat prompts.
 
-## 快速使用
+## Quick Start
 
-交互式开发：
+Interactive mode:
 
 ```bash
 seek
 ```
 
-一次性任务：
+One-shot tasks:
 
 ```bash
 seek "review the current diff and suggest the smallest safe fix"
@@ -34,7 +36,7 @@ seek --mode agent "fix the failing tests and run the relevant verification"
 seek --mode yolo "format the repo and run the full test suite"
 ```
 
-切换模型、provider 和 reasoning：
+Model, provider, and reasoning:
 
 ```bash
 seek --model deepseek-v4-pro -r high
@@ -42,61 +44,61 @@ seek --provider deepseek-cn
 seek --provider sglang --base-url http://localhost:30000/v1 --model deepseek-v4-pro
 ```
 
-运行本地 HTTP/SSE Agent Server：
+Local HTTP/SSE server:
 
 ```bash
 seek serve --host 127.0.0.1 --port 8080
 ```
 
-检查或升级：
+Update:
 
 ```bash
 seek update --check
 seek update -y
 ```
 
-## 已支持的完整功能
+## Feature Support
 
-| 能力 | 支持内容 | 常用方式 |
+| Area | Supported now | How to use |
 |---|---|---|
-| 交互式 TUI | inline scrollback、fullscreen、状态栏、实时工具状态、审批弹窗、Tab 补全 | `seek`、`--alt-screen`、`--no-alt-screen` |
-| 模式控制 | `plan` 只读规划、`agent` 审批驱动、`yolo` 高信任快速执行 | `--mode plan`、`/agent`、`/yolo` |
-| 代码工具 | 读写文件、搜索、glob、patch、编辑、Git 状态和 diff | 直接描述任务，Agent 自动调用工具 |
-| Shell 与验证 | 前台命令、后台 jobs、等待/取消、verification gate、LSP diagnostics | `/jobs`、让 Agent “run tests” |
-| Web | 搜索和抓取 URL，支持多搜索源、域名 allow/block、代理 | 让 Agent “search web”、配置 `[web]` |
-| MCP | stdio/SSE MCP Server，工具自动注册为 `mcp_*` | `/mcp add ...`、`/mcp reload` |
-| Skills | `SKILL.md` 工作流、安装、更新、信任、项目/全局发现 | `/skills`、`/skill <name>` |
-| 任务系统 | durable tasks、checklist、plan、notes、长任务状态 | `/tasks`、Agent 工具 `task_create` |
-| Artifacts | 保存长日志、诊断、patch、证据，避免污染上下文 | Agent 自动创建，或使用 artifact 工具 |
-| Sessions | 会话保存、加载、删除、恢复工作区上下文 | `/save`、`/sessions`、`/load` |
-| 回滚 | workspace snapshot，支持查看和恢复 | `/restore` |
-| 子 Agent | bounded worker、并行调查、状态查询 | Agent 工具 `spawn_agent` |
-| Server | HTTP/SSE threads、sessions、runtime events、skills API | `seek serve` |
+| Terminal UX | Inline scrollback, fullscreen TUI, status line, live tool activity, approvals, Tab completion | `seek`, `--alt-screen`, `--no-alt-screen` |
+| Modes | Read-only planning, approval-driven agent mode, high-trust yolo mode | `--mode plan`, `/agent`, `/yolo` |
+| Code tools | Read/write/edit files, search, glob, patches, git status/diff/log | Describe the task; the agent calls tools |
+| Shell and verification | Foreground commands, background jobs, wait/cancel, verification gates, LSP diagnostics | Ask the agent to run tests; inspect `/jobs` |
+| Web | Search and fetch URLs, multiple search engines, allow/block domains, proxy config | Ask the agent to search; configure `[web]` |
+| MCP | stdio/SSE MCP servers exposed as `mcp_*` tools | `/mcp add ...`, `/mcp reload` |
+| Skills | `SKILL.md` workflows, install/update/trust, project/global discovery | `/skills`, `/skill <name>` |
+| Tasks | Durable tasks, checklist, plan, notes, long-running task state | `/tasks`; agent tools such as `task_create` |
+| Artifacts | Store long logs, diagnostics, patches, and evidence outside the live context | Created by tools or artifact commands |
+| Sessions | Save, list, load, delete, and resume work | `/save`, `/sessions`, `/load` |
+| Rollback | Workspace snapshots and restore flow | `/restore` |
+| Sub-agents | Bounded workers and parallel investigation | Agent tool `spawn_agent` |
+| Server | HTTP/SSE threads, sessions, runtime events, skills API | `seek serve` |
 
-## 常用功能示例
+## Common Usage
 
-模式与上下文：
-
-```text
-/plan                 # 切到只读规划
-/agent                # 切到常规开发模式
-/yolo                 # 切到高信任快速执行
-/tokens               # 查看 token 使用
-/cost                 # 查看成本
-/clear                # 清空当前上下文
-```
-
-会话与恢复：
+Modes and context:
 
 ```text
-/save                 # 保存当前会话
-/sessions             # 列出会话
-/load <session-id>    # 加载会话
-/delete <session-id>  # 删除会话
-/restore              # 查看并恢复 workspace snapshot
+/plan                 # switch to read-only planning
+/agent                # switch to normal agent mode
+/yolo                 # switch to high-trust execution
+/tokens               # show token usage
+/cost                 # show cost
+/clear                # clear current context
 ```
 
-MCP：
+Sessions and recovery:
+
+```text
+/save                 # save current session
+/sessions             # list sessions
+/load <session-id>    # load a session
+/delete <session-id>  # delete a session
+/restore              # list and restore workspace snapshots
+```
+
+MCP:
 
 ```text
 /mcp list
@@ -105,7 +107,7 @@ MCP：
 /mcp reload
 ```
 
-也可以写进配置文件：
+MCP can also be configured in TOML:
 
 ```toml
 [[mcp_servers]]
@@ -116,17 +118,17 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 enabled = true
 ```
 
-Skills：
+Skills:
 
 ```text
-/skills                       # 查看本地 skills
-/skills remote                # 查看远程 registry
+/skills
+/skills remote
 /skill install github:org/repo
 /skill trust my-skill
-/skill my-skill               # 下一轮使用这个 skill
+/skill my-skill
 ```
 
-配置诊断：
+Configuration diagnostics:
 
 ```bash
 seek config validate
@@ -135,28 +137,28 @@ seek config migrate --target user
 seek config migrate --target project --dry-run
 ```
 
-## 配置与默认路径
+## Configuration And Paths
 
-配置优先级：
+Configuration precedence:
 
 ```text
-默认值 < 用户配置 < 项目配置 < 环境变量 < CLI 参数
+defaults < user config < project config < environment variables < CLI flags
 ```
 
-| 内容 | 默认位置 | 如何更改 |
+| Data | Default path | Override |
 |---|---|---|
-| 用户配置 | `~/.seekcode/config.toml` | 直接编辑文件，或用环境变量/CLI 覆盖 |
-| 项目配置 | `./.seekcode/config.toml` | 放在当前仓库，覆盖用户配置 |
+| User config | `~/.seekcode/config.toml` | Edit the file, env vars, or CLI flags |
+| Project config | `./.seekcode/config.toml` | Put it in the current repo |
 | Sessions | `${XDG_DATA_HOME:-~/.local/share}/seekcode/sessions` | `SEEKCODE_SESSIONS_DIR=/path` |
 | Artifacts | `${XDG_DATA_HOME:-~/.local/share}/seekcode/artifacts` | `SEEKCODE_ARTIFACTS_DIR=/path` |
 | Tasks | `${XDG_DATA_HOME:-~/.local/share}/seekcode/tasks/tasks.json` | `SEEKCODE_TASKS_DIR=/path` |
 | Jobs | `${XDG_DATA_HOME:-~/.local/share}/seekcode/jobs` | `SEEKCODE_JOBS_DIR=/path` |
-| Runtime Server 数据 | `${XDG_DATA_HOME:-~/.local/share}/seekcode/runtime` | `SEEKCODE_RUNTIME_DIR=/path` |
-| 全局 Skills | `~/.seekcode/skills` | 配置 `skills_dir` 或 `DEEPSEEK_SKILLS_DIR` |
-| 项目 Skills | `./.seekcode/skills`、`./skills`、`./.agents/skills` | 放入这些目录即可被发现 |
-| 回滚快照 | `./.seekcode/side-git` | workspace-local，随仓库目录变化 |
+| Runtime server data | `${XDG_DATA_HOME:-~/.local/share}/seekcode/runtime` | `SEEKCODE_RUNTIME_DIR=/path` |
+| Global skills | `~/.seekcode/skills` | `skills_dir` or `DEEPSEEK_SKILLS_DIR` |
+| Project skills | `./.seekcode/skills`, `./skills`, `./.agents/skills` | Put skills in those folders |
+| Rollback snapshots | `./.seekcode/side-git` | Workspace-local |
 
-常用配置示例：
+Common config:
 
 ```toml
 api_key = ""
@@ -185,7 +187,7 @@ allowed_domains = []
 blocked_domains = []
 ```
 
-常用环境变量：
+Common environment variables:
 
 ```bash
 export DEEPSEEK_API_KEY="sk-..."
@@ -197,19 +199,22 @@ export DEEPSEEK_TUI_ALTERNATE_SCREEN="never"
 export XDG_DATA_HOME="$HOME/.local/share"
 ```
 
-## 兼容性说明
+`SEEKCODE_*` data-directory overrides are preferred. Legacy `DEEPSEEK_*_DIR` overrides are still recognized for compatibility where supported.
 
-Seek Code 保持 DeepSeek-first 的默认体验，同时尽量兼容现有 Code Agent 生态：
+## Compatibility
 
-- 原生读取 `AGENTS.md`，并支持分层项目指令。
-- 兼容 Claude Code 指令文件：`CLAUDE.md`、`.claude/CLAUDE.md`。
-- 兼容 Claude Code markdown slash commands：发现项目和用户目录下的 `.claude/commands/**/*.md`，以 `/project:name` 或 `/user:name` 形式使用。
-- Skills 会扫描 `./.seekcode/skills`、`./skills`、`./.agents/skills`、`~/.seekcode/skills`，也兼容 `~/.agents/skills`、`~/.claude/skills`、`.deepseek/skills`。
-- MCP 使用通用 stdio/SSE server 配置，现有 MCP Server 通常可以直接接入。
-- 支持从旧 `.deepseek` 配置迁移：`seek config migrate --target user|project`。
-- 兼容性不会改变 Seek Code 的权限、sandbox 和 DeepSeek-first 工具策略；外部指令只作为项目上下文和命令扩展进入系统。
+Seek Code keeps DeepSeek-first defaults while supporting common code-agent conventions:
 
-## 开发
+- Native `AGENTS.md` support with layered project instructions.
+- Claude Code instruction compatibility: `CLAUDE.md` and `.claude/CLAUDE.md`.
+- Claude Code markdown slash commands from `.claude/commands/**/*.md`, exposed as `/project:name` or `/user:name`.
+- Skill discovery from `./.seekcode/skills`, `./skills`, `./.agents/skills`, `~/.seekcode/skills`, plus compatible `.agents`, `.claude`, and `.deepseek` skill paths.
+- Generic stdio/SSE MCP server configuration.
+- Migration from old `.deepseek` config paths via `seek config migrate --target user|project`.
+
+Compatibility files add project context and command expansion; they do not weaken Seek Code permissions, sandboxing, or DeepSeek-first tool policy.
+
+## Development
 
 ```bash
 npm install
