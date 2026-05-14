@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import { emitRuntimeEvent } from "../src/engine/events.js";
 import { generateTaskId, isActiveStatus, isTerminalStatus } from "../src/engine/task-lifecycle.js";
+import { RuntimeApiClient } from "../src/server/runtime-client.js";
+import { parseRuntimeSSEFrame, runtimeEventToSSE } from "../src/server/runtime-protocol.js";
 import { formatJob } from "../src/tools/jobs.js";
 import { runtimeItemToEngineRuntimeEvent, runtimeItemsToEngineRuntimeEvents, sessionMessagesToRuntimeEvents } from "../src/tui/runtime-replay.js";
 
@@ -179,6 +181,64 @@ describe("runtime event emission", () => {
 
   it("does nothing when no callbacks are registered", async () => {
     await expect(emitRuntimeEvent(undefined, { type: "content_delta", data: { text: "ok" } })).resolves.toBeUndefined();
+  });
+});
+
+describe("server runtime protocol", () => {
+  it("shares SSE event mapping outside HTTP handlers", () => {
+    const streamed = new Set<string>();
+
+    expect(runtimeEventToSSE({ type: "content_delta", data: { text: "ok" } }, streamed)).toEqual({
+      event: "content",
+      data: { text: "ok" },
+    });
+    expect(runtimeEventToSSE({ type: "tool_call_begin", data: { name: "read", tool_call_id: "call-1" } }, streamed)).toEqual({
+      event: "tool_call",
+      data: { name: "read", tool_call_id: "call-1" },
+    });
+    expect(runtimeEventToSSE({ type: "tool_call", data: { id: "call-1", name: "read", arguments: {} } }, streamed)).toBeNull();
+  });
+
+  it("parses persisted runtime events from SSE frames", () => {
+    const event = parseRuntimeSSEFrame({
+      id: "7",
+      event: "content",
+      data: JSON.stringify({
+        seq: 7,
+        thread_id: "thread-1",
+        event: "content",
+        data: { text: "ok" },
+        created_at: "2026-01-01T00:00:00.000Z",
+      }),
+    });
+
+    expect(event).toMatchObject({
+      seq: 7,
+      thread_id: "thread-1",
+      event: "content",
+      data: { text: "ok" },
+    });
+  });
+
+  it("streams runtime events through the shared API client parser", async () => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("id: 1\nevent: content\ndata: {\"seq\":1,\"thread_id\":\"thread-1\",\"event\":\"content\",\"data\":{\"text\":\"Hi\"},\"created_at\":\"now\"}\n\n"));
+        controller.close();
+      },
+    });
+    const client = new RuntimeApiClient({
+      baseUrl: "http://runtime.test",
+      fetchImpl: async () => new Response(body, { status: 200 }) as any,
+    });
+
+    const events = [];
+    for await (const event of client.streamThreadEvents("thread-1")) events.push(event);
+
+    expect(events).toMatchObject([
+      { seq: 1, thread_id: "thread-1", event: "content", data: { text: "Hi" } },
+    ]);
   });
 });
 

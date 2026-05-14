@@ -391,16 +391,20 @@ async function lspSymbols(args: Record<string, unknown>): Promise<string> {
     ? args.file.trim()
     : typeof args.path === "string" && args.path.trim() ? args.path.trim() : "";
   if (!file) return "Error: file is required.";
-  const symbols = getLspManager().documentSymbols(file, workdir);
-  return JSON.stringify({ file, workdir: resolve(workdir), backend: "local-fallback", symbols }, null, 2);
+  const result = await getLspManager().documentSymbolsWithBackend(file, workdir);
+  return JSON.stringify({ file, workdir: resolve(workdir), backend: result.backend, symbols: result.value }, null, 2);
 }
 
 async function lspDefinition(args: Record<string, unknown>): Promise<string> {
   const workdir = resolveWorkdir(args);
   const symbol = typeof args.symbol === "string" ? args.symbol.trim() : "";
   if (!symbol) return "Error: symbol is required.";
-  const matches = getLspManager().definition(symbol, workdir);
-  return JSON.stringify({ symbol, workdir: resolve(workdir), backend: "local-fallback", matches }, null, 2);
+  const file = typeof args.file === "string" && args.file.trim()
+    ? args.file.trim()
+    : typeof args.path === "string" && args.path.trim() ? args.path.trim() : undefined;
+  const line = args.line !== undefined ? Number(args.line) : undefined;
+  const result = await getLspManager().definitionWithBackend(symbol, workdir, { file, line, character: args.character });
+  return JSON.stringify({ symbol, workdir: resolve(workdir), backend: result.backend, matches: result.value }, null, 2);
 }
 
 async function lspHover(args: Record<string, unknown>): Promise<string> {
@@ -411,7 +415,8 @@ async function lspHover(args: Record<string, unknown>): Promise<string> {
   const line = Number(args.line);
   if (!file) return "Error: file is required.";
   if (!Number.isFinite(line) || line <= 0) return "Error: line must be a positive number.";
-  return getLspManager().hover(file, line, workdir);
+  const result = await getLspManager().hoverWithBackend(file, line, workdir, 2, args.character);
+  return result.value;
 }
 
 export async function runAutoDiagnostics(args: {
@@ -633,9 +638,18 @@ function validateLspFileArgs(args: Record<string, unknown>) {
 function validateLspDefinitionArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
-  const symbol = typeof workdirValidated.args.symbol === "string" ? workdirValidated.args.symbol.trim() : "";
+  const normalizedArgs = workdirValidated.args;
+  const symbol = typeof normalizedArgs.symbol === "string" ? normalizedArgs.symbol.trim() : "";
+  if (normalizedArgs.file !== undefined && typeof normalizedArgs.file !== "string") return { ok: false as const, message: "file must be a string." };
+  if (normalizedArgs.path !== undefined && typeof normalizedArgs.path !== "string") return { ok: false as const, message: "path must be a string." };
+  if (normalizedArgs.line !== undefined && ((typeof normalizedArgs.line !== "number" && typeof normalizedArgs.line !== "string") || !Number.isFinite(Number(normalizedArgs.line)) || Number(normalizedArgs.line) <= 0)) {
+    return { ok: false as const, message: "line must be a positive number." };
+  }
+  if (normalizedArgs.character !== undefined && ((typeof normalizedArgs.character !== "number" && typeof normalizedArgs.character !== "string") || !Number.isFinite(Number(normalizedArgs.character)) || Number(normalizedArgs.character) < 0)) {
+    return { ok: false as const, message: "character must be a non-negative number." };
+  }
   return symbol
-    ? { ok: true as const, args: { ...workdirValidated.args, symbol } }
+    ? { ok: true as const, args: { ...normalizedArgs, symbol, ...(normalizedArgs.line !== undefined ? { line: Number(normalizedArgs.line) } : {}) } }
     : { ok: false as const, message: "symbol is required." };
 }
 
@@ -644,6 +658,9 @@ function validateLspHoverArgs(args: Record<string, unknown>) {
   if (!fileValidated.ok) return fileValidated;
   if (args.line === undefined || (typeof args.line !== "number" && typeof args.line !== "string") || !Number.isFinite(Number(args.line)) || Number(args.line) <= 0) {
     return { ok: false as const, message: "line must be a positive number." };
+  }
+  if (args.character !== undefined && ((typeof args.character !== "number" && typeof args.character !== "string") || !Number.isFinite(Number(args.character)) || Number(args.character) < 0)) {
+    return { ok: false as const, message: "character must be a non-negative number." };
   }
   return { ok: true as const, args: { ...fileValidated.args, line: Number(args.line) } };
 }
@@ -898,11 +915,15 @@ export function registerDiagnosticsTools(): void {
   });
   registry.register({
     name: "lsp_definition",
-    description: "Find likely definitions of a symbol using the LSP facade with ripgrep/grep fallback.",
+    description: "Find definitions using a JSON-RPC language server when file position is provided, with ripgrep/grep fallback.",
     parameters: {
       type: "object",
       properties: {
         symbol: { type: "string" },
+        file: { type: "string", description: "Optional source file for precise LSP definition lookup." },
+        path: { type: "string", description: "Alias for file." },
+        line: { type: "integer", description: "Optional 1-based source line for precise LSP definition lookup." },
+        character: { type: "integer", description: "Optional 1-based source character; defaults to first non-whitespace character on the line." },
         workdir: { type: "string", default: "." },
       },
       required: ["symbol"],
@@ -917,13 +938,14 @@ export function registerDiagnosticsTools(): void {
   });
   registry.register({
     name: "lsp_hover",
-    description: "Return source context around a file line using the LSP facade local fallback.",
+    description: "Return hover information using a JSON-RPC language server with local source-context fallback.",
     parameters: {
       type: "object",
       properties: {
         file: { type: "string" },
         path: { type: "string", description: "Alias for file." },
         line: { type: "integer" },
+        character: { type: "integer", description: "Optional 1-based source character; defaults to first non-whitespace character on the line." },
         workdir: { type: "string", default: "." },
       },
       required: ["file", "line"],

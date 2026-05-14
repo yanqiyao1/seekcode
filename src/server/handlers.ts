@@ -33,6 +33,7 @@ import {
 } from "./runtime-store.js";
 import { registerBuiltInTools } from "../tools/setup.js";
 import { VERSION } from "../version.js";
+import { isSpeculativeRuntimeEvent, runtimeEventToSSE } from "./runtime-protocol.js";
 
 let toolsReadyKey = "";
 function ensureTools(config?: Config, workspacePath = process.cwd()) {
@@ -457,45 +458,6 @@ export async function chatHandler(c: Context) {
       record.activeEngine = undefined;
     }
   });
-}
-
-function isSpeculativeRuntimeEvent(event: EngineRuntimeEvent): boolean {
-  return event.type === "api_call_start"
-    || event.type === "thinking_delta"
-    || event.type === "content_delta"
-    || event.type === "tool_call_begin";
-}
-
-function runtimeEventToSSE(
-  event: EngineRuntimeEvent,
-  streamedToolCalls: Set<string>,
-): { event: string; data: unknown } | null {
-  switch (event.type) {
-    case "thinking_delta":
-      return { event: "thinking", data: event.data };
-    case "content_delta":
-      return { event: "content", data: event.data };
-    case "tool_call_begin": {
-      const key = event.data.tool_call_id || event.data.name;
-      streamedToolCalls.add(key);
-      return { event: "tool_call", data: { name: event.data.name, tool_call_id: event.data.tool_call_id } };
-    }
-    case "tool_call": {
-      if (streamedToolCalls.has(event.data.id) || streamedToolCalls.has(event.data.name)) return null;
-      streamedToolCalls.add(event.data.id || event.data.name);
-      return { event: "tool_call", data: { name: event.data.name, tool_call_id: event.data.id } };
-    }
-    case "tool_result":
-      return { event: "tool_result", data: { name: event.data.name, preview: event.preview, artifact_ids: event.artifact_ids || [] } };
-    case "tool_progress":
-      return { event: "tool_progress", data: event.data };
-    case "context_intervention":
-      return { event: "context_intervention", data: event.data };
-    case "prefix_invalidated":
-      return { event: "prefix_invalidated", data: event.data };
-    default:
-      return null;
-  }
 }
 
 async function emitApprovalRequired(

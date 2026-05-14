@@ -10,7 +10,7 @@ import { AssistantStream } from "./assistant-stream.js";
 import { defaultToolActivityLabel, describeToolActivity, describeToolActivityFromArgsStream } from "./tool-activity.js";
 import { ActiveToolLines } from "./tool-lines.js";
 import { Transcript } from "./transcript.js";
-import { sessionMessagesToRuntimeEvents } from "./runtime-replay.js";
+import { runtimeItemsToEngineRuntimeEvents, sessionMessagesToRuntimeEvents, type RuntimeItemLike } from "./runtime-replay.js";
 
 export type TuiTranscriptEventKind = "tool" | "thinking" | "content" | "other";
 
@@ -180,6 +180,10 @@ export class TuiRuntimeViewModel {
     } finally {
       this.replayingRuntimeEvents = wasReplaying;
     }
+  }
+
+  replayRuntimeItems(items: RuntimeItemLike[]): void {
+    this.replayRuntimeEvents(runtimeItemsToEngineRuntimeEvents(items));
   }
 
   finishThinkingStatus(): void {

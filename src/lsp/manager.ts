@@ -1,13 +1,8 @@
-/** Lightweight LSP facade with local fallbacks.
- *
- * This gives Seek Code stable symbol/definition style tool APIs before a
- * long-lived JSON-RPC language-server backend is introduced.
- */
-
 import { existsSync, readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { resolvePathAlias } from "../tools/path-resolution.js";
+import { findTypeScriptLanguageServer, inferCharacter, isTypeScriptLikeFile, TypeScriptLanguageServerSession } from "./typescript-lsp.js";
 
 export interface DocumentSymbol {
   name: string;
@@ -23,12 +18,35 @@ export interface DefinitionMatch {
   text: string;
 }
 
+export type LspBackend = "json-rpc" | "local-fallback";
+
+export interface LspResult<T> {
+  backend: LspBackend;
+  value: T;
+}
+
 export class LspManager {
+  private readonly tsSessions = new Map<string, TypeScriptLanguageServerSession>();
+
   documentSymbols(file: string, workdir = process.cwd()): DocumentSymbol[] {
     const path = resolvePathAlias(file, resolve(workdir));
     if (!existsSync(path)) return [];
     const content = readFileSync(path, "utf-8");
     return extractSymbols(content, path);
+  }
+
+  async documentSymbolsWithBackend(file: string, workdir = process.cwd()): Promise<LspResult<DocumentSymbol[]>> {
+    const path = resolvePathAlias(file, resolve(workdir));
+    if (!existsSync(path)) return { backend: "local-fallback", value: [] };
+    const session = this.typescriptSessionFor(path, workdir);
+    if (session) {
+      try {
+        return { backend: "json-rpc", value: await session.documentSymbols(path) };
+      } catch {
+        this.dropTypescriptSession(workdir);
+      }
+    }
+    return { backend: "local-fallback", value: this.documentSymbols(path, workdir) };
   }
 
   definition(symbol: string, workdir = process.cwd()): DefinitionMatch[] {
@@ -51,6 +69,30 @@ export class LspManager {
     return grep.status === 0 ? parseRgMatches(grep.stdout) : [];
   }
 
+  async definitionWithBackend(
+    symbol: string,
+    workdir = process.cwd(),
+    position?: { file?: string; line?: number; character?: unknown },
+  ): Promise<LspResult<DefinitionMatch[]>> {
+    const query = symbol.trim();
+    if (!query) return { backend: "local-fallback", value: [] };
+    const file = position?.file ? resolvePathAlias(position.file, resolve(workdir)) : "";
+    const line = Number(position?.line);
+    if (file && Number.isFinite(line) && line > 0 && existsSync(file)) {
+      const session = this.typescriptSessionFor(file, workdir);
+      if (session) {
+        try {
+          const character = inferCharacter(file, line, position?.character);
+          const matches = await session.definition(file, line, character);
+          if (matches.length) return { backend: "json-rpc", value: matches };
+        } catch {
+          this.dropTypescriptSession(workdir);
+        }
+      }
+    }
+    return { backend: "local-fallback", value: this.definition(query, workdir) };
+  }
+
   hover(file: string, line: number, workdir = process.cwd(), radius = 2): string {
     const path = resolvePathAlias(file, resolve(workdir));
     if (!existsSync(path)) return `Error: file not found: ${file}`;
@@ -64,6 +106,48 @@ export class LspManager {
       return `${marker} ${n}: ${text}`;
     }).join("\n");
   }
+
+  async hoverWithBackend(file: string, line: number, workdir = process.cwd(), radius = 2, character?: unknown): Promise<LspResult<string>> {
+    const path = resolvePathAlias(file, resolve(workdir));
+    if (existsSync(path)) {
+      const session = this.typescriptSessionFor(path, workdir);
+      if (session) {
+        try {
+          const text = await session.hover(path, line, inferCharacter(path, line, character));
+          if (text) return { backend: "json-rpc", value: text };
+        } catch {
+          this.dropTypescriptSession(workdir);
+        }
+      }
+    }
+    return { backend: "local-fallback", value: this.hover(file, line, workdir, radius) };
+  }
+
+  async dispose(): Promise<void> {
+    const sessions = [...this.tsSessions.values()];
+    this.tsSessions.clear();
+    await Promise.allSettled(sessions.map(session => session.dispose()));
+  }
+
+  private typescriptSessionFor(file: string, workdir: string): TypeScriptLanguageServerSession | null {
+    if (!isTypeScriptLikeFile(file)) return null;
+    const root = resolve(workdir);
+    const existing = this.tsSessions.get(root);
+    if (existing) return existing;
+    const command = findTypeScriptLanguageServer(root);
+    if (!command) return null;
+    const session = new TypeScriptLanguageServerSession(root, command);
+    this.tsSessions.set(root, session);
+    return session;
+  }
+
+  private dropTypescriptSession(workdir: string): void {
+    const root = resolve(workdir);
+    const session = this.tsSessions.get(root);
+    if (!session) return;
+    this.tsSessions.delete(root);
+    void session.dispose();
+  }
 }
 
 let manager: LspManager | null = null;
@@ -74,6 +158,7 @@ export function getLspManager(): LspManager {
 }
 
 export function clearLspManagerForTests(): void {
+  void manager?.dispose();
   manager = null;
 }
 

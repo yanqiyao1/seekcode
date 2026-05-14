@@ -559,7 +559,7 @@ describe("TuiRuntimeViewModel", () => {
   it("replays server runtime items without duplicating final assistant messages", () => {
     const transcript = new Transcript();
     const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
-    const events = runtimeItemsToEngineRuntimeEvents([
+    view.replayRuntimeItems([
       { type: "user_message", data: { text: "hello" } },
       { type: "api_call_start", data: {} },
       { type: "content_delta", data: { text: "Hi" } },
@@ -569,7 +569,6 @@ describe("TuiRuntimeViewModel", () => {
       },
     ]);
 
-    view.replayRuntimeEvents(events);
     const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
 
     expect(plain).toContain("hello");
