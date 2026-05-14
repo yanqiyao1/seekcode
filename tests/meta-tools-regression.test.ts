@@ -8,6 +8,7 @@ vi.mock("openai", () => ({
   })),
 }));
 
+const OpenAIMock = (await import("openai")).default as any;
 const { getRegistry } = await import("../src/tools/registry.js");
 const { registerSubAgentTool, clearAgentState } = await import("../src/tools/sub-agent.js");
 const { registerRLMTool } = await import("../src/tools/rlm-query.js");
@@ -15,6 +16,7 @@ const { registerRLMTool } = await import("../src/tools/rlm-query.js");
 beforeEach(() => {
   getRegistry().clear();
   clearAgentState();
+  OpenAIMock.mockClear();
   createMock.mockReset();
 });
 
@@ -164,7 +166,9 @@ describe("meta tool regressions", () => {
       choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
     });
     registerSubAgentTool();
+    const oldSeekModel = process.env.SEEKCODE_MODEL;
     const oldModel = process.env.DEEPSEEK_MODEL;
+    delete process.env.SEEKCODE_MODEL;
     process.env.DEEPSEEK_MODEL = "env-model";
 
     try {
@@ -183,8 +187,83 @@ describe("meta tool regressions", () => {
       expect(request.messages[0]?.role).toBe("system");
       expect(request.messages[0]?.content).toContain("You are a specialized sub-agent.");
     } finally {
+      if (oldSeekModel === undefined) delete process.env.SEEKCODE_MODEL;
+      else process.env.SEEKCODE_MODEL = oldSeekModel;
       if (oldModel === undefined) delete process.env.DEEPSEEK_MODEL;
       else process.env.DEEPSEEK_MODEL = oldModel;
+    }
+  });
+
+  it("uses registered runtime config for spawn_agent credentials and default model", async () => {
+    createMock.mockResolvedValue({
+      choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+    });
+    registerSubAgentTool({
+      api_key: "config-key",
+      base_url: "https://config.example/v1",
+      model: "configured-model",
+    });
+
+    const result = await getRegistry().lookup("spawn_agent")!.execute({
+      task: "use configured runtime",
+    });
+
+    expect(result).toContain("<deepseek:subagent.done>");
+    expect(OpenAIMock).toHaveBeenCalledWith({
+      apiKey: "config-key",
+      baseURL: "https://config.example/v1",
+    });
+    expect(createMock.mock.calls[0]?.[0]).toMatchObject({
+      model: "configured-model",
+    });
+  });
+
+  it("falls back to canonical SEEKCODE env vars for spawn_agent when no runtime config is registered", async () => {
+    createMock.mockResolvedValue({
+      choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+    });
+    const oldSeekApiKey = process.env.SEEKCODE_API_KEY;
+    const oldSeekBaseUrl = process.env.SEEKCODE_BASE_URL;
+    const oldSeekModel = process.env.SEEKCODE_MODEL;
+    const oldDeepseekApiKey = process.env.DEEPSEEK_API_KEY;
+    const oldDeepseekBaseUrl = process.env.DEEPSEEK_BASE_URL;
+    const oldDeepseekModel = process.env.DEEPSEEK_MODEL;
+
+    process.env.SEEKCODE_API_KEY = "seekcode-key";
+    process.env.SEEKCODE_BASE_URL = "https://seekcode.example/v1";
+    process.env.SEEKCODE_MODEL = "seekcode-model";
+    delete process.env.DEEPSEEK_API_KEY;
+    delete process.env.DEEPSEEK_BASE_URL;
+    delete process.env.DEEPSEEK_MODEL;
+
+    try {
+      registerSubAgentTool();
+
+      const result = await getRegistry().lookup("spawn_agent")!.execute({
+        task: "use seekcode env",
+      });
+
+      expect(result).toContain("<deepseek:subagent.done>");
+      expect(OpenAIMock).toHaveBeenCalledWith({
+        apiKey: "seekcode-key",
+        baseURL: "https://seekcode.example/v1",
+      });
+      expect(createMock.mock.calls[0]?.[0]).toMatchObject({
+        model: "seekcode-model",
+      });
+    } finally {
+      if (oldSeekApiKey === undefined) delete process.env.SEEKCODE_API_KEY;
+      else process.env.SEEKCODE_API_KEY = oldSeekApiKey;
+      if (oldSeekBaseUrl === undefined) delete process.env.SEEKCODE_BASE_URL;
+      else process.env.SEEKCODE_BASE_URL = oldSeekBaseUrl;
+      if (oldSeekModel === undefined) delete process.env.SEEKCODE_MODEL;
+      else process.env.SEEKCODE_MODEL = oldSeekModel;
+      if (oldDeepseekApiKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+      else process.env.DEEPSEEK_API_KEY = oldDeepseekApiKey;
+      if (oldDeepseekBaseUrl === undefined) delete process.env.DEEPSEEK_BASE_URL;
+      else process.env.DEEPSEEK_BASE_URL = oldDeepseekBaseUrl;
+      if (oldDeepseekModel === undefined) delete process.env.DEEPSEEK_MODEL;
+      else process.env.DEEPSEEK_MODEL = oldDeepseekModel;
     }
   });
 

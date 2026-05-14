@@ -248,7 +248,7 @@ export class TuiRuntimeViewModel {
         this.renderApprovalRequired(event.data.tool, event.data.args);
         break;
       case "tool_result":
-        this.renderToolResult(event.data.name, event.preview, event.data.tool_call_id || event.data.name, event.metadata);
+        this.renderToolResult(event.data.name, event.preview, event.data.tool_call_id || event.data.name, event.metadata, event.data.is_error);
         break;
       case "tool_progress":
         this.renderToolProgress(event);
@@ -338,9 +338,9 @@ export class TuiRuntimeViewModel {
     this.updateToolActivity(key, activeName, label, false);
   }
 
-  private renderToolResult(name: string, preview: string, toolCallId = name, metadata?: ToolUseRuntimeMetadata): void {
+  private renderToolResult(name: string, preview: string, toolCallId = name, metadata?: ToolUseRuntimeMetadata, isError = false): void {
     const label = metadata?.summary || metadata?.activity || metadata?.render?.userFacingName || name;
-    const line = r.toolCallStatus(label, preview.startsWith("Error:") ? "error" : "success", preview);
+    const line = r.toolCallStatus(label, isError || preview.startsWith("Error:") ? "error" : "success", preview);
     const activeToolLine = this.activeToolLines.finish(toolCallId);
     this.activeToolNames.delete(toolCallId);
     this.activeToolLabels.delete(toolCallId);

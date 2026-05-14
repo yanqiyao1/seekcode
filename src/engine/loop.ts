@@ -338,11 +338,11 @@ export class Engine {
                 });
               },
             });
-            let isError = resultContent.startsWith("Error:");
+            let isError = isToolResultError(resultContent);
             if (!isError) {
               const diagnostics = await this.maybeRunPostEditDiagnostics(tc.name, args);
               if (diagnostics) resultContent = `${resultContent}\n\n[post-edit diagnostics]\n${diagnostics}`;
-              isError = resultContent.startsWith("Error:");
+              isError = isToolResultError(resultContent);
             }
 
             const originalArtifactIds = extractArtifactIds(resultContent);
@@ -616,6 +616,11 @@ function extractArtifactIds(text: string): string[] {
     // non-JSON tool output
   }
   return [...ids];
+}
+
+function isToolResultError(text: string): boolean {
+  const trimmed = text.trimStart();
+  return trimmed.startsWith("Error:") || trimmed.startsWith("<deepseek:subagent.error>");
 }
 
 function mergeUsage(

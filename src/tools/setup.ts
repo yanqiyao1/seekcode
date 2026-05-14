@@ -29,7 +29,7 @@ export function registerBuiltInTools(config?: Config, options: { clear?: boolean
   registerPatchTool();
   registerThinkTool();
   registerRLMTool();
-  registerSubAgentTool();
+  registerSubAgentTool(config);
   registerPlanTools();
   registerGoalTools();
   registerToolSearchTool();

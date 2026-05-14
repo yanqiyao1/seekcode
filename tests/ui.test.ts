@@ -421,6 +421,29 @@ describe("TuiRuntimeViewModel", () => {
     expect(plain).toContain("Workspace audit");
   });
 
+  it("renders tool_result is_error as failed even when the preview lacks an Error prefix", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "spawn_agent", tool_call_id: "call-sub" } } as any);
+    view.handleRuntimeEvent({
+      type: "tool_result",
+      data: {
+        tool_call_id: "call-sub",
+        name: "spawn_agent",
+        content: "<deepseek:subagent.error>auth failed</deepseek:subagent.error>",
+        is_error: true,
+      },
+      preview: "<deepseek:subagent.error> auth failed",
+    } as any);
+
+    const plain = stripAnsi(transcript.lines.at(-1)?.text || "");
+    expect(plain).toContain("✗ spawn_agent");
+    expect(plain).toContain("<deepseek:subagent.error>");
+    expect(plain).not.toContain("✓ spawn_agent");
+  });
+
   it("keeps concurrent write tool lines associated by tool call id", () => {
     const transcript = new Transcript();
     const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });

@@ -1228,6 +1228,38 @@ describe("engine", () => {
     expect(result.tool_results[0].content).toContain("boom");
   });
 
+  it("records structured sub-agent error results as tool failures", async () => {
+    getRegistry().register({
+      name: "spawn_agent",
+      description: "spawn",
+      parameters: { type: "object", properties: {} },
+      permission: "always_allow" as any,
+      category: "test",
+      parallelOk: true,
+      execute: async () => [
+        "<deepseek:subagent.error>",
+        "  agent_id: agent_1",
+        "  summary: |",
+        "    upstream auth failed",
+        "</deepseek:subagent.error>",
+      ].join("\n"),
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "spawn_agent", arguments: {} }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+
+    expect(result.tool_results).toHaveLength(1);
+    expect(result.tool_results[0]).toMatchObject({ name: "spawn_agent", is_error: true });
+    expect(result.tool_results[0].content).toContain("<deepseek:subagent.error>");
+  });
+
   it("honors session plan mode even if a stale agent mode object is passed to the engine", async () => {
     registerFileTools();
     const session = createSession({ workspace_path: tmp, mode: "plan" });

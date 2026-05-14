@@ -14,6 +14,9 @@ import OpenAI from "openai";
 import { PermissionLevel } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { getAgentProfile, hasAgentProfile, listAgentProfiles } from "../engine/agent-profiles.js";
+import type { Config } from "../config.js";
+
+type SubAgentRuntimeConfig = Pick<Config, "api_key" | "base_url" | "model">;
 
 // ── Agent tracking ───────────────────────────────────────────
 
@@ -49,7 +52,7 @@ function validateOptionalFiniteNumber(value: unknown, key: "timeout_ms" | "max_t
 
 // ── spawn_agent ──────────────────────────────────────────────
 
-async function spawnAgent(args: Record<string, unknown>): Promise<string> {
+async function spawnAgent(args: Record<string, unknown>, runtimeConfig?: SubAgentRuntimeConfig): Promise<string> {
   const task = typeof args.task === "string" ? args.task.trim() : "";
   const taskName = typeof args.task_name === "string" && args.task_name.trim()
     ? args.task_name.trim()
@@ -71,12 +74,12 @@ async function spawnAgent(args: Record<string, unknown>): Promise<string> {
   const maxTurnsError = validateOptionalFiniteNumber(args.max_turns, "max_turns");
   if (maxTurnsError) return `Error: ${maxTurnsError}`;
 
-  const apiKey = (typeof args.api_key === "string" ? args.api_key.trim() : "") ||
-    process.env.DEEPSEEK_API_KEY || "";
-  const baseUrl = (typeof args.base_url === "string" ? args.base_url.trim() : "") ||
-    process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
+  const apiKey = resolveStringOption(args.api_key, runtimeConfig?.api_key, envValue("SEEKCODE_API_KEY", "DEEPSEEK_API_KEY"), "");
+  const baseUrl = resolveStringOption(args.base_url, runtimeConfig?.base_url, envValue("SEEKCODE_BASE_URL", "DEEPSEEK_BASE_URL"), "https://api.deepseek.com");
   const model = (typeof args.model === "string" && args.model.trim() ? args.model.trim() : "") ||
-    process.env.DEEPSEEK_MODEL || profile.defaultModel;
+    runtimeConfig?.model ||
+    envValue("SEEKCODE_MODEL", "DEEPSEEK_MODEL") ||
+    profile.defaultModel;
 
   const agentId = `agent_${nextAgentId++}`;
   const nickname = taskName.replace(/[^a-z0-9_]/gi, "_").slice(0, 40);
@@ -155,6 +158,15 @@ function normalizeMaxTurns(value: unknown, fallback = 15): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(1, Math.floor(parsed));
+}
+
+function envValue(primary: string, fallback: string): string {
+  return process.env[primary] || process.env[fallback] || "";
+}
+
+function resolveStringOption(value: unknown, configValue: string | undefined, envValue: string, fallback: string): string {
+  const explicit = typeof value === "string" ? value.trim() : "";
+  return explicit || configValue || envValue || fallback;
 }
 
 function formatAgentDone(
@@ -246,7 +258,7 @@ function validateAgentStatusArgs(args: Record<string, unknown>) {
 
 // ── Registration ─────────────────────────────────────────────
 
-export function registerSubAgentTool(): void {
+export function registerSubAgentTool(config?: SubAgentRuntimeConfig): void {
   const r = getRegistry();
 
   r.register({
@@ -277,7 +289,7 @@ export function registerSubAgentTool(): void {
       },
       required: ["task"],
     },
-    execute: spawnAgent,
+    execute: (args) => spawnAgent(args, config),
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: true,
@@ -324,7 +336,7 @@ export function registerSubAgentTool(): void {
         task_name: task.slice(0, 40),
         system_prompt: args.system_prompt,
         max_turns: args.max_turns,
-      });
+      }, config);
     },
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
