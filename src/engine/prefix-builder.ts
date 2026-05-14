@@ -30,13 +30,14 @@ export function buildPinnedPrefix(
   context: PinnedPrefixContext = loadPinnedPrefixContext(config, workspacePath),
 ): ImmutablePrefix {
   const visibleTools = getMode(config.mode).filterTools(tools.listActive());
+  const schemaTools = getMode(config.mode).filterTools(tools.listAll());
   const base = buildSystemPrompt(config, workspacePath, buildToolsDescription(visibleTools));
   const withAgents = injectAgentsMdResult(base, context.agentsMd);
   const skillsContext = buildSkillsContext(context.skills);
   const systemPrompt = skillsContext ? `${withAgents}\n\n${skillsContext}` : withAgents;
   return new ImmutablePrefix({
     systemPrompt,
-    toolSchemas: visibleTools.map(tool => ({
+    toolSchemas: schemaTools.map(tool => ({
       type: "function",
       function: {
         name: tool.name,

@@ -1,4 +1,4 @@
-/** Session persistence — JSON save/load. */
+/** Session persistence — JSON snapshot plus append-only event log. */
 
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } from "node:fs";
 import { basename, resolve, join } from "node:path";
@@ -40,6 +40,10 @@ function safeSessionId(sessionId: unknown): string {
     .replace(/\.json$/i, "")
     .replace(/[^a-zA-Z0-9._-]/g, "")
     .slice(0, 128);
+}
+
+function sessionEventPath(dir: string, sessionId: string): string {
+  return join(dir, `${sessionId}.jsonl`);
 }
 
 function numberOrZero(value: unknown): number {
@@ -191,6 +195,7 @@ export function saveSession(session: Session): string {
     try {
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, `${id}.json`), payload, "utf-8");
+      appendSessionEvent(dir, session, "session.saved");
       return id;
     } catch (e: any) {
       errors.push(`${dir}: ${e?.message || String(e)}`);
@@ -198,6 +203,24 @@ export function saveSession(session: Session): string {
   }
 
   throw new Error(`Could not write session. ${errors.join(" | ")}`);
+}
+
+function appendSessionEvent(dir: string, session: Session, event: string): void {
+  try {
+    const payload = {
+      seq: Date.now(),
+      session_id: session.id,
+      event,
+      created_at: session.updated_at,
+      message_count: session.messages.length,
+      turn_count: session.turns.length,
+      cumulative_tokens_in: session.cumulative_tokens_in,
+      cumulative_tokens_out: session.cumulative_tokens_out,
+    };
+    writeFileSync(sessionEventPath(dir, session.id), JSON.stringify(payload) + "\n", { encoding: "utf-8", flag: "a" });
+  } catch {
+    // Snapshot persistence remains authoritative if the event log append fails.
+  }
 }
 
 export function loadSession(sessionId: string): Session | null {

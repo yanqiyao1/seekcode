@@ -1,12 +1,12 @@
 # MCP (Model Context Protocol) Integration
 
-DeepSeek CLI supports connecting to MCP servers to extend tooling capabilities.
+Seek Code supports connecting to MCP servers to extend tooling capabilities.
 
 ## Configuration
 
 Add MCP servers to your configuration file:
 
-### `.deepseek/config.toml` (project-local)
+### `.seekcode/config.toml` (project-local)
 
 ```toml
 [[mcp_servers]]
@@ -35,7 +35,7 @@ url = "https://example.com/mcp"
 
 ## How It Works
 
-1. On startup, DeepSeek CLI connects to all configured MCP servers
+1. On startup, Seek Code connects to all configured MCP servers
 2. Each server provides its list of tools
 3. Tools are registered in the global tool registry with prefix `mcp_<server>_<tool>`
 4. The model can call MCP tools like any other tool
@@ -45,8 +45,11 @@ url = "https://example.com/mcp"
 
 Use slash commands during a session:
 
+```text
+/mcp list              List connected MCP servers and their tools
+/mcp add <name> ...    Add a new stdio MCP server
+/mcp disable <name>    Disable an MCP server
+/mcp reload            Reload configured MCP servers
 ```
-/mcp_connect <config>   Connect to a new MCP server
-/mcp_disconnect <name>  Disconnect from an MCP server
-/mcp_list              List connected MCP servers and their tools
-```
+
+Legacy `.deepseek/config.toml` can be migrated with `seek config migrate --target project`.

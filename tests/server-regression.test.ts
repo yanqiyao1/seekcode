@@ -39,13 +39,16 @@ describe("HTTP/SSE server", () => {
   let tmp: string;
   let oldRuntimeDir: string | undefined;
   let oldArtifactsDir: string | undefined;
+  let oldServerToken: string | undefined;
 
   beforeEach(() => {
     tmp = mkdtempSync(join(tmpdir(), "seek-code-server-runtime-"));
     oldRuntimeDir = process.env.DEEPCODE_RUNTIME_DIR;
     oldArtifactsDir = process.env.DEEPCODE_ARTIFACTS_DIR;
+    oldServerToken = process.env.SEEKCODE_SERVER_TOKEN;
     process.env.DEEPCODE_RUNTIME_DIR = tmp;
     process.env.DEEPCODE_ARTIFACTS_DIR = join(tmp, "artifacts");
+    delete process.env.SEEKCODE_SERVER_TOKEN;
     clientSendMocks.length = 0;
     clearRuntimeStoreForTests();
     clearArtifactsForTests();
@@ -60,7 +63,28 @@ describe("HTTP/SSE server", () => {
     else process.env.DEEPCODE_RUNTIME_DIR = oldRuntimeDir;
     if (oldArtifactsDir === undefined) delete process.env.DEEPCODE_ARTIFACTS_DIR;
     else process.env.DEEPCODE_ARTIFACTS_DIR = oldArtifactsDir;
+    if (oldServerToken === undefined) delete process.env.SEEKCODE_SERVER_TOKEN;
+    else process.env.SEEKCODE_SERVER_TOKEN = oldServerToken;
     rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("serves OpenAPI metadata and enforces optional bearer auth on runtime routes", async () => {
+    let app = createApp();
+    const openapi = await (await app.request("/v1/openapi.json")).json() as { openapi: string; paths: Record<string, unknown> };
+
+    expect(openapi.openapi).toBe("3.1.0");
+    expect(openapi.paths["/v1/threads"]).toBeTruthy();
+
+    process.env.SEEKCODE_SERVER_TOKEN = "secret";
+    app = createApp();
+    const health = await app.request("/v1/health");
+    const unauthorized = await app.request("/v1/tools");
+    const authorized = await app.request("/v1/tools", { headers: { authorization: "Bearer secret" } });
+
+    expect(health.status).toBe(200);
+    expect(unauthorized.status).toBe(401);
+    expect(await unauthorized.json()).toMatchObject({ error: "unauthorized" });
+    expect(authorized.status).toBe(200);
   });
 
   it("executes tool calls and emits tool_result events", async () => {

@@ -930,6 +930,25 @@ describe("web tools", () => {
     expect(parsed.content).toBe("a".repeat(32));
   });
 
+  it("reports fetch content profiles and cumulative web stats", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(`
+      <html><head><title>Docs Page</title></head>
+      <body><nav>noise</nav><main><h1>Docs Page</h1><p>Readable content for extraction.</p></main></body></html>
+    `, { status: 200, headers: { "content-type": "text/html" } }));
+
+    const fetched = JSON.parse(await getRegistry().lookup("web_fetch")!.execute({
+      url: "https://example.com/docs",
+      json: true,
+    })) as { content_profile: { title?: string; format: string; word_count: number; main_content_ratio?: number } };
+    const stats = JSON.parse(await getRegistry().lookup("web_stats")!.execute({})) as { fetch_calls: number; fetch_ms: number; cache_entries: { fetch: number } };
+
+    expect(fetched.content_profile).toMatchObject({ title: "Docs Page", format: "html" });
+    expect(fetched.content_profile.word_count).toBeGreaterThan(0);
+    expect(fetched.content_profile.main_content_ratio).toBeGreaterThan(0);
+    expect(stats.fetch_calls).toBeGreaterThan(0);
+    expect(stats.cache_entries.fetch).toBeGreaterThanOrEqual(1);
+  });
+
   it("applies current domain policy when fetching a stored ref_id", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
       new Response(`

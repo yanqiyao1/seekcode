@@ -140,7 +140,7 @@ export class Engine {
       }
       await emitRuntimeEvent(callbacks, { type: "prefix_pinned", data: this.prefix.metadata });
       const schemas = this.prefix.toolSchemas();
-      const allowedToolNames = new Set(activeMode.filterTools(this.tools.listActive()).map(tool => tool.name));
+      const currentAllowedToolNames = () => new Set(activeMode.filterTools(this.tools.listActive()).map(tool => tool.name));
 
       let iterations = 0;
       let lastUsage: UsageTelemetry | null = null;
@@ -237,7 +237,7 @@ export class Engine {
           if (!toolDef) {
             return makeToolErrorOutcome(tc, `Error: Unknown tool '${tc.name}'`);
           }
-          if (!this.prefix.hasTool(tc.name) || !allowedToolNames.has(tc.name)) {
+          if (!this.prefix.hasTool(tc.name) || !currentAllowedToolNames().has(tc.name)) {
             return makeToolErrorOutcome(tc, `Tool '${tc.name}' is not active in the current mode or prefix. Enable it explicitly if needed.`);
           }
 
@@ -425,7 +425,7 @@ export class Engine {
 
         const isParallelBatchCandidate = (tc: ToolCall): boolean => {
           const toolDef = this.tools.lookup(tc.name);
-          if (!toolDef || !this.prefix.hasTool(tc.name) || !allowedToolNames.has(tc.name)) return false;
+          if (!toolDef || !this.prefix.hasTool(tc.name) || !currentAllowedToolNames().has(tc.name)) return false;
           if (toolDef.permission !== PermissionLevel.ALWAYS_ALLOW || toolDef.readOnly !== true) return false;
           const args = withWorkspaceDefaults(toolDef, tc.arguments as Record<string, unknown>, this.session.workspace_path);
           return isToolConcurrencySafe(toolDef, args);

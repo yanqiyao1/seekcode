@@ -14,6 +14,7 @@ const FILE_DIFF_MAX_LINES = 160;
 const FILE_DIFF_MAX_CHARS = 12_000;
 const PATH_ALIASES = ["path", "file", "file_path", "filepath", "filename", "target_file", "target_path", "output_path"];
 const CONTENT_ALIASES = ["content", "text", "body", "contents", "data"];
+let rgAvailableCache: boolean | null = null;
 
 function resolvePath(path: string): string { return resolve(path); }
 
@@ -226,14 +227,19 @@ async function search(args: Record<string, unknown>): Promise<string> {
   if (args.include !== undefined && typeof args.include !== "string") return executeError("include must be a string");
   const caseSensitiveError = validateOptionalBoolean(args.case_sensitive, "case_sensitive");
   if (caseSensitiveError) return executeError(caseSensitiveError);
+  const regexError = validateOptionalBoolean(args.regex, "regex");
+  if (regexError) return executeError(regexError);
   const { args: normalized, path } = pathInput;
   const pattern = args.pattern as string;
   const include = typeof normalized.include === "string" ? normalized.include : "";
   const caseSensitive = normalized.case_sensitive !== false;
+  const regex = normalized.regex === true;
   const boundary = workspaceRoot(normalized, path);
   try {
     const root = resolveExistingPathInsideRoot(path, boundary);
-    const grepArgs = ["-rnF"];
+    const rgResult = runRipgrepSearch({ root, pattern, include, caseSensitive, regex });
+    if (rgResult !== null) return rgResult;
+    const grepArgs = [regex ? "-rnE" : "-rnF"];
     if (!caseSensitive) grepArgs.push("-i");
     grepArgs.push("--directories=recurse", "--exclude-dir=node_modules", "--exclude-dir=.git", "--exclude-dir=.seekcode", "--exclude-dir=.deepseek");
     if (include) grepArgs.push(`--include=${include}`);
@@ -262,6 +268,8 @@ async function glob(args: Record<string, unknown>): Promise<string> {
   try {
     const results: string[] = [];
     const root = resolveExistingPathInsideRoot(path, boundary);
+    const rgResult = runRipgrepGlob(root, pattern);
+    if (rgResult !== null) return rgResult;
     const matcher = globToRegExp(pattern);
     function walk(dir: string) {
       try {
@@ -284,6 +292,67 @@ async function glob(args: Record<string, unknown>): Promise<string> {
     if (!results.length) return `No files matching '${pattern}'`;
     return results.slice(0, 200).map(m => `  ${relative(root, m).replace(/\\/g, "/")}`).join("\n");
   } catch (e: any) { return `Error in glob: ${e.message}`; }
+}
+
+function hasRipgrep(): boolean {
+  if (rgAvailableCache !== null) return rgAvailableCache;
+  const result = spawnSync("rg", ["--version"], { encoding: "utf-8", timeout: 1000, maxBuffer: 64 * 1024 });
+  rgAvailableCache = result.status === 0;
+  return rgAvailableCache;
+}
+
+function runRipgrepSearch(options: {
+  root: string;
+  pattern: string;
+  include: string;
+  caseSensitive: boolean;
+  regex: boolean;
+}): string | null {
+  if (!hasRipgrep()) return null;
+  const args = [
+    "--line-number",
+    "--no-heading",
+    "--color", "never",
+    "--glob", "!node_modules",
+    "--glob", "!.git",
+    "--glob", "!.seekcode",
+    "--glob", "!.deepseek",
+  ];
+  if (!options.regex) args.push("--fixed-strings");
+  if (!options.caseSensitive) args.push("--ignore-case");
+  if (options.include) args.push("--glob", options.include);
+  args.push("--", options.pattern, options.root);
+  const result = spawnSync("rg", args, { encoding: "utf-8", timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
+  if (result.status === 1) return `No matches found for '${options.pattern}'\n[backend: rg]`;
+  if (result.error) return null;
+  if (result.status && result.status !== 0) return `Error searching: ${result.stderr || `rg exited with ${result.status}`}`;
+  const lines = result.stdout.split("\n").filter(Boolean).slice(0, 500);
+  return `${lines.join("\n") || `No matches found for '${options.pattern}'`}\n[backend: rg]`;
+}
+
+function runRipgrepGlob(root: string, pattern: string): string | null {
+  if (!hasRipgrep()) return null;
+  const result = spawnSync("rg", [
+    "--files",
+    "--glob", pattern,
+    "--glob", "!node_modules",
+    "--glob", "!.git",
+    "--glob", "!.seekcode",
+    "--glob", "!.deepseek",
+  ], { cwd: root, encoding: "utf-8", timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
+  if (result.error) return null;
+  if (result.status === 1) return `No files matching '${pattern}'\n[backend: rg]`;
+  if (result.status && result.status !== 0) return null;
+  const files = result.stdout.split("\n").filter(Boolean).slice(0, 200);
+  if (!files.length) return `No files matching '${pattern}'\n[backend: rg]`;
+  return `${files.map(file => `  ${renderRgFilePath(root, file)}`).join("\n")}\n[backend: rg]`;
+}
+
+function renderRgFilePath(root: string, file: string): string {
+  const rendered = file.startsWith("/") || /^[a-zA-Z]:/.test(file)
+    ? relative(root, file)
+    : file;
+  return rendered.replace(/\\/g, "/").replace(/^\.\//, "");
 }
 
 function globToRegExp(pattern: string): RegExp {
@@ -480,7 +549,7 @@ export function registerFileTools(): void {
       return rootError ? { ok: false, message: rootError } : { ok: true, args: pathInput.args };
     },
   });
-  t("search", "Search for text using grep.", { pattern: { type: "string" }, path: { type: "string", default: "." }, root: { type: "string", description: "Optional root boundary for symlink safety." }, include: { type: "string", default: "" }, case_sensitive: { type: "boolean", default: true } }, ["pattern"], search, PermissionLevel.ALWAYS_ALLOW, "file", true, {
+  t("search", "Search for text using ripgrep when available, falling back to grep.", { pattern: { type: "string" }, path: { type: "string", default: "." }, root: { type: "string", description: "Optional root boundary for symlink safety." }, include: { type: "string", default: "" }, case_sensitive: { type: "boolean", default: true }, regex: { type: "boolean", default: false, description: "Treat pattern as a regular expression instead of a literal string." } }, ["pattern"], search, PermissionLevel.ALWAYS_ALLOW, "file", true, {
     aliases: ["grep"],
     searchHint: "grep text across files",
     readOnly: true,
@@ -507,6 +576,8 @@ export function registerFileTools(): void {
       }
       const caseSensitiveError = validateOptionalBoolean(normalized.case_sensitive, "case_sensitive");
       if (caseSensitiveError) return { ok: false, message: caseSensitiveError };
+      const regexError = validateOptionalBoolean(normalized.regex, "regex");
+      if (regexError) return { ok: false, message: regexError };
       return { ok: true, args: normalized };
     },
   });

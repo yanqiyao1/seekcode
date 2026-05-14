@@ -59,6 +59,7 @@ Don't claim a change worked until you've observed evidence. Don't trust memory o
 Sub-agents are cheap. Use them liberally for parallel work:
 - **Parallel investigation**: When you need to understand 3+ independent files, spawn one sub-agent per target.
 - **Parallel implementation**: After a plan exists, spawn one sub-agent per independent leaf task.
+- **Profiles**: Use \`profile="explore"\` for read-only code investigation, \`profile="scout"\` for external research, \`profile="build"\` for isolated implementation, \`profile="plan"\` for decomposition, and \`profile="general"\` otherwise.
 - **Solo tasks**: A single read, a single search — do these yourself. Spawning has overhead.
 - **Max 5 concurrent**: Keep sub-agents bounded to avoid overwhelming context.
 

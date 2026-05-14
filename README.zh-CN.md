@@ -6,7 +6,7 @@ Seek Code 是一个专为 DeepSeek 打造的终端 Code Agent。它围绕 `deeps
 
 ```bash
 npm install -g seekcode
-export DEEPSEEK_API_KEY="sk-your-api-key"
+export SEEKCODE_API_KEY="sk-your-api-key"
 seek
 ```
 
@@ -68,6 +68,7 @@ seek update -y
 | Web | 搜索和抓取 URL、多搜索源、域名 allow/block、代理配置 | 让 Agent 搜索，或配置 `[web]` |
 | MCP | stdio/SSE MCP Server，注册为 `mcp_*` 工具 | `/mcp add ...`、`/mcp reload` |
 | Skills | `SKILL.md` 工作流、安装/更新/信任、项目/全局发现 | `/skills`、`/skill <name>` |
+| 自定义工具 | 项目级 `.seekcode/tools/*.js|*.cjs|*.ts` 工具模块，默认 ASK 权限 | 放入 `.seekcode/tools`，用 `custom_tools` 查看 |
 | 任务系统 | durable tasks、checklist、plan、notes、长任务状态 | `/tasks`，Agent 工具如 `task_create` |
 | Artifacts | 保存长日志、诊断、patch 和证据，避免污染上下文 | 工具自动创建，或使用 artifact 工具 |
 | Sessions | 保存、列出、加载、删除和恢复工作上下文 | `/save`、`/sessions`、`/load` |
@@ -128,6 +129,21 @@ Skills：
 /skill my-skill
 ```
 
+项目自定义工具：
+
+```js
+// .seekcode/tools/hello.cjs
+module.exports = tool({
+  name: "hello_tool",
+  description: "Say hello",
+  parameters: { type: "object", properties: { name: { type: "string" } } },
+  readOnly: true,
+  run(args) { return `hello ${args.name}`; }
+});
+```
+
+自定义工具会在启动时加载，默认权限为 `ask`，可通过 `custom_tools` 查看。
+
 配置诊断：
 
 ```bash
@@ -154,7 +170,7 @@ seek config migrate --target project --dry-run
 | Tasks | `${XDG_DATA_HOME:-~/.local/share}/seekcode/tasks/tasks.json` | `SEEKCODE_TASKS_DIR=/path` |
 | Jobs | `${XDG_DATA_HOME:-~/.local/share}/seekcode/jobs` | `SEEKCODE_JOBS_DIR=/path` |
 | Runtime Server 数据 | `${XDG_DATA_HOME:-~/.local/share}/seekcode/runtime` | `SEEKCODE_RUNTIME_DIR=/path` |
-| 全局 Skills | `~/.seekcode/skills` | `skills_dir` 或 `DEEPSEEK_SKILLS_DIR` |
+| 全局 Skills | `~/.seekcode/skills` | `skills_dir` 或 `SEEKCODE_SKILLS_DIR` |
 | 项目 Skills | `./.seekcode/skills`、`./skills`、`./.agents/skills` | 放入这些目录 |
 | 回滚快照 | `./.seekcode/side-git` | workspace-local |
 
@@ -190,16 +206,16 @@ blocked_domains = []
 常用环境变量：
 
 ```bash
-export DEEPSEEK_API_KEY="sk-..."
-export DEEPSEEK_MODEL="deepseek-v4-pro"
-export DEEPSEEK_PROVIDER="deepseek"
-export DEEPSEEK_BASE_URL="https://api.deepseek.com"
-export DEEPSEEK_REASONING_EFFORT="high"
-export DEEPSEEK_TUI_ALTERNATE_SCREEN="never"
+export SEEKCODE_API_KEY="sk-..."
+export SEEKCODE_MODEL="deepseek-v4-pro"
+export SEEKCODE_PROVIDER="deepseek"
+export SEEKCODE_BASE_URL="https://api.deepseek.com"
+export SEEKCODE_REASONING_EFFORT="high"
+export SEEKCODE_TUI_ALTERNATE_SCREEN="never"
 export XDG_DATA_HOME="$HOME/.local/share"
 ```
 
-推荐使用 `SEEKCODE_*` 数据目录覆盖变量。兼容路径中，部分旧的 `DEEPSEEK_*_DIR` 覆盖变量仍会被识别。
+`SEEKCODE_*` 是规范命名空间。旧的 `DEEPSEEK_*` 变量仍会作为 provider/API/model 兼容和迁移兜底被识别。
 
 ## 兼容性
 

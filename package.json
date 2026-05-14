@@ -19,6 +19,7 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsup src/index.ts --format esm --dts --clean",
+    "bench": "tsx bench/runtime-bench.ts",
     "pretest": "npm run build",
     "start": "node dist/index.js",
     "prepack": "npm run build",

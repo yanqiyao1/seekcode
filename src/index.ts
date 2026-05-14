@@ -40,22 +40,7 @@ import { refreshSessionTitle } from "./session/title.js";
 import { getApprovalCache, clearApprovalCache } from "./tools/approval-cache.js";
 import { applyApprovalChoice } from "./tools/approval-session.js";
 import { checkPermission, clearAll as clearPermissions, permissionPatternsFromArgs } from "./tools/permission-ruleset.js";
-
-// Register all tools
-import { registerFileTools } from "./tools/file-ops.js";
-import { registerShellTool } from "./tools/shell.js";
-import { registerGitTools } from "./tools/git.js";
-import { registerWebTools } from "./tools/web.js";
-import { registerPatchTool } from "./tools/patch.js";
-import { registerThinkTool } from "./tools/think.js";
-import { registerRLMTool } from "./tools/rlm-query.js";
-import { registerSubAgentTool } from "./tools/sub-agent.js";
-import { registerPlanTools } from "./tools/plan.js";
-import { registerGoalTools } from "./tools/goal.js";
-import { registerToolSearchTool } from "./tools/tool-search.js";
-import { registerTaskTools } from "./tools/tasks.js";
-import { registerDiagnosticsTools } from "./tools/diagnostics.js";
-import { registerArtifactTools } from "./tools/artifacts.js";
+import { registerBuiltInTools } from "./tools/setup.js";
 import { extractCachedInputTokens } from "./client/capabilities.js";
 import { reloadMCPManager } from "./mcp/manager.js";
 import { linkArtifact } from "./artifacts/store.js";
@@ -73,24 +58,8 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && (error.name === "AbortError" || /aborted|abort/i.test(error.message));
 }
 
-function setupTools(cfg?: ReturnType<typeof loadConfig>) {
-  const reg = getRegistry();
-  reg.clear();
-  registerFileTools();
-  registerShellTool();
-  registerGitTools();
-  registerWebTools(cfg?.web);
-  registerPatchTool();
-  registerThinkTool();
-  registerRLMTool();
-  registerSubAgentTool();
-  registerPlanTools();
-  registerGoalTools();
-  registerToolSearchTool();
-  registerTaskTools();
-  registerArtifactTools();
-  registerDiagnosticsTools();
-  return reg;
+function setupTools(cfg?: ReturnType<typeof loadConfig>, workspacePath = process.cwd()) {
+  return registerBuiltInTools(cfg, { clear: true, workspacePath });
 }
 
 interface RuntimeStartup {
@@ -101,7 +70,7 @@ interface RuntimeStartup {
 }
 
 function startRuntimeStartup(cfg: Config, workspacePath: string, profiler: StartupProfiler): RuntimeStartup {
-  const tools = profiler.profileSync("tools.register", () => setupTools(cfg), registry => `${registry.size} registered`);
+  const tools = profiler.profileSync("tools.register", () => setupTools(cfg, workspacePath), registry => `${registry.size} registered`);
   const mcpReady = profiler.profileAsync("mcp.reload", async () => {
     await reloadMCPManager(cfg).catch(() => undefined);
   });
@@ -893,10 +862,10 @@ program
   .command("serve")
   .description("Start the HTTP/SSE server")
   .option("-p, --port <port>", "Port to listen on", "8080")
-  .option("-h, --host <host>", "Host to bind to", "0.0.0.0")
+  .option("-h, --host <host>", "Host to bind to", "127.0.0.1")
   .action(async (options) => {
     const cliOverrides = configOverridesFromCliOptions(program.opts());
-    setupTools(await ensureRuntimeApiKey(loadConfig(cliOverrides), cliOverrides));
+    setupTools(await ensureRuntimeApiKey(loadConfig(cliOverrides), cliOverrides), resolve("."));
     const { runServer } = await import("./server/app.js");
     runServer(options.host, parseOptionalInt(options.port) ?? 8080);
   });

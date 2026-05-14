@@ -68,6 +68,7 @@ interface SearchEntry {
   ref_id?: string;
   content?: string;
   content_error?: string;
+  content_profile?: ContentProfile;
 }
 
 interface FetchResponse {
@@ -82,6 +83,8 @@ interface SearchOutcome {
   source: string;
   results: SearchEntry[];
   failures: string[];
+  telemetry?: SearchEngineTelemetry[];
+  cacheHit?: boolean;
 }
 
 interface CacheEntry<T> {
@@ -96,6 +99,38 @@ interface WebRef {
   source: string;
   query: string;
   createdAt: number;
+}
+
+interface SearchEngineTelemetry {
+  engine: string;
+  source: string;
+  ok: boolean;
+  duration_ms: number;
+  result_count: number;
+  error?: string;
+  cache_hit?: boolean;
+}
+
+interface ContentProfile {
+  title?: string;
+  format: "html" | "json" | "xml" | "text" | "binary";
+  character_count: number;
+  word_count: number;
+  truncated: boolean;
+  main_content_ratio?: number;
+}
+
+interface WebStats {
+  search_calls: number;
+  search_cache_hits: number;
+  search_engine_calls: Record<string, number>;
+  search_engine_failures: Record<string, number>;
+  search_engine_ms: Record<string, number>;
+  fetch_calls: number;
+  fetch_cache_hits: number;
+  fetch_failures: number;
+  fetch_ms: number;
+  host_queue_waits: Record<string, number>;
 }
 
 interface ResolvedWebConfig {
@@ -125,6 +160,21 @@ const WEB_REFS = new Map<string, WebRef>();
 const SEARCH_CACHE = new Map<string, CacheEntry<SearchOutcome>>();
 const FETCH_CACHE = new Map<string, CacheEntry<FetchResponse>>();
 const PROXY_DISPATCHERS = new Map<string, Dispatcher>();
+const HOST_ACTIVE_FETCHES = new Map<string, number>();
+const HOST_WAITERS = new Map<string, Array<() => void>>();
+const ENGINE_CIRCUITS = new Map<string, { failures: number; openUntil: number }>();
+const WEB_STATS: WebStats = {
+  search_calls: 0,
+  search_cache_hits: 0,
+  search_engine_calls: {},
+  search_engine_failures: {},
+  search_engine_ms: {},
+  fetch_calls: 0,
+  fetch_cache_hits: 0,
+  fetch_failures: 0,
+  fetch_ms: 0,
+  host_queue_waits: {},
+};
 const SAFE_DISPATCHER = new Agent({
   connect: {
     lookup: safeLookup,
@@ -132,6 +182,9 @@ const SAFE_DISPATCHER = new Agent({
 });
 let ENV_DISPATCHER: Dispatcher | null | undefined;
 let refSeq = 0;
+const MAX_HOST_CONCURRENCY = 4;
+const ENGINE_CIRCUIT_FAILURE_THRESHOLD = 3;
+const ENGINE_CIRCUIT_OPEN_MS = 60_000;
 
 function asPositiveInt(value: unknown, fallback: number, max: number): number {
   const parsed = typeof value === "number" ? value : typeof value === "string" ? Number.parseInt(value, 10) : NaN;
@@ -531,6 +584,8 @@ function cloneSearchOutcome(outcome: SearchOutcome): SearchOutcome {
     source: outcome.source,
     results: cloneSearchResults(outcome.results),
     failures: [...outcome.failures],
+    telemetry: outcome.telemetry?.map(item => ({ ...item })),
+    cacheHit: outcome.cacheHit,
   };
 }
 
@@ -627,6 +682,77 @@ function setTimedCache<T>(cache: Map<string, CacheEntry<T>>, key: string, value:
   }
 }
 
+function incrementStat(map: Record<string, number>, key: string, by = 1): void {
+  map[key] = (map[key] || 0) + by;
+}
+
+function recordEngineTelemetry(item: SearchEngineTelemetry): void {
+  incrementStat(WEB_STATS.search_engine_calls, item.source);
+  incrementStat(WEB_STATS.search_engine_ms, item.source, item.duration_ms);
+  if (!item.ok) incrementStat(WEB_STATS.search_engine_failures, item.source);
+}
+
+function webStatsSnapshot(): WebStats & { cache_entries: { search: number; fetch: number; refs: number }; engine_circuits: Record<string, { failures: number; open_ms_remaining: number }> } {
+  const now = Date.now();
+  const circuits: Record<string, { failures: number; open_ms_remaining: number }> = {};
+  for (const [source, circuit] of ENGINE_CIRCUITS) {
+    circuits[source] = {
+      failures: circuit.failures,
+      open_ms_remaining: Math.max(0, circuit.openUntil - now),
+    };
+  }
+  return {
+    ...WEB_STATS,
+    search_engine_calls: { ...WEB_STATS.search_engine_calls },
+    search_engine_failures: { ...WEB_STATS.search_engine_failures },
+    search_engine_ms: { ...WEB_STATS.search_engine_ms },
+    host_queue_waits: { ...WEB_STATS.host_queue_waits },
+    cache_entries: { search: SEARCH_CACHE.size, fetch: FETCH_CACHE.size, refs: WEB_REFS.size },
+    engine_circuits: circuits,
+  };
+}
+
+function engineCircuitOpen(source: string): string | null {
+  const circuit = ENGINE_CIRCUITS.get(source);
+  if (!circuit || circuit.openUntil <= Date.now()) return null;
+  return `${source}: temporarily disabled after ${circuit.failures} consecutive failures`;
+}
+
+function recordEngineHealth(source: string, ok: boolean): void {
+  if (ok) {
+    ENGINE_CIRCUITS.delete(source);
+    return;
+  }
+  const previous = ENGINE_CIRCUITS.get(source);
+  const failures = (previous?.failures || 0) + 1;
+  ENGINE_CIRCUITS.set(source, {
+    failures,
+    openUntil: failures >= ENGINE_CIRCUIT_FAILURE_THRESHOLD ? Date.now() + ENGINE_CIRCUIT_OPEN_MS : 0,
+  });
+}
+
+async function withHostConcurrency<T>(rawUrl: string, fn: () => Promise<T>): Promise<T> {
+  let host = "";
+  try { host = new URL(rawUrl).hostname.toLowerCase(); } catch { return fn(); }
+  while ((HOST_ACTIVE_FETCHES.get(host) || 0) >= MAX_HOST_CONCURRENCY) {
+    incrementStat(WEB_STATS.host_queue_waits, host);
+    await new Promise<void>(resolve => {
+      const waiters = HOST_WAITERS.get(host) || [];
+      waiters.push(resolve);
+      HOST_WAITERS.set(host, waiters);
+    });
+  }
+  HOST_ACTIVE_FETCHES.set(host, (HOST_ACTIVE_FETCHES.get(host) || 0) + 1);
+  try {
+    return await fn();
+  } finally {
+    const active = Math.max(0, (HOST_ACTIVE_FETCHES.get(host) || 1) - 1);
+    if (active) HOST_ACTIVE_FETCHES.set(host, active);
+    else HOST_ACTIVE_FETCHES.delete(host);
+    HOST_WAITERS.get(host)?.shift()?.();
+  }
+}
+
 function canonicalSearchUrl(url: string): string | null {
   try {
     const parsed = new URL(url);
@@ -664,6 +790,37 @@ function dedupeSearchResults(results: SearchEntry[], maxResults: number): Search
     if (deduped.length >= maxResults) break;
   }
   return deduped;
+}
+
+function rankSearchResults(query: string, results: SearchEntry[], maxResults: number): SearchEntry[] {
+  const terms = query.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(term => term.length >= 2);
+  return results
+    .map((result, index) => ({ result, score: scoreSearchResult(result, terms, index) }))
+    .sort((a, b) => b.score - a.score || a.result.title.localeCompare(b.result.title))
+    .slice(0, maxResults)
+    .map(item => item.result);
+}
+
+function scoreSearchResult(result: SearchEntry, terms: string[], index: number): number {
+  const title = result.title.toLowerCase();
+  const snippet = (result.snippet || "").toLowerCase();
+  let score = Math.max(0, 100 - index);
+  for (const term of terms) {
+    if (title.includes(term)) score += 15;
+    if (snippet.includes(term)) score += 5;
+  }
+  try {
+    const url = new URL(result.url);
+    const host = url.hostname.toLowerCase();
+    if (host.endsWith(".edu") || host.endsWith(".gov")) score += 8;
+    if (/docs|developer|api|reference|guide/.test(url.pathname.toLowerCase())) score += 6;
+    if (/github\.com|npmjs\.com|pypi\.org|developer\.mozilla\.org/.test(host)) score += 5;
+    if (/\/(tag|category|search|login|signup)\b/i.test(url.pathname)) score -= 10;
+  } catch {
+    score -= 50;
+  }
+  if (!result.snippet) score -= 4;
+  return score;
 }
 
 function searchCacheKey(
@@ -964,18 +1121,24 @@ async function fetchText(
 ): Promise<FetchResponse> {
   const maxBytes = options.maxBytes || DEFAULT_MAX_BYTES;
   if (options.signal?.aborted) throw makeAbortError();
+  WEB_STATS.fetch_calls++;
   const shouldCache = options.cache !== false;
   const cacheKey = shouldCache ? fetchCacheKey(url, accept, maxBytes, options.config, options.method || "GET", options.body) : "";
   if (cacheKey) {
     const cached = getTimedCache(FETCH_CACHE, cacheKey, FETCH_CACHE_TTL_MS);
-    if (cached) return cloneFetchResponse(cached);
+    if (cached) {
+      WEB_STATS.fetch_cache_hits++;
+      return cloneFetchResponse(cached);
+    }
   }
 
   const retries = Math.max(0, Math.min(options.retries ?? 1, 3));
   let lastError: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const response = await fetchTextOnce(url, timeoutMs, accept, options);
+      const startedAt = Date.now();
+      const response = await withHostConcurrency(url, () => fetchTextOnce(url, timeoutMs, accept, options));
+      WEB_STATS.fetch_ms += Date.now() - startedAt;
       if (attempt < retries && isRetryableStatus(response.status)) {
         lastError = new Error(`HTTP ${response.status}`);
         await delay(150 * (attempt + 1));
@@ -989,6 +1152,7 @@ async function fetchText(
       await delay(150 * (attempt + 1));
     }
   }
+  WEB_STATS.fetch_failures++;
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
@@ -1471,6 +1635,69 @@ function searchCandidates(engine: SearchEngine, config: ResolvedWebConfig): Sear
   return candidate ? [candidate] : [];
 }
 
+async function runSearchCandidate(
+  candidate: SearchCandidate,
+  query: string,
+  maxResults: number,
+  timeoutMs: number,
+  config: ResolvedWebConfig,
+  signal?: AbortSignal,
+): Promise<{ source: string; results: SearchEntry[]; telemetry: SearchEngineTelemetry }> {
+  const circuitReason = engineCircuitOpen(candidate.source);
+  if (circuitReason) {
+    const telemetry = { engine: candidate.engine, source: candidate.source, ok: false, duration_ms: 0, result_count: 0, error: circuitReason };
+    recordEngineTelemetry(telemetry);
+    return Promise.reject(Object.assign(new Error(circuitReason), { telemetry }));
+  }
+  const startedAt = Date.now();
+  try {
+    const results = await candidate.run(query, maxResults, timeoutMs, config, signal);
+    const telemetry = {
+      engine: candidate.engine,
+      source: candidate.source,
+      ok: true,
+      duration_ms: Date.now() - startedAt,
+      result_count: results.length,
+    };
+    recordEngineTelemetry(telemetry);
+    recordEngineHealth(candidate.source, true);
+    return { source: candidate.source, results, telemetry };
+  } catch (error) {
+    const telemetry = {
+      engine: candidate.engine,
+      source: candidate.source,
+      ok: false,
+      duration_ms: Date.now() - startedAt,
+      result_count: 0,
+      error: formatFetchError(error),
+    };
+    recordEngineTelemetry(telemetry);
+    recordEngineHealth(candidate.source, false);
+    throw Object.assign(error instanceof Error ? error : new Error(String(error)), { telemetry });
+  }
+}
+
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<Array<PromiseSettledResult<R>>> {
+  const results: Array<PromiseSettledResult<R>> = new Array(items.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (next < items.length) {
+      const index = next++;
+      try {
+        results[index] = { status: "fulfilled", value: await fn(items[index]!, index) };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, () => worker()));
+  return results;
+}
+
 async function searchWithFallback(
   query: string,
   maxResults: number,
@@ -1481,24 +1708,30 @@ async function searchWithFallback(
   signal?: AbortSignal,
 ): Promise<SearchOutcome> {
   if (signal?.aborted) throw makeAbortError();
+  WEB_STATS.search_calls++;
   const cacheKey = searchCacheKey(query, maxResults, engine, searchType, config);
   if (cacheKey) {
     const cached = getTimedCache(SEARCH_CACHE, cacheKey, SEARCH_CACHE_TTL_MS);
-    if (cached) return cloneSearchOutcome(cached);
+    if (cached) {
+      WEB_STATS.search_cache_hits++;
+      return { ...cloneSearchOutcome(cached), cacheHit: true };
+    }
   }
 
   const failures: string[] = [];
+  const telemetry: SearchEngineTelemetry[] = [];
   const candidates = searchCandidates(engine, config);
 
   if (engine === "auto" && searchType === "deep") {
-    const settled = await Promise.allSettled(candidates.map(candidate =>
-      candidate.run(query, maxResults, timeoutMs, config, signal).then(results => ({ source: candidate.source, results }))
-    ));
+    const settled = await mapLimit(candidates, 3, candidate =>
+      runSearchCandidate(candidate, query, maxResults, timeoutMs, config, signal)
+    );
     const merged: SearchEntry[] = [];
     const sources: string[] = [];
     settled.forEach((result, index) => {
       const source = candidates[index]?.source || "unknown";
       if (result.status === "fulfilled") {
+        telemetry.push(result.value.telemetry);
         if (result.value.results.length) {
           sources.push(result.value.source);
           merged.push(...result.value.results);
@@ -1508,12 +1741,15 @@ async function searchWithFallback(
         return;
       }
       if (isAbortError(result.reason) || signal?.aborted) throw result.reason;
+      const rejectedTelemetry = (result.reason as { telemetry?: SearchEngineTelemetry })?.telemetry;
+      if (rejectedTelemetry) telemetry.push(rejectedTelemetry);
       failures.push(`${source}: ${formatFetchError(result.reason)}`);
     });
     const outcome = {
       source: sources.join(" + "),
-      results: dedupeSearchResults(merged, maxResults),
+      results: rankSearchResults(query, dedupeSearchResults(merged, Math.max(maxResults * 2, maxResults)), maxResults),
       failures,
+      telemetry,
     };
     if (cacheKey && outcome.results.length) setTimedCache(SEARCH_CACHE, cacheKey, cloneSearchOutcome(outcome), SEARCH_CACHE_MAX);
     return outcome;
@@ -1521,20 +1757,29 @@ async function searchWithFallback(
 
   for (const candidate of candidates) {
     try {
-      const results = await candidate.run(query, maxResults, timeoutMs, config, signal);
+      const searched = await runSearchCandidate(candidate, query, maxResults, timeoutMs, config, signal);
+      telemetry.push(searched.telemetry);
+      const results = searched.results;
       if (results.length) {
-        const outcome = { source: candidate.source, results: dedupeSearchResults(results, maxResults), failures };
+        const outcome = {
+          source: candidate.source,
+          results: rankSearchResults(query, dedupeSearchResults(results, Math.max(maxResults * 2, maxResults)), maxResults),
+          failures,
+          telemetry,
+        };
         if (cacheKey) setTimedCache(SEARCH_CACHE, cacheKey, cloneSearchOutcome(outcome), SEARCH_CACHE_MAX);
         return outcome;
       }
       failures.push(`${candidate.source}: no parseable results`);
     } catch (error) {
       if (isAbortError(error) || signal?.aborted) throw error;
+      const rejectedTelemetry = (error as { telemetry?: SearchEngineTelemetry })?.telemetry;
+      if (rejectedTelemetry) telemetry.push(rejectedTelemetry);
       failures.push(`${candidate.source}: ${formatFetchError(error)}`);
     }
   }
 
-  return { source: "", results: [], failures };
+  return { source: "", results: [], failures, telemetry };
 }
 
 function assignRefs(query: string, source: string, results: SearchEntry[]): SearchEntry[] {
@@ -1609,7 +1854,7 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
   const searchQuery = effectiveAllowedDomains.length
     ? `${query} ${effectiveAllowedDomains.map(domain => `site:${domain.replace(/^\*\./, "").replace(/^\./, "")}`).join(" OR ")}`
     : query;
-  const { source, results: rawResults, failures } = await searchWithFallback(searchQuery, maxResults, timeoutMs, engine, searchType, config, signal);
+  const { source, results: rawResults, failures, telemetry, cacheHit } = await searchWithFallback(searchQuery, maxResults, timeoutMs, engine, searchType, config, signal);
   const filteredResults = filterSearchResults(rawResults, effectiveAllowedDomains, config.blockedDomains);
   const contextualResults = includeContent
     ? await attachResultContent(filteredResults, config, { contextResults, contextMaxCharacters, timeoutMs, signal })
@@ -1617,7 +1862,7 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
   const results = assignRefs(query, source, contextualResults);
 
   if (!results.length) {
-    const payload = { query, source: "", count: 0, results: [], failures, message: `No results for '${query}'` };
+    const payload = { query, source: "", count: 0, results: [], failures, telemetry, cache_hit: Boolean(cacheHit), message: `No results for '${query}'` };
     return jsonOutput ? JSON.stringify(payload, null, 2) : `No results for '${query}'. Tried ${failures.join(" | ") || "no engines"}`;
   }
 
@@ -1628,8 +1873,10 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
       count: results.length,
       results,
       failures,
+      telemetry,
       search_type: searchType,
       context_included: includeContent,
+      cache_hit: Boolean(cacheHit),
       message: `Found ${results.length} result(s)`,
     }, null, 2);
   }
@@ -1643,6 +1890,7 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
     lines.push("");
   });
   if (failures.length) lines.push(`Note: ${failures.join(" | ")}`);
+  if (cacheHit) lines.push("Cache: hit");
   return lines.join("\n");
 }
 
@@ -1731,8 +1979,10 @@ function htmlToText(html: string): string {
   const $ = cheerio.load(html);
   $("script, style, nav, footer, header, noscript, svg, iframe, canvas").remove();
   const title = normalizeText($("title").first().text());
-  const body = $("main").length ? $("main").text() : $("article").length ? $("article").text() : $("body").length ? $("body").text() : $.text();
-  const text = body.split("\n").map(line => normalizeText(line)).filter(Boolean).join("\n");
+  const root = selectReadableRoot($);
+  root.find("br").replaceWith("\n");
+  root.find("pre,code,li,p,div,section,article,tr").each((_, el) => { $(el).append("\n"); });
+  const text = root.text().split("\n").map(line => normalizeText(line)).filter(Boolean).join("\n");
   return [title, text].filter(Boolean).join("\n\n").replace(/\n{3,}/g, "\n\n");
 }
 
@@ -1740,9 +1990,28 @@ function htmlToMarkdown(html: string): string {
   const $ = cheerio.load(html);
   $("script, style, nav, footer, header, noscript, svg, iframe, canvas").remove();
   $("br").replaceWith("\n");
-  $("h1,h2,h3").each((_, el) => {
+  $("pre").each((_, el) => {
+    const text = $(el).text().replace(/\n+$/g, "");
+    $(el).replaceWith(`\n\`\`\`\n${text}\n\`\`\`\n`);
+  });
+  $("code").each((_, el) => {
+    const text = normalizeText($(el).text());
+    if (text) $(el).replaceWith(`\`${text.replace(/`/g, "\\`")}\``);
+  });
+  $("table").each((_, el) => {
+    const rows = $(el).find("tr").map((_, row) =>
+      $(row).find("th,td").map((_, cell) => normalizeText($(cell).text())).get().join(" | ")
+    ).get().filter(Boolean);
+    if (rows.length) $(el).replaceWith(`\n${rows.join("\n")}\n`);
+  });
+  $("a[href]").each((_, el) => {
+    const text = normalizeText($(el).text());
+    const href = $(el).attr("href") || "";
+    if (text && /^https?:\/\//i.test(href)) $(el).replaceWith(`${text} (${href})`);
+  });
+  $("h1,h2,h3,h4").each((_, el) => {
     const tag = el.tagName.toLowerCase();
-    const level = tag === "h1" ? "# " : tag === "h2" ? "## " : "### ";
+    const level = tag === "h1" ? "# " : tag === "h2" ? "## " : tag === "h3" ? "### " : "#### ";
     $(el).replaceWith(`\n${level}${normalizeText($(el).text())}\n`);
   });
   $("li").each((_, el) => {
@@ -1752,16 +2021,73 @@ function htmlToMarkdown(html: string): string {
     $(el).append("\n");
   });
   const title = normalizeText($("title").first().text());
-  const body = $("main").length ? $("main").text() : $("article").length ? $("article").text() : $("body").length ? $("body").text() : $.text();
+  const body = selectReadableRoot($).text();
   const text = decodeHtml(body).split("\n").map(line => line.replace(/\s+/g, " ").trim()).filter(Boolean).join("\n");
   return [title ? `# ${title}` : "", text].filter(Boolean).join("\n\n").replace(/\n{3,}/g, "\n\n");
+}
+
+function selectReadableRoot($: cheerio.CheerioAPI): cheerio.Cheerio<any> {
+  const candidates = $("article, main, [role='main'], .markdown-body, .doc, .docs, .documentation, body").toArray();
+  let best: Element | null = null;
+  let bestScore = -1;
+  for (const candidate of candidates) {
+    const node = $(candidate);
+    const textLength = normalizeText(node.text()).length;
+    const linkLength = normalizeText(node.find("a").text()).length;
+    const headingCount = node.find("h1,h2,h3").length;
+    const codeCount = node.find("pre,code").length;
+    const score = textLength - Math.floor(linkLength * 0.7) + headingCount * 120 + codeCount * 80;
+    if (score > bestScore) {
+      best = candidate;
+      bestScore = score;
+    }
+  }
+  return best ? $(best) : $.root();
+}
+
+function formatStructuredText(body: string, contentType: string): string {
+  const trimmed = body.trim();
+  if (!trimmed) return body;
+  if (contentType.includes("json") || /^[\[{]/.test(trimmed)) {
+    try { return JSON.stringify(JSON.parse(trimmed), null, 2); } catch { return body; }
+  }
+  return body;
 }
 
 function processBody(body: string, contentType: string, format: "markdown" | "text" | "raw"): string {
   if (format === "raw") return body;
   const isHtml = contentType.includes("text/html") || /<html[\s>]/i.test(body) || /<(article|main|body|p|h1|h2)[\s>]/i.test(body);
-  if (!isHtml) return body;
+  if (!isHtml) return formatStructuredText(body, contentType);
   return format === "markdown" ? htmlToMarkdown(body) : htmlToText(body);
+}
+
+function contentProfile(body: string, contentType: string, processed: string, truncated: boolean): ContentProfile {
+  const normalizedType = contentType.toLowerCase();
+  const format: ContentProfile["format"] = normalizedType.includes("html")
+    ? "html"
+    : normalizedType.includes("json")
+      ? "json"
+      : normalizedType.includes("xml")
+        ? "xml"
+        : /^text\//.test(normalizedType) || !normalizedType
+          ? "text"
+          : "binary";
+  let title: string | undefined;
+  let mainContentRatio: number | undefined;
+  if (format === "html") {
+    const $ = cheerio.load(body);
+    title = normalizeText($("title").first().text()) || undefined;
+    const total = Math.max(1, normalizeText($("body").text() || $.text()).length);
+    mainContentRatio = Math.min(1, normalizeText(selectReadableRoot($).text()).length / total);
+  }
+  return {
+    ...(title ? { title } : {}),
+    format,
+    character_count: processed.length,
+    word_count: processed.split(/\s+/).filter(Boolean).length,
+    truncated,
+    ...(mainContentRatio !== undefined ? { main_content_ratio: Number(mainContentRatio.toFixed(3)) } : {}),
+  };
 }
 
 function trimForContext(content: string, maxChars: number): string {
@@ -1795,7 +2121,12 @@ async function attachResultContent(
         return;
       }
       const content = processBody(resp.text, resp.contentType, "markdown");
-      enriched[index] = { ...result, content: trimForContext(content, charsPerResult) };
+      const trimmed = trimForContext(content, charsPerResult);
+      enriched[index] = {
+        ...result,
+        content: trimmed,
+        content_profile: contentProfile(resp.text, resp.contentType, trimmed, resp.truncated),
+      };
     } catch (error) {
       if (isAbortError(error) || options.signal?.aborted) throw error;
       enriched[index] = { ...result, content_error: formatFetchError(error) };
@@ -1804,13 +2135,14 @@ async function attachResultContent(
   return enriched;
 }
 
-function formatFetchResult(resp: FetchResponse, content: string, jsonOutput: boolean): string {
+function formatFetchResult(resp: FetchResponse, content: string, jsonOutput: boolean, profile?: ContentProfile): string {
   if (jsonOutput) {
     return JSON.stringify({
       url: resp.url,
       status: resp.status,
       content_type: resp.contentType,
       truncated: resp.truncated,
+      content_profile: profile,
       content,
     }, null, 2);
   }
@@ -1819,6 +2151,7 @@ function formatFetchResult(resp: FetchResponse, content: string, jsonOutput: boo
     `Status: ${resp.status}`,
     `Content-Type: ${resp.contentType}`,
     `Truncated: ${resp.truncated}`,
+    ...(profile ? [`Profile: ${profile.format}, ${profile.word_count} words${profile.title ? `, title: ${profile.title}` : ""}`] : []),
     "",
   ].join("\n");
   return header + content;
@@ -1849,7 +2182,7 @@ async function webFetchWithConfig(args: Record<string, unknown>, config: Resolve
       validateRedirect: async (url) => { await assertPublicUrl(url, config); },
     });
     const content = processBody(resp.text, resp.contentType, format).slice(0, maxBytes);
-    return formatFetchResult(resp, content, jsonOutput);
+    return formatFetchResult(resp, content, jsonOutput, contentProfile(resp.text, resp.contentType, content, resp.truncated));
   } catch (error) {
     return `Error fetching URL: ${formatFetchError(error)}`;
   }
@@ -1949,5 +2282,17 @@ export function registerWebTools(configInput?: Partial<WebConfig>): void {
     maxResultSizeChars: 120_000,
     isSearchOrReadCommand: () => ({ isSearch: false, isRead: true }),
     validateInput: validateWebFetchInput,
+  });
+  r.register({
+    name: "web_stats",
+    description: "Show web search/fetch cache, engine health, latency, and failure statistics for this process.",
+    parameters: { type: "object", properties: {} },
+    execute: async () => JSON.stringify(webStatsSnapshot(), null, 2),
+    permission: PermissionLevel.ALWAYS_ALLOW,
+    category: "web",
+    parallelOk: true,
+    readOnly: true,
+    searchHint: "inspect web search fetch health telemetry cache",
+    resultKind: "json",
   });
 }

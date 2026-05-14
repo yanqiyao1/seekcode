@@ -21,6 +21,8 @@ const ALWAYS_ACTIVE_TOOLS = new Set([
   "tool_search",
   "tool_stats",
   "tool_enable",
+  "custom_tools",
+  "web_stats",
   "rlm_query",
   "think",
   "get_goal",
@@ -249,10 +251,13 @@ const KNOWN_READ_ONLY_TOOLS = new Set([
   "read", "ls", "search", "glob",
   "git_status", "git_diff", "git_log", "git_branch",
   "web_search", "web_fetch", "fetch_url",
-  "diagnostics", "lsp_diagnostics", "tool_search", "tool_stats", "tool_enable",
+  "web_stats",
+  "diagnostics", "lsp_diagnostics", "lsp_symbols", "lsp_definition", "lsp_hover", "tool_search", "tool_stats", "tool_enable",
+  "custom_tools",
   "think", "get_goal", "plan_status",
   "task_list", "task_read", "task_shell_wait", "exec_shell_wait",
   "artifact_list", "artifact_read", "artifact_links",
+  "agent_profiles",
 ]);
 
 const KNOWN_DESTRUCTIVE_TOOLS = new Set([

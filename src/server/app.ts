@@ -20,13 +20,27 @@ import {
   listToolsHandler,
   listSkillsHandler,
   chatHandler,
+  openApiHandler,
 } from "./handlers.js";
 
 export function createApp(): Hono {
   const app = new Hono();
   app.use("/*", cors());
+  app.use("/v1/*", async (c, next) => {
+    const token = process.env.SEEKCODE_SERVER_TOKEN?.trim();
+    if (!token || c.req.path === "/v1/health") {
+      await next();
+      return;
+    }
+    const auth = c.req.header("authorization") || "";
+    if (auth !== `Bearer ${token}`) {
+      return c.json({ error: "unauthorized" }, 401);
+    }
+    await next();
+  });
 
   app.get("/v1/health", health);
+  app.get("/v1/openapi.json", openApiHandler);
   app.post("/v1/session", createSessionHandler);
   app.get("/v1/session/:session_id", getSessionHandler);
   app.get("/v1/sessions", listSessionsHandler);
@@ -48,7 +62,7 @@ export function createApp(): Hono {
   return app;
 }
 
-export function runServer(host = "0.0.0.0", port = 8080): void {
+export function runServer(host = "127.0.0.1", port = 8080): void {
   const app = createApp();
   console.log(`Seek Code server starting on ${host}:${port}...`);
   // Use @hono/node-server for Node.js

@@ -6,7 +6,7 @@ Seek Code is a DeepSeek-first terminal code agent. It is built around `deepseek-
 
 ```bash
 npm install -g seekcode
-export DEEPSEEK_API_KEY="sk-your-api-key"
+export SEEKCODE_API_KEY="sk-your-api-key"
 seek
 ```
 
@@ -68,6 +68,7 @@ seek update -y
 | Web | Search and fetch URLs, multiple search engines, allow/block domains, proxy config | Ask the agent to search; configure `[web]` |
 | MCP | stdio/SSE MCP servers exposed as `mcp_*` tools | `/mcp add ...`, `/mcp reload` |
 | Skills | `SKILL.md` workflows, install/update/trust, project/global discovery | `/skills`, `/skill <name>` |
+| Custom tools | Workspace `.seekcode/tools/*.js|*.cjs|*.ts` tool modules with default ASK permissions | Add files under `.seekcode/tools`; inspect with `custom_tools` |
 | Tasks | Durable tasks, checklist, plan, notes, long-running task state | `/tasks`; agent tools such as `task_create` |
 | Artifacts | Store long logs, diagnostics, patches, and evidence outside the live context | Created by tools or artifact commands |
 | Sessions | Save, list, load, delete, and resume work | `/save`, `/sessions`, `/load` |
@@ -128,6 +129,21 @@ Skills:
 /skill my-skill
 ```
 
+Workspace custom tools:
+
+```js
+// .seekcode/tools/hello.cjs
+module.exports = tool({
+  name: "hello_tool",
+  description: "Say hello",
+  parameters: { type: "object", properties: { name: { type: "string" } } },
+  readOnly: true,
+  run(args) { return `hello ${args.name}`; }
+});
+```
+
+Custom tools load during startup, use `ask` permission by default, and can be inspected with `custom_tools`.
+
 Configuration diagnostics:
 
 ```bash
@@ -154,7 +170,7 @@ defaults < user config < project config < environment variables < CLI flags
 | Tasks | `${XDG_DATA_HOME:-~/.local/share}/seekcode/tasks/tasks.json` | `SEEKCODE_TASKS_DIR=/path` |
 | Jobs | `${XDG_DATA_HOME:-~/.local/share}/seekcode/jobs` | `SEEKCODE_JOBS_DIR=/path` |
 | Runtime server data | `${XDG_DATA_HOME:-~/.local/share}/seekcode/runtime` | `SEEKCODE_RUNTIME_DIR=/path` |
-| Global skills | `~/.seekcode/skills` | `skills_dir` or `DEEPSEEK_SKILLS_DIR` |
+| Global skills | `~/.seekcode/skills` | `skills_dir` or `SEEKCODE_SKILLS_DIR` |
 | Project skills | `./.seekcode/skills`, `./skills`, `./.agents/skills` | Put skills in those folders |
 | Rollback snapshots | `./.seekcode/side-git` | Workspace-local |
 
@@ -190,16 +206,16 @@ blocked_domains = []
 Common environment variables:
 
 ```bash
-export DEEPSEEK_API_KEY="sk-..."
-export DEEPSEEK_MODEL="deepseek-v4-pro"
-export DEEPSEEK_PROVIDER="deepseek"
-export DEEPSEEK_BASE_URL="https://api.deepseek.com"
-export DEEPSEEK_REASONING_EFFORT="high"
-export DEEPSEEK_TUI_ALTERNATE_SCREEN="never"
+export SEEKCODE_API_KEY="sk-..."
+export SEEKCODE_MODEL="deepseek-v4-pro"
+export SEEKCODE_PROVIDER="deepseek"
+export SEEKCODE_BASE_URL="https://api.deepseek.com"
+export SEEKCODE_REASONING_EFFORT="high"
+export SEEKCODE_TUI_ALTERNATE_SCREEN="never"
 export XDG_DATA_HOME="$HOME/.local/share"
 ```
 
-`SEEKCODE_*` data-directory overrides are preferred. Legacy `DEEPSEEK_*_DIR` overrides are still recognized for compatibility where supported.
+`SEEKCODE_*` is the canonical namespace. Legacy `DEEPSEEK_*` variables are still recognized for provider/API/model compatibility and migration.
 
 ## Compatibility
 

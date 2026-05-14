@@ -8,6 +8,7 @@ import { addRule, checkPermission, clearAll as clearPermissionRules, forgetTool,
 import { getRegistry } from "../src/tools/registry.js";
 import { checkSandboxPolicy } from "../src/tools/sandbox.js";
 import { registerShellTool } from "../src/tools/shell.js";
+import { registerSubAgentTool } from "../src/tools/sub-agent.js";
 import { registerTaskTools } from "../src/tools/tasks.js";
 import { registerToolSearchTool } from "../src/tools/tool-search.js";
 
@@ -204,6 +205,27 @@ describe("permission rules", () => {
     });
     expect(removeRule("write", "*.ts")).toBe(true);
     expect(checkPermission({ toolName: "write", toolArgs: { path: "src/index.ts" } }).action).toBe("ask");
+  });
+});
+
+describe("agent profiles", () => {
+  it("lists specialized profiles and rejects unknown spawn_agent profiles", async () => {
+    registerSubAgentTool();
+    const profiles = JSON.parse(await getRegistry().lookup("agent_profiles")!.execute({})) as Array<{ name: string; permissionPolicy: string }>;
+    const spawn = getRegistry().lookup("spawn_agent")!;
+
+    expect(profiles).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "build", permissionPolicy: "build" }),
+      expect.objectContaining({ name: "explore", permissionPolicy: "read-only" }),
+      expect.objectContaining({ name: "scout", permissionPolicy: "read-only" }),
+    ]));
+    expect(await spawn.validateInput?.(
+      { task: "inspect", profile: "missing" },
+      { tool_name: "spawn_agent", workspace_path: "/tmp/workspace", tool_def: spawn },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("unknown profile"),
+    });
   });
 });
 

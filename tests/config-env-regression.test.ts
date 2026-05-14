@@ -19,6 +19,9 @@ const ENV_KEYS = [
   "DEEPSEEK_COST_TRACKING",
   "DEEPSEEK_THINKING_VISIBLE",
   "DEEPSEEK_STATUS_ITEMS",
+  "DEEPSEEK_WEB_SEARCH_ENGINE",
+  "SEEKCODE_MAX_TURNS",
+  "SEEKCODE_WEB_SEARCH_ENGINE",
 ];
 
 beforeEach(() => {
@@ -70,6 +73,18 @@ describe("config env overrides", () => {
     const cfg = loadConfig();
 
     expect(cfg.status_items).toEqual(["mode", "model", "workspace", "hints"]);
+  });
+
+  it("prefers canonical SEEKCODE env vars over legacy DEEPSEEK env vars", () => {
+    process.env.DEEPSEEK_MAX_TURNS = "7";
+    process.env.SEEKCODE_MAX_TURNS = "9";
+    process.env.DEEPSEEK_WEB_SEARCH_ENGINE = "bing";
+    process.env.SEEKCODE_WEB_SEARCH_ENGINE = "duckduckgo";
+
+    const cfg = loadConfig();
+
+    expect(cfg.max_turns).toBe(9);
+    expect(cfg.web.search_engine).toBe("duckduckgo");
   });
 
   it("ignores invalid numeric env values and falls back to defaults", () => {

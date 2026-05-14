@@ -13,12 +13,15 @@
 import OpenAI from "openai";
 import { PermissionLevel } from "./base.js";
 import { getRegistry } from "./registry.js";
+import { getAgentProfile, hasAgentProfile, listAgentProfiles } from "../engine/agent-profiles.js";
 
 // ── Agent tracking ───────────────────────────────────────────
 
 interface AgentRecord {
   id: string;
   task_name: string;
+  nickname: string;
+  profile: string;
   task: string;
   status: "running" | "done" | "error";
   result?: string;
@@ -52,8 +55,11 @@ async function spawnAgent(args: Record<string, unknown>): Promise<string> {
     ? args.task_name.trim()
     : `agent-${nextAgentId}`;
   if (args.system_prompt !== undefined && typeof args.system_prompt !== "string") return "Error: system_prompt must be a string.";
+  if (args.profile !== undefined && typeof args.profile !== "string") return "Error: profile must be a string.";
+  if (args.profile !== undefined && !hasAgentProfile(args.profile)) return `Error: unknown profile '${args.profile}'.`;
+  const profile = getAgentProfile(args.profile);
   const systemPrompt = typeof args.system_prompt === "string" ? args.system_prompt.trim() : "";
-  const maxTurns = normalizeMaxTurns(args.max_turns);
+  const maxTurns = normalizeMaxTurns(args.max_turns, profile.defaultMaxTurns);
   const timeout = normalizeTimeoutMs(args.timeout_ms);
 
   if (!task) return "Error: task is required.";
@@ -70,7 +76,7 @@ async function spawnAgent(args: Record<string, unknown>): Promise<string> {
   const baseUrl = (typeof args.base_url === "string" ? args.base_url.trim() : "") ||
     process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
   const model = (typeof args.model === "string" && args.model.trim() ? args.model.trim() : "") ||
-    process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
+    process.env.DEEPSEEK_MODEL || profile.defaultModel;
 
   const agentId = `agent_${nextAgentId++}`;
   const nickname = taskName.replace(/[^a-z0-9_]/gi, "_").slice(0, 40);
@@ -78,6 +84,8 @@ async function spawnAgent(args: Record<string, unknown>): Promise<string> {
   const record: AgentRecord = {
     id: agentId,
     task_name: taskName,
+    nickname,
+    profile: profile.name,
     task,
     status: "running",
     started_at: Date.now(),
@@ -92,11 +100,7 @@ async function spawnAgent(args: Record<string, unknown>): Promise<string> {
     abortController.abort();
   }, timeout);
 
-  const sysPrompt = systemPrompt || (
-    "You are a specialized sub-agent. Complete the given task thoroughly and " +
-    "return a clear, structured result. Be efficient — output the result directly. " +
-    "When done, output a final summary with key findings."
-  );
+  const sysPrompt = systemPrompt || profile.systemPrompt;
 
   const messages: any[] = [
     { role: "system", content: sysPrompt },
@@ -147,9 +151,9 @@ function normalizeTimeoutMs(value: unknown): number {
   return Math.max(10_000, Math.min(Math.floor(parsed), 600_000));
 }
 
-function normalizeMaxTurns(value: unknown): number {
+function normalizeMaxTurns(value: unknown, fallback = 15): number {
   const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return 15;
+  if (!Number.isFinite(parsed)) return fallback;
   return Math.max(1, Math.floor(parsed));
 }
 
@@ -186,7 +190,7 @@ async function agentStatus(args: Record<string, unknown>): Promise<string> {
   if (agentId || nickname) {
     const agent = agentId
       ? runningAgents.get(agentId)
-      : [...runningAgents.values()].find(item => item.task_name.replace(/[^a-z0-9_]/gi, "_").slice(0, 40) === nickname);
+      : [...runningAgents.values()].find(item => item.nickname === nickname);
     if (!agent) return `Agent not found: ${agentId || nickname}`;
     return formatAgentStatus(agent);
   }
@@ -199,9 +203,13 @@ async function agentStatus(args: Record<string, unknown>): Promise<string> {
     const dur = agent.completed_at
       ? `${((agent.completed_at - agent.started_at) / 1000).toFixed(1)}s`
       : "running...";
-    lines.push(`  ${sym} [${agent.id}] ${agent.task_name} (${dur})`);
+    lines.push(`  ${sym} [${agent.id}] ${agent.profile}:${agent.task_name} (${dur})`);
   }
   return lines.join("\n");
+}
+
+async function agentProfiles(): Promise<string> {
+  return JSON.stringify(listAgentProfiles(), null, 2);
 }
 
 function formatAgentStatus(agent: AgentRecord): string {
@@ -210,7 +218,7 @@ function formatAgentStatus(agent: AgentRecord): string {
     : `${((Date.now() - agent.started_at) / 1000).toFixed(1)}s (running)`;
 
   return [
-    `Agent: ${agent.id} (${agent.task_name})`,
+    `Agent: ${agent.id} (${agent.profile}:${agent.task_name})`,
     `Status: ${agent.status} | Duration: ${dur}`,
     agent.result ? `Result: ${agent.result.slice(0, 500)}` : "",
     agent.error ? `Error: ${agent.error}` : "",
@@ -261,6 +269,7 @@ export function registerSubAgentTool(): void {
       properties: {
         task: { type: "string", description: "The sub-task for the agent to complete" },
         task_name: { type: "string", description: "Descriptive name (lowercase, underscores) for tracking" },
+        profile: { type: "string", enum: ["general", "explore", "scout", "build", "plan"], default: "general", description: "Specialized built-in agent profile." },
         system_prompt: { type: "string", description: "Custom system prompt", default: "" },
         max_turns: { type: "integer", description: "Maximum reasoning turns", default: 15 },
         timeout_ms: { type: "integer", description: "Timeout in ms (10s-600s)", default: 120_000 },
@@ -277,6 +286,12 @@ export function registerSubAgentTool(): void {
       if (!task) return { ok: false as const, message: "task is required." };
       if (args.system_prompt !== undefined && typeof args.system_prompt !== "string") {
         return { ok: false as const, message: "system_prompt must be a string." };
+      }
+      if (args.profile !== undefined && typeof args.profile !== "string") {
+        return { ok: false as const, message: "profile must be a string." };
+      }
+      if (args.profile !== undefined && !hasAgentProfile(args.profile)) {
+        return { ok: false as const, message: `unknown profile '${args.profile}'.` };
       }
       if (args.api_key !== undefined && typeof args.api_key !== "string") return { ok: false as const, message: "api_key must be a string." };
       if (args.base_url !== undefined && typeof args.base_url !== "string") return { ok: false as const, message: "base_url must be a string." };
@@ -341,5 +356,15 @@ export function registerSubAgentTool(): void {
     category: "meta",
     parallelOk: true,
     validateInput: validateAgentStatusArgs,
+  });
+  r.register({
+    name: "agent_profiles",
+    description: "List built-in sub-agent profiles and their intended use.",
+    parameters: { type: "object", properties: {} },
+    execute: agentProfiles,
+    permission: PermissionLevel.ALWAYS_ALLOW,
+    category: "meta",
+    parallelOk: true,
+    readOnly: true,
   });
 }

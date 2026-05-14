@@ -31,6 +31,7 @@ import { SideGit } from "../src/rollback/side-git.js";
 import { registerToolSearchTool } from "../src/tools/tool-search.js";
 import { registerDiagnosticsTools } from "../src/tools/diagnostics.js";
 import { registerArtifactTools } from "../src/tools/artifacts.js";
+import { registerBuiltInTools } from "../src/tools/setup.js";
 import { clearArtifactsForTests, listArtifactLinks, readArtifact } from "../src/artifacts/store.js";
 import { clearMCPManagerForTests, getMCPManager } from "../src/mcp/manager.js";
 import { activateSkill, applySkillToUserInput, fetchRegistrySkills, installSkillFromArchive, scanSkills, trustSkill, uninstallSkill, updateSkill } from "../src/engine/skills.js";
@@ -88,6 +89,18 @@ describe("file tools", () => {
     expect(result).toContain("notes.txt");
     expect(existsSync(join(tmp, "SHOULD_NOT_EXIST"))).toBe(false);
     expect(existsSync("SHOULD_NOT_EXIST")).toBe(false);
+  });
+
+  it("supports opt-in regex search while keeping literal search as the default", async () => {
+    registerFileTools();
+    writeFileSync(join(tmp, "notes.txt"), "ticket-123\nliteral ticket-[0-9]+\n");
+
+    const literal = await getRegistry().lookup("search")!.execute({ path: tmp, pattern: "ticket-[0-9]+" });
+    const regex = await getRegistry().lookup("search")!.execute({ path: tmp, pattern: "ticket-[0-9]+", regex: true });
+
+    expect(literal).toContain("literal ticket-[0-9]+");
+    expect(literal).not.toContain("ticket-123");
+    expect(regex).toContain("ticket-123");
   });
 
   it("edit rejects an empty old_string instead of corrupting the file", async () => {
@@ -845,6 +858,42 @@ describe("git and patch tools", () => {
 });
 
 describe("tool catalog", () => {
+  it("loads workspace-local custom tools with ASK permission and conflict-safe names", async () => {
+    mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
+    writeFileSync(join(tmp, ".seekcode", "tools", "hello.cjs"), [
+      "module.exports = [",
+      "  tool({",
+      "    name: 'hello_tool',",
+      "    description: 'Say hello from a local tool',",
+      "    parameters: { type: 'object', properties: { name: { type: 'string' } } },",
+      "    readOnly: true,",
+      "    validate(args) { return typeof args.name === 'string' ? { ok: true, args } : 'name must be a string'; },",
+      "    run(args) { return `hello ${args.name}`; }",
+      "  }),",
+      "  tool({ name: 'read', description: 'conflicting read', run() { return 'custom read'; } })",
+      "];",
+    ].join("\n"));
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+    const list = JSON.parse(await getRegistry().lookup("custom_tools")!.execute({})) as { tools: Array<{ name: string; requested_name: string }> };
+    const hello = getRegistry().lookup("hello_tool")!;
+    const conflict = getRegistry().lookup("custom_read")!;
+
+    expect(list.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "hello_tool", requested_name: "hello_tool" }),
+      expect.objectContaining({ name: "custom_read", requested_name: "read" }),
+    ]));
+    expect(hello.permission).toBe(PermissionLevel.ASK);
+    expect(hello.readOnly).toBe(true);
+    expect(await hello.execute({ name: "Ada" })).toBe("hello Ada");
+    expect(await hello.validateInput?.(
+      { name: 7 as any },
+      { tool_name: "hello_tool", workspace_path: tmp, tool_def: hello },
+    )).toMatchObject({ ok: false, message: "name must be a string" });
+    expect(await conflict.execute({})).toBe("custom read");
+    expect(getRegistry().lookup("read")?.name).toBe("read");
+  });
+
   it("returns stable sorted schemas and activates deferred tools through tool_search", async () => {
     getRegistry().register({
       name: "z_deferred",
@@ -4703,6 +4752,33 @@ process.stdin.on("data", (chunk) => {
     expect(await tool.execute({ workdir: tmp, language: { nested: true } as any })).toContain("language must be a string");
     expect(await tool.execute({ workdir: tmp, min_severity: { nested: true } as any })).toContain("min_severity must be a string");
     expect(await tool.execute({ workdir: tmp, files: [join(tmp, "a.ts"), 7] as any })).toContain("files must be a string or array of strings");
+  });
+
+  it("exposes lightweight LSP symbols, definition, and hover tools", async () => {
+    registerDiagnosticsTools();
+    const file = join(tmp, "src", "sample.ts");
+    mkdirSync(join(tmp, "src"), { recursive: true });
+    writeFileSync(file, [
+      "export class Sample {",
+      "  run(): string {",
+      "    return helper();",
+      "  }",
+      "}",
+      "export function helper() { return 'ok'; }",
+    ].join("\n"));
+
+    const symbolsResult = JSON.parse(await getRegistry().lookup("lsp_symbols")!.execute({ file, workdir: tmp })) as { symbols: Array<{ name: string; kind: string }> };
+    const definition = JSON.parse(await getRegistry().lookup("lsp_definition")!.execute({ symbol: "helper", workdir: tmp })) as { matches: Array<{ file: string; line: number }> };
+    const hover = await getRegistry().lookup("lsp_hover")!.execute({ file, line: 2, workdir: tmp });
+
+    expect(symbolsResult.symbols).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "Sample", kind: "class" }),
+      expect.objectContaining({ name: "run", kind: "method" }),
+      expect.objectContaining({ name: "helper", kind: "function" }),
+    ]));
+    expect(definition.matches.some(item => item.file.endsWith("sample.ts") && item.line === 6)).toBe(true);
+    expect(hover).toContain("> 2:");
+    expect(hover).toContain("run(): string");
   });
 
   it("rejects malformed diagnostics workdirs instead of passing object roots into subprocess helpers", async () => {

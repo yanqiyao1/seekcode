@@ -10,6 +10,7 @@ import { createArtifact, getArtifact, listArtifacts, readArtifact } from "../art
 import { addMCPServer, getMCPManager, reloadMCPManager, removeMCPServer, setMCPServerEnabled } from "../mcp/manager.js";
 import type { MCPConfig } from "../config.js";
 import { resolvePathAlias } from "./path-resolution.js";
+import { getLspManager } from "../lsp/manager.js";
 
 type DiagnosticsToolExtras = Partial<Omit<ToolDef, "name" | "description" | "parameters" | "execute" | "permission" | "category" | "parallelOk">>;
 
@@ -384,6 +385,35 @@ async function lspDiagnostics(args: Record<string, unknown>): Promise<string> {
   return JSON.stringify({ language, command, artifact_id: artifact.id, summary, diagnostics, output }, null, 2);
 }
 
+async function lspSymbols(args: Record<string, unknown>): Promise<string> {
+  const workdir = resolveWorkdir(args);
+  const file = typeof args.file === "string" && args.file.trim()
+    ? args.file.trim()
+    : typeof args.path === "string" && args.path.trim() ? args.path.trim() : "";
+  if (!file) return "Error: file is required.";
+  const symbols = getLspManager().documentSymbols(file, workdir);
+  return JSON.stringify({ file, workdir: resolve(workdir), backend: "local-fallback", symbols }, null, 2);
+}
+
+async function lspDefinition(args: Record<string, unknown>): Promise<string> {
+  const workdir = resolveWorkdir(args);
+  const symbol = typeof args.symbol === "string" ? args.symbol.trim() : "";
+  if (!symbol) return "Error: symbol is required.";
+  const matches = getLspManager().definition(symbol, workdir);
+  return JSON.stringify({ symbol, workdir: resolve(workdir), backend: "local-fallback", matches }, null, 2);
+}
+
+async function lspHover(args: Record<string, unknown>): Promise<string> {
+  const workdir = resolveWorkdir(args);
+  const file = typeof args.file === "string" && args.file.trim()
+    ? args.file.trim()
+    : typeof args.path === "string" && args.path.trim() ? args.path.trim() : "";
+  const line = Number(args.line);
+  if (!file) return "Error: file is required.";
+  if (!Number.isFinite(line) || line <= 0) return "Error: line must be a positive number.";
+  return getLspManager().hover(file, line, workdir);
+}
+
 export async function runAutoDiagnostics(args: {
   workdir: string;
   files?: string[];
@@ -587,6 +617,35 @@ function validateLspDiagnosticsArgs(args: Record<string, unknown>) {
     return { ok: false as const, message: "files must be a string or array of strings." };
   }
   return { ok: true as const, args: normalizedArgs };
+}
+
+function validateLspFileArgs(args: Record<string, unknown>) {
+  const workdirValidated = validateDiagnosticsWorkdirArgs(args);
+  if (!workdirValidated.ok) return workdirValidated;
+  const normalizedArgs = workdirValidated.args;
+  const file = typeof normalizedArgs.file === "string" && normalizedArgs.file.trim()
+    ? normalizedArgs.file.trim()
+    : typeof normalizedArgs.path === "string" && normalizedArgs.path.trim() ? normalizedArgs.path.trim() : "";
+  if (!file) return { ok: false as const, message: "file is required." };
+  return { ok: true as const, args: { ...normalizedArgs, file } };
+}
+
+function validateLspDefinitionArgs(args: Record<string, unknown>) {
+  const workdirValidated = validateDiagnosticsWorkdirArgs(args);
+  if (!workdirValidated.ok) return workdirValidated;
+  const symbol = typeof workdirValidated.args.symbol === "string" ? workdirValidated.args.symbol.trim() : "";
+  return symbol
+    ? { ok: true as const, args: { ...workdirValidated.args, symbol } }
+    : { ok: false as const, message: "symbol is required." };
+}
+
+function validateLspHoverArgs(args: Record<string, unknown>) {
+  const fileValidated = validateLspFileArgs(args);
+  if (!fileValidated.ok) return fileValidated;
+  if (args.line === undefined || (typeof args.line !== "number" && typeof args.line !== "string") || !Number.isFinite(Number(args.line)) || Number(args.line) <= 0) {
+    return { ok: false as const, message: "line must be a positive number." };
+  }
+  return { ok: true as const, args: { ...fileValidated.args, line: Number(args.line) } };
 }
 
 export function registerDiagnosticsTools(): void {
@@ -816,6 +875,66 @@ export function registerDiagnosticsTools(): void {
     category: "diagnostics",
     parallelOk: true,
     validateInput: validateLspDiagnosticsArgs,
+  });
+  registry.register({
+    name: "lsp_symbols",
+    description: "List document symbols for a source file using the LSP facade with local fallback parsing.",
+    parameters: {
+      type: "object",
+      properties: {
+        file: { type: "string" },
+        path: { type: "string", description: "Alias for file." },
+        workdir: { type: "string", default: "." },
+      },
+      required: ["file"],
+    },
+    execute: lspSymbols,
+    permission: PermissionLevel.ALWAYS_ALLOW,
+    category: "diagnostics",
+    parallelOk: true,
+    deferLoading: true,
+    readOnly: true,
+    validateInput: validateLspFileArgs,
+  });
+  registry.register({
+    name: "lsp_definition",
+    description: "Find likely definitions of a symbol using the LSP facade with ripgrep/grep fallback.",
+    parameters: {
+      type: "object",
+      properties: {
+        symbol: { type: "string" },
+        workdir: { type: "string", default: "." },
+      },
+      required: ["symbol"],
+    },
+    execute: lspDefinition,
+    permission: PermissionLevel.ALWAYS_ALLOW,
+    category: "diagnostics",
+    parallelOk: true,
+    deferLoading: true,
+    readOnly: true,
+    validateInput: validateLspDefinitionArgs,
+  });
+  registry.register({
+    name: "lsp_hover",
+    description: "Return source context around a file line using the LSP facade local fallback.",
+    parameters: {
+      type: "object",
+      properties: {
+        file: { type: "string" },
+        path: { type: "string", description: "Alias for file." },
+        line: { type: "integer" },
+        workdir: { type: "string", default: "." },
+      },
+      required: ["file", "line"],
+    },
+    execute: lspHover,
+    permission: PermissionLevel.ALWAYS_ALLOW,
+    category: "diagnostics",
+    parallelOk: true,
+    deferLoading: true,
+    readOnly: true,
+    validateInput: validateLspHoverArgs,
   });
 }
 

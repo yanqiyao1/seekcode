@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -129,6 +129,21 @@ describe("session persistence matrix", () => {
     const loaded = loadSession("abc")!;
     expect(loaded.title).toBe("hello");
     expect(loaded.workspace_path).toBe(process.cwd());
+  });
+
+  it("writes append-only session event logs next to JSON snapshots", () => {
+    const session = createSession({ id: "eventful", messages: [] });
+
+    saveSession(session);
+    session.messages.push({ role: "user", content: "next", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null });
+    saveSession(session);
+
+    const logPath = join(process.env.SEEKCODE_SESSIONS_DIR!, "eventful.jsonl");
+    const events = readFileSync(logPath, "utf-8").trim().split("\n").map(line => JSON.parse(line)) as Array<{ event: string; session_id: string; message_count: number }>;
+
+    expect(existsSync(join(process.env.SEEKCODE_SESSIONS_DIR!, "eventful.json"))).toBe(true);
+    expect(events).toHaveLength(2);
+    expect(events.at(-1)).toMatchObject({ event: "session.saved", session_id: "eventful", message_count: 1 });
   });
 
   it("returns null for invalid session ids", () => {
@@ -272,6 +287,30 @@ describe("AGENTS.md and pinned prefix building", () => {
     expect(prefix.toolSchemas()).toHaveLength(1);
     expect(prefix.memoryIndex).toContain("Project Context");
     expect(prefix.systemPrompt).toContain("workspace rules");
+  });
+
+  it("keeps deferred tool schemas in the pinned prefix while hiding them from visible descriptions", () => {
+    const workspace = join(tmp, "workspace-deferred");
+    mkdirSync(workspace, { recursive: true });
+    getRegistry().register({
+      name: "deferred_reader",
+      description: "Deferred reader",
+      parameters: { type: "object", properties: {} },
+      execute: async () => "ok",
+      permission: "always_allow" as any,
+      category: "file",
+      parallelOk: true,
+      readOnly: true,
+      deferLoading: true,
+      searchHint: "deferred schema",
+    });
+
+    const prefix = buildPinnedPrefix(config(), workspace, getRegistry());
+    const schemaNames = prefix.toolSchemas().map((schema: any) => schema.function.name);
+
+    expect(schemaNames).toContain("deferred_reader");
+    expect(prefix.hasTool("deferred_reader")).toBe(true);
+    expect(prefix.systemPrompt).not.toContain("**deferred_reader**");
   });
 
   it("reuses prefetched AGENTS.md and skills context when building pinned prefixes", () => {

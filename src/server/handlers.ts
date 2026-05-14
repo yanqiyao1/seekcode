@@ -31,47 +31,15 @@ import {
   type RuntimeEvent,
   type RuntimeRecord,
 } from "./runtime-store.js";
-import { registerFileTools } from "../tools/file-ops.js";
-import { registerShellTool } from "../tools/shell.js";
-import { registerGitTools } from "../tools/git.js";
-import { registerWebTools } from "../tools/web.js";
-import { registerPatchTool } from "../tools/patch.js";
-import { registerThinkTool } from "../tools/think.js";
-import { registerRLMTool } from "../tools/rlm-query.js";
-import { registerSubAgentTool } from "../tools/sub-agent.js";
-import { registerPlanTools } from "../tools/plan.js";
-import { registerGoalTools } from "../tools/goal.js";
-import { registerToolSearchTool } from "../tools/tool-search.js";
-import { registerTaskTools } from "../tools/tasks.js";
-import { registerDiagnosticsTools } from "../tools/diagnostics.js";
-import { registerArtifactTools } from "../tools/artifacts.js";
+import { registerBuiltInTools } from "../tools/setup.js";
 import { VERSION } from "../version.js";
 
-// Ensure tools registered
 let toolsReadyKey = "";
-function ensureTools(config?: Config) {
-  const key = JSON.stringify(config?.web || {});
+function ensureTools(config?: Config, workspacePath = process.cwd()) {
+  const key = JSON.stringify({ web: config?.web || {}, workspace: workspacePath });
   if (toolsReadyKey === key && getRegistry().size > 0) return;
   toolsReadyKey = key;
-  const registry = getRegistry();
-  if (registry.size > 0) {
-    registerWebTools(config?.web);
-    return;
-  }
-  registerFileTools();
-  registerShellTool();
-  registerGitTools();
-  registerWebTools(config?.web);
-  registerPatchTool();
-  registerThinkTool();
-  registerRLMTool();
-  registerSubAgentTool();
-  registerPlanTools();
-  registerGoalTools();
-  registerToolSearchTool();
-  registerTaskTools();
-  registerArtifactTools();
-  registerDiagnosticsTools();
+  registerBuiltInTools(config, { clear: true, workspacePath });
 }
 
 const VALID_THREAD_MODES = new Set<Config["mode"]>(["plan", "agent", "yolo"]);
@@ -92,11 +60,43 @@ export async function health(c: Context) {
   return c.json({ status: "ok", version: VERSION });
 }
 
+export async function openApiHandler(c: Context) {
+  return c.json({
+    openapi: "3.1.0",
+    info: { title: "Seek Code Runtime API", version: VERSION },
+    paths: {
+      "/v1/health": { get: { summary: "Health check" } },
+      "/v1/session": { post: { summary: "Create a session and runtime thread" } },
+      "/v1/sessions": { get: { summary: "List runtime sessions" } },
+      "/v1/sessions/{session_id}": {
+        get: { summary: "Get a session" },
+        delete: { summary: "Delete a session" },
+      },
+      "/v1/sessions/{session_id}/resume-thread": { post: { summary: "Resume a session thread" } },
+      "/v1/session/{session_id}/chat": { post: { summary: "Run a chat turn over SSE" } },
+      "/v1/threads": {
+        get: { summary: "List runtime threads" },
+        post: { summary: "Create a runtime thread" },
+      },
+      "/v1/threads/{thread_id}": {
+        get: { summary: "Get a runtime thread" },
+        patch: { summary: "Update a runtime thread" },
+      },
+      "/v1/threads/{thread_id}/fork": { post: { summary: "Fork a runtime thread" } },
+      "/v1/threads/{thread_id}/events": { get: { summary: "Replay runtime SSE events" } },
+      "/v1/threads/{thread_id}/items": { get: { summary: "Replay normalized runtime items" } },
+      "/v1/threads/{thread_id}/turns/{turn_id}/interrupt": { post: { summary: "Interrupt a running turn" } },
+      "/v1/tools": { get: { summary: "List registered tools" } },
+      "/v1/skills": { get: { summary: "List discovered skills" } },
+    },
+  });
+}
+
 export async function createSessionHandler(c: Context) {
   const cfg = loadConfig();
   const session = createSession({ model: cfg.model, mode: cfg.mode });
   const record = createRuntimeRecord(cfg, session);
-  ensureTools(cfg);
+  ensureTools(cfg, session.workspace_path || process.cwd());
   const prefix = buildPinnedPrefix(cfg, session.workspace_path || process.cwd(), getRegistry());
   session.prefix_hash = prefix.hash;
   record.history.addSystem(prefix.systemPrompt);
@@ -187,7 +187,7 @@ export async function createThreadHandler(c: Context) {
     mode: session.mode as Config["mode"],
   };
   const record = createRuntimeRecord(threadConfig, session);
-  ensureTools(threadConfig);
+  ensureTools(threadConfig, session.workspace_path);
   const prefix = buildPinnedPrefix(threadConfig, session.workspace_path, getRegistry());
   session.prefix_hash = prefix.hash;
   record.history.addSystem(prefix.systemPrompt);
@@ -244,7 +244,7 @@ export async function updateThreadHandler(c: Context) {
   const record = getRuntimeRecord(thread.id);
   if (!record) return c.json({ error: "Thread not found" }, 404);
   if (patch.mode || patch.workspace) {
-    ensureTools(record.config);
+    ensureTools(record.config, record.session.workspace_path || process.cwd());
     const prefix = buildPinnedPrefix(record.config, record.session.workspace_path || process.cwd(), getRegistry());
     record.session.prefix_hash = prefix.hash;
     record.session.messages = [
@@ -376,7 +376,7 @@ export async function chatHandler(c: Context) {
   const message = body.message.trim();
   if (!message) return c.json({ error: "message required" }, 400);
 
-  ensureTools(record.config);
+  ensureTools(record.config, record.session.workspace_path || process.cwd());
 
   return streamSSE(c, async (stream) => {
     const abortController = new AbortController();

@@ -60,6 +60,10 @@ export class StartupProfiler {
   report(stderr: NodeJS.WritableStream = process.stderr): void {
     if (!this.enabled || !this.records.length) return;
     const total = Math.max(...this.records.map(record => record.start_ms + record.duration_ms));
+    if (startupProfileJsonEnabled()) {
+      stderr.write(`${JSON.stringify({ total_ms: total, records: this.records }, null, 2)}\n`);
+      return;
+    }
     stderr.write(`\nStartup profile (${formatMs(total)} total observed):\n`);
     for (const record of this.records) {
       const status = record.ok ? "ok" : "error";
@@ -87,6 +91,11 @@ function startupProfileEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const value = env.SEEKCODE_STARTUP_PROFILE || env.SEEK_STARTUP_PROFILE;
   if (!value) return false;
   return !["0", "false", "no", "off"].includes(value.trim().toLowerCase());
+}
+
+function startupProfileJsonEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env.SEEKCODE_STARTUP_PROFILE_JSON || env.SEEKCODE_STARTUP_PROFILE || "";
+  return value.trim().toLowerCase() === "json";
 }
 
 function formatMs(value: number): string {

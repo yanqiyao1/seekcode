@@ -32,6 +32,8 @@ const StatusItemSchema = z.enum([
   "hints",
 ]);
 
+const PermissionActionSchema = z.enum(["allow", "ask", "deny"]);
+
 const WebConfigSchema = z.object({
   enabled: z.boolean().default(true),
   mode: z.enum(["live", "off"]).default("live"),
@@ -85,6 +87,7 @@ const ConfigSchema = z.object({
   tool_call_budget_per_turn: z.number().int().default(80),
   tool_failure_degrade_threshold: z.number().int().default(3),
   status_items: z.array(StatusItemSchema).default(["mode", "model", "workspace"]),
+  permissions: z.record(PermissionActionSchema).default({}),
   web: WebConfigSchema.default({}),
 });
 
@@ -129,7 +132,8 @@ export interface ConfigExplainReport {
 const DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com";
 const DEFAULT_USER_CONFIG_TEMPLATE = `# Seek Code user configuration
 # This file is created automatically on first use.
-# You can also set these values with DEEPSEEK_* environment variables.
+# Prefer SEEKCODE_* environment variables. DEEPSEEK_* remains supported
+# for provider/API/model compatibility and legacy config.
 
 api_key = ""
 provider = "deepseek"
@@ -260,7 +264,11 @@ function loadEnv(): Record<string, unknown> {
     ["DEEPSEEK_WEB_FETCH_TIMEOUT_MS", "web.fetch_timeout_ms"],
     ["DEEPSEEK_WEB_MAX_BYTES", "web.max_bytes"],
   ];
-  for (const [env, key] of map) {
+  const canonicalMap = [
+    ...map,
+    ...map.map(([env, key]) => [env.replace(/^DEEPSEEK_/, "SEEKCODE_"), key] as [string, string]),
+  ];
+  for (const [env, key] of canonicalMap) {
     const val = process.env[env];
     if (val) {
       if (
@@ -276,26 +284,26 @@ function loadEnv(): Record<string, unknown> {
       }
     }
   }
-  if (process.env.DEEPSEEK_CONTEXT_REFRESH_ENABLED) {
-    result.context_refresh_enabled = parseBool(process.env.DEEPSEEK_CONTEXT_REFRESH_ENABLED);
+  if (envValue("SEEKCODE_CONTEXT_REFRESH_ENABLED", "DEEPSEEK_CONTEXT_REFRESH_ENABLED")) {
+    result.context_refresh_enabled = parseBool(envValue("SEEKCODE_CONTEXT_REFRESH_ENABLED", "DEEPSEEK_CONTEXT_REFRESH_ENABLED")!);
   }
-  if (process.env.DEEPSEEK_WORKSPACE_BOUNDARY) {
-    result.workspace_boundary = parseBool(process.env.DEEPSEEK_WORKSPACE_BOUNDARY);
+  if (envValue("SEEKCODE_WORKSPACE_BOUNDARY", "DEEPSEEK_WORKSPACE_BOUNDARY")) {
+    result.workspace_boundary = parseBool(envValue("SEEKCODE_WORKSPACE_BOUNDARY", "DEEPSEEK_WORKSPACE_BOUNDARY")!);
   }
-  if (process.env.DEEPSEEK_LSP_AUTO_DIAGNOSTICS) {
-    result.lsp_auto_diagnostics = parseBool(process.env.DEEPSEEK_LSP_AUTO_DIAGNOSTICS);
+  if (envValue("SEEKCODE_LSP_AUTO_DIAGNOSTICS", "DEEPSEEK_LSP_AUTO_DIAGNOSTICS")) {
+    result.lsp_auto_diagnostics = parseBool(envValue("SEEKCODE_LSP_AUTO_DIAGNOSTICS", "DEEPSEEK_LSP_AUTO_DIAGNOSTICS")!);
   }
-  if (process.env.DEEPSEEK_ROLLBACK_ENABLED) {
-    result.rollback_enabled = parseBool(process.env.DEEPSEEK_ROLLBACK_ENABLED);
+  if (envValue("SEEKCODE_ROLLBACK_ENABLED", "DEEPSEEK_ROLLBACK_ENABLED")) {
+    result.rollback_enabled = parseBool(envValue("SEEKCODE_ROLLBACK_ENABLED", "DEEPSEEK_ROLLBACK_ENABLED")!);
   }
-  if (process.env.DEEPSEEK_COST_TRACKING) {
-    result.cost_tracking = parseBool(process.env.DEEPSEEK_COST_TRACKING);
+  if (envValue("SEEKCODE_COST_TRACKING", "DEEPSEEK_COST_TRACKING")) {
+    result.cost_tracking = parseBool(envValue("SEEKCODE_COST_TRACKING", "DEEPSEEK_COST_TRACKING")!);
   }
-  if (process.env.DEEPSEEK_THINKING_VISIBLE) {
-    result.thinking_visible = parseBool(process.env.DEEPSEEK_THINKING_VISIBLE);
+  if (envValue("SEEKCODE_THINKING_VISIBLE", "DEEPSEEK_THINKING_VISIBLE")) {
+    result.thinking_visible = parseBool(envValue("SEEKCODE_THINKING_VISIBLE", "DEEPSEEK_THINKING_VISIBLE")!);
   }
-  if (process.env.DEEPSEEK_WEB_ENABLED) {
-    setNested(result, "web.enabled", parseBool(process.env.DEEPSEEK_WEB_ENABLED));
+  if (envValue("SEEKCODE_WEB_ENABLED", "DEEPSEEK_WEB_ENABLED")) {
+    setNested(result, "web.enabled", parseBool(envValue("SEEKCODE_WEB_ENABLED", "DEEPSEEK_WEB_ENABLED")!));
   }
   if (!getNested(result, "web.google_api_key") && process.env.GOOGLE_API_KEY) {
     setNested(result, "web.google_api_key", process.env.GOOGLE_API_KEY);
@@ -327,13 +335,18 @@ function loadEnv(): Record<string, unknown> {
   if (!getNested(result, "web.searxng_url") && process.env.SEARXNG_URL) {
     setNested(result, "web.searxng_url", process.env.SEARXNG_URL);
   }
-  if (process.env.DEEPSEEK_TRUSTED_WORKSPACES) {
-    result.trusted_workspaces = process.env.DEEPSEEK_TRUSTED_WORKSPACES
+  const trustedWorkspaces = envValue("SEEKCODE_TRUSTED_WORKSPACES", "DEEPSEEK_TRUSTED_WORKSPACES");
+  if (trustedWorkspaces) {
+    result.trusted_workspaces = trustedWorkspaces
       .split(":")
       .map(item => item.trim())
       .filter(Boolean);
   }
   return result;
+}
+
+function envValue(primary: string, fallback: string): string | undefined {
+  return process.env[primary] ?? process.env[fallback];
 }
 
 function parseBool(value: string): boolean {
@@ -574,6 +587,7 @@ function migrateConfigObject(input: Record<string, unknown>): { config: Record<s
   rename("sandboxMode", "sandbox_mode");
   rename("workspaceBoundary", "workspace_boundary");
   rename("trustedWorkspaces", "trusted_workspaces");
+  rename("permission", "permissions");
   rename("webSearch", "web");
   rename("web_search", "web");
 
